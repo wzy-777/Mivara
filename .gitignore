@@ -1,0 +1,27 @@
+#files to ignore
+
+receiver
+sender
+app
+*.txt
+
+#folders to ignore:
+build/
+.vscode/
+.mimocode/
+
+#stats files
+*.json
+
+# test code and diagnostics
+test/
+
+# build outputs + runtime DLL closure (bin/ holds binaries and DLLs)
+/bin/
+/dist/
+
+# large vendor binaries (over GitHub size limit, download separately)
+vdd/VDD Control.exe
+vdd/VDD Control.pdb
+vdd/vdd.zip
+
