@@ -56,6 +56,7 @@
 #include "discover.h"
 #include "gpu_accelerate.h"
 #include "ports.h"
+#include "vdd.h"
 
 /* ── Platform headers ───────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -268,6 +269,21 @@ public:
         int nd = 1, sb = SOCK_BUF;
         setsockopt(_s, IPPROTO_TCP, TCP_NODELAY, (char *)&nd, sizeof(nd));
         setsockopt(_s, SOL_SOCKET,  SO_SNDBUF,   (char *)&sb, sizeof(sb));
+
+        /* I/O timeouts: a half-dead peer must not block send/recv forever –
+         * the session has to end (and the virtual display detach) even when
+         * the connection dies silently. Windows takes DWORD milliseconds. */
+#ifdef _WIN32
+        DWORD tmo = 2000;
+        setsockopt(_s, SOL_SOCKET, SO_SNDTIMEO, (char *)&tmo, sizeof(tmo));
+        tmo = 5000;
+        setsockopt(_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tmo, sizeof(tmo));
+#else
+        struct timeval tmo = { 2, 0 };
+        setsockopt(_s, SOL_SOCKET, SO_SNDTIMEO, (char *)&tmo, sizeof(tmo));
+        tmo.tv_sec = 5;
+        setsockopt(_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tmo, sizeof(tmo));
+#endif
         std::cout << COL_GREEN << "Connected to "
                   << ip << ":" << port << COL_RESET << "\n";
         return true;
@@ -427,301 +443,17 @@ static std::vector<uint8_t> captureScreen()
 /* ══════════════════════════════════════════════════════════════════════════
  * VIRTUAL DISPLAY MANAGEMENT (Windows)
  *
- * Deep-integrated lifecycle management for the virtual display driver
- * (VirtualDrivers/Virtual-Display-Driver, device id "MTT1337"):
- *   - vddStartup()   : activate the virtual monitor (CCD SetDisplayConfig),
- *                      place it right of the current desktop, 1920x1080@60
- *   - vddShutdown()  : deactivate it again (only if we activated it)
+ * Lifecycle lives in vdd.cpp / vdd.h so the GUI can force-detach the
+ * virtual monitor if the sender ever has to be hard-killed:
+ *   - vddStartup()     : activate + place + size, adopt ownership
+ *   - vddShutdown()    : detach on EVERY exit path (normal end, send
+ *                        failure, Ctrl+C, console close, atexit)
+ *   - vddForceDetach() : unconditional detach (GUI safety net)
  *
- * The virtual display is only attached to the desktop while a True-Extend
+ * The virtual display is only attached to the desktop while an extend
  * streaming session is running.
  * ══════════════════════════════════════════════════════════════════════════ */
 #ifdef _WIN32
-static bool g_vdd_we_attached = false;   /* we turned it on -> we turn it off */
-
-/* Match a CCD target whose friendly monitor name identifies the VDD
- * ("VDD by MTT" / "MTT1337" family). Real monitors never match. */
-static bool vddNameMatch(const WCHAR *wname)
-{
-    char buf[128];
-    int  n = 0;
-    for (; wname && wname[n] && n < 127; n++)
-        buf[n] = (char)wname[n];
-    buf[n] = '\0';
-    for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
-    return strstr(buf, "vdd") || strstr(buf, "mtt");
-}
-
-/* Iterate all CCD paths; run fn(path) for every path whose target monitor
- * is the VDD. fn returns true to keep scanning. Returns true if any VDD
- * path was seen. */
-template <typename F>
-static bool vddForEachPath(F fn)
-{
-    UINT32 nPaths = 0, nModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &nPaths, &nModes) != ERROR_SUCCESS)
-        return false;
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &nPaths, paths.data(),
-                           &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-
-    bool seen = false;
-    for (UINT32 i = 0; i < nPaths; i++) {
-        DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
-        tn.header.type       = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        tn.header.size       = sizeof(tn);
-        tn.header.adapterId  = paths[i].targetInfo.adapterId;
-        tn.header.id         = paths[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS)
-            continue;
-        if (!vddNameMatch(tn.monitorFriendlyDeviceName))
-            continue;
-        seen = true;
-        if (!fn(paths[i], nPaths, paths, nModes, modes))
-            break;
-    }
-    return seen;
-}
-
-/* Does the VDD driver expose a monitor at all (active or not)? */
-static bool vddInstalled()
-{
-    return vddForEachPath([](DISPLAYCONFIG_PATH_INFO &,
-                             UINT32, std::vector<DISPLAYCONFIG_PATH_INFO> &,
-                             UINT32, std::vector<DISPLAYCONFIG_MODE_INFO> &) {
-        return true;
-    });
-}
-
-/* Activate / deactivate every VDD path via the CCD topology. */
-static bool vddApplyTopology(bool active)
-{
-    UINT32 nPaths = 0, nModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &nPaths, &nModes) != ERROR_SUCCESS)
-        return false;
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &nPaths, paths.data(),
-                           &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-
-    bool touched = false;
-    for (UINT32 i = 0; i < nPaths; i++) {
-        DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
-        tn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        tn.header.size      = sizeof(tn);
-        tn.header.adapterId = paths[i].targetInfo.adapterId;
-        tn.header.id        = paths[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS) continue;
-        if (!vddNameMatch(tn.monitorFriendlyDeviceName))            continue;
-
-        if (active) paths[i].flags |=  DISPLAYCONFIG_PATH_ACTIVE;
-        else        paths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;
-        touched = true;
-    }
-    if (!touched) return false;
-
-    LONG st = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
-                               SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY);
-    return st == ERROR_SUCCESS;
-}
-
-/* Find the GDI device name (\\.\DISPLAYn) of the *active* VDD monitor. */
-static bool vddFindActiveDevice(std::string &out)
-{
-    for (DWORD i = 0; ; i++) {
-        DISPLAY_DEVICEA dd = {};
-        dd.cb = sizeof(dd);
-        if (!EnumDisplayDevicesA(NULL, i, &dd, 0)) break;
-        if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE) ||
-            !(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
-            continue;
-        DISPLAY_DEVICEA mon = {};
-        mon.cb = sizeof(mon);
-        if (EnumDisplayDevicesA(dd.DeviceName, 0, &mon, 0) &&
-            (strstr(mon.DeviceID, "MTT") || strstr(mon.DeviceString, "VDD"))) {
-            out = dd.DeviceName;
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Set resolution/refresh/position of a display via the classic CDS API.
- * IMPORTANT: use dynamic apply (flags = 0). CDS_UPDATEREGISTRY is rejected
- * by this IddCx virtual display (DISP_CHANGE_FAILED); the dynamic apply
- * works reliably right after attach. The mode is re-applied at every
- * session start, so persistence is not needed. */
-static bool vddConfigure(const std::string &device, int x, int y,
-                         int w, int h, int hz)
-{
-    DEVMODEA dm = {};
-    dm.dmSize = sizeof(dm);
-    if (!EnumDisplaySettingsExA(device.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
-        return false;
-    dm.dmFields           = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT |
-                            DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
-    dm.dmBitsPerPel       = 32;
-    dm.dmPosition.x       = x;
-    dm.dmPosition.y       = y;
-    dm.dmPelsWidth        = w;
-    dm.dmPelsHeight       = h;
-    dm.dmDisplayFrequency = hz;
-    LONG r = ChangeDisplaySettingsExA(device.c_str(), &dm, NULL, 0, NULL);
-    return r == DISP_CHANGE_SUCCESSFUL;
-}
-
-/* Is this GDI display device backed by the virtual display driver? */
-static bool isVddMonitorDevice(const char *gdiDevice)
-{
-    DISPLAY_DEVICEA mon = {};
-    mon.cb = sizeof(mon);
-    if (EnumDisplayDevicesA(gdiDevice, 0, &mon, 0))
-        return strstr(mon.DeviceID, "MTT")   ||
-               strstr(mon.DeviceID, "VDD")   ||
-               strstr(mon.DeviceString, "VDD");
-    return false;
-}
-
-/* Rightmost desktop edge EXCLUDING virtual-display monitors, so the VDD
- * can be placed right after the real desktop (not after itself). */
-struct EdgeScanCtx { int right; };
-static BOOL CALLBACK edgeScanProc(HMONITOR hmon, HDC, LPRECT rc, LPARAM lp)
-{
-    auto *ctx = (EdgeScanCtx *)lp;
-    MONITORINFOEXA mi;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoA(hmon, (MONITORINFO *)&mi) &&
-        !isVddMonitorDevice(mi.szDevice)) {
-        if (rc->right > ctx->right) ctx->right = rc->right;
-    }
-    return TRUE;
-}
-
-static int desktopRightEdge()
-{
-    EdgeScanCtx ctx = {0};
-    EnumDisplayMonitors(NULL, NULL, edgeScanProc, (LPARAM)&ctx);
-    return ctx.right;
-}
-
-/* Locate a monitor rect in the virtual desktop by GDI device name. */
-struct MonRectSearch { const char *dev; RECT rc; bool found; };
-static BOOL CALLBACK findMonRectProc(HMONITOR hmon, HDC, LPRECT, LPARAM lp)
-{
-    auto *s = (MonRectSearch *)lp;
-    MONITORINFOEXA mi;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoA(hmon, (MONITORINFO *)&mi) &&
-        _stricmp(mi.szDevice, s->dev) == 0) {
-        s->rc    = mi.rcMonitor;
-        s->found = true;
-        return FALSE;
-    }
-    return TRUE;
-}
-
-/* Full startup: attach VDD, place it right of the desktop, aim capture.
- * w/h = requested virtual display resolution. */
-static void vddShutdown();   /* forward – used by vddStartup on error paths */
-
-static bool vddStartup(int w, int h)
-{
-    if (!vddInstalled()) {
-        std::cerr << COL_RED
-                  << "Virtual display driver not found.\n"
-                     "  Install VirtualDrivers/Virtual-Display-Driver (MttVDD)\n"
-                     "  first – see README.md.\n"
-                  << COL_RESET;
-        return false;
-    }
-
-    bool alreadyActive = false;
-    vddForEachPath([&](DISPLAYCONFIG_PATH_INFO &p, UINT32,
-                       std::vector<DISPLAYCONFIG_PATH_INFO> &,
-                       UINT32, std::vector<DISPLAYCONFIG_MODE_INFO> &) {
-        if (p.flags & DISPLAYCONFIG_PATH_ACTIVE) alreadyActive = true;
-        return !alreadyActive;   /* stop early once found */
-    });
-
-    /* Compute the anchor BEFORE attaching: right edge of the real desktop
-     * (VDD excluded), so the virtual display lands right after it. */
-    int x = desktopRightEdge();
-
-    if (!alreadyActive) {
-        std::cout << COL_CYAN << "Activating virtual display...\n" << COL_RESET;
-        if (!vddApplyTopology(true)) {
-            std::cerr << COL_RED << "Failed to activate virtual display\n"
-                      << COL_RESET;
-            return false;
-        }
-        g_vdd_we_attached = true;
-        Sleep(1500);              /* let the topology settle */
-    }
-
-    std::string dev;
-    if (!vddFindActiveDevice(dev)) {
-        std::cerr << COL_RED
-                  << "Virtual display did not come up (no active MTT device)\n"
-                  << COL_RESET;
-        vddShutdown();
-        return false;
-    }
-
-    /* Deterministic placement: requested mode @60 right of the real desktop.
-     * A freshly attached display may reject mode changes for a moment,
-     * so retry a few times before falling back. */
-    bool ok = false;
-    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-        ok = vddConfigure(dev, x, 0, w, h, 60);
-        if (!ok) Sleep(600);
-    }
-    if (!ok && (w != 1920 || h != 1080)) {
-        std::cerr << COL_YELLOW
-                  << "Requested mode " << w << "x" << h
-                  << " rejected – falling back to 1920x1080\n" << COL_RESET;
-        for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-            ok = vddConfigure(dev, x, 0, 1920, 1080, 60);
-            if (!ok) Sleep(600);
-        }
-    }
-    if (!ok)
-        std::cerr << COL_YELLOW
-                  << "Mode change not applied – streaming current mode\n"
-                  << COL_RESET;
-    Sleep(800);
-
-    MonRectSearch s = {};
-    s.dev = dev.c_str();
-    EnumDisplayMonitors(NULL, NULL, findMonRectProc, (LPARAM)&s);
-    if (!s.found) {
-        std::cerr << COL_RED << "Virtual display rect not found\n" << COL_RESET;
-        vddShutdown();
-        return false;
-    }
-
-    g_cap_device   = dev;
-    g_cap_origin.x = s.rc.left;
-    g_cap_origin.y = s.rc.top;
-    SCREEN_WIDTH   = s.rc.right  - s.rc.left;
-    SCREEN_HEIGHT  = s.rc.bottom - s.rc.top;
-
-    std::cout << COL_GREEN << "Virtual display ready: " << dev << "  "
-              << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
-              << " @(" << s.rc.left << "," << s.rc.top << ")\n" << COL_RESET;
-    return true;
-}
-
-/* Tear down: detach the virtual display again if we attached it. */
-static void vddShutdown()
-{
-    if (!g_vdd_we_attached) return;
-    g_vdd_we_attached = false;
-    std::cout << COL_CYAN << "Deactivating virtual display...\n" << COL_RESET;
-    vddApplyTopology(false);
-}
 
 /* Ask the user which resolution the virtual display should use.
  * Modes mirror the driver's vdd_settings.xml. Default: 1920x1080. */
@@ -953,7 +685,16 @@ static void ports_interactive_menu()
 #ifdef _WIN32
 static BOOL WINAPI consoleCtrlHandler(DWORD type)
 {
-    (void)type;
+    /* Console window close / logoff / shutdown: the process is terminated
+     * right after this handler returns – the streaming loop will never
+     * see g_running go false. Detach the virtual display HERE or it stays
+     * attached to the desktop forever. */
+    if (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
+        type == CTRL_SHUTDOWN_EVENT) {
+        vddShutdown();
+        g_running = false;
+        return TRUE;
+    }
     g_running = false;
     return TRUE;
 }
@@ -991,6 +732,10 @@ int main(int argc, char* argv[])
     }
 #ifdef _WIN32
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+    /* Belt and braces: if anything calls exit() on an error path that
+     * skipped the explicit vddShutdown(), the virtual display is still
+     * detached. vddShutdown() is idempotent. */
+    atexit(vddShutdown);
 #else
     signal(SIGINT, consoleCtrlHandler);
     signal(SIGTERM, consoleCtrlHandler);
@@ -1075,9 +820,15 @@ int main(int argc, char* argv[])
     if (DISPLAY_MODE == MODE_TRUE_EXTEND) {
         int vdd_w = 1920, vdd_h = 1080;      /* default resolution */
         if (cli_mode.empty()) selectExtendResolution(vdd_w, vdd_h);
-        if (!vddStartup(vdd_w, vdd_h)) {
+        VddInfo vdd;
+        if (!vddStartup(vdd_w, vdd_h, vdd)) {
             cleanupSockets(); return 1;
         }
+        g_cap_device   = vdd.device;
+        g_cap_origin.x = vdd.x;
+        g_cap_origin.y = vdd.y;
+        SCREEN_WIDTH   = vdd.w;
+        SCREEN_HEIGHT  = vdd.h;
     }
 #endif
 
@@ -1188,24 +939,20 @@ int main(int argc, char* argv[])
          * in Windows display settings mid-stream, follow it. Tell the
          * receiver via a 0xFFFFFFFF marker + fresh 16-byte header. */
         if (DISPLAY_MODE == MODE_TRUE_EXTEND && (frames_sent & 31) == 0) {
-            MonRectSearch ms = {};
-            ms.dev = g_cap_device.c_str();
-            EnumDisplayMonitors(NULL, NULL, findMonRectProc, (LPARAM)&ms);
-            if (!ms.found) {
+            int nx = 0, ny = 0, nw = 0, nh = 0;
+            if (!vddFindMonitorRect(g_cap_device, nx, ny, nw, nh)) {
                 std::cerr << COL_RED
                           << "\nVirtual display is gone – ending session\n"
                           << COL_RESET;
                 break;
             }
-            int nw = ms.rc.right - ms.rc.left;
-            int nh = ms.rc.bottom - ms.rc.top;
             if (nw != SCREEN_WIDTH || nh != SCREEN_HEIGHT ||
-                ms.rc.left != g_cap_origin.x || ms.rc.top != g_cap_origin.y)
+                nx != g_cap_origin.x || ny != g_cap_origin.y)
             {
                 SCREEN_WIDTH   = nw;
                 SCREEN_HEIGHT  = nh;
-                g_cap_origin.x = ms.rc.left;
-                g_cap_origin.y = ms.rc.top;
+                g_cap_origin.x = nx;
+                g_cap_origin.y = ny;
 
                 struct { uint32_t w, h, fps, mode; } rs = {
                     htonl((uint32_t)SCREEN_WIDTH),

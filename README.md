@@ -73,7 +73,7 @@ TwinView（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工�
 
 | 类别 | 能力 |
 |------|------|
-| **扩展屏** | 会话开始自动附加虚拟显示器，会话结束（含 Ctrl+C）自动分离 |
+| **扩展屏** | 会话开始自动启用并挂载虚拟显示器，任何退出路径（正常结束 / Ctrl+C / 断开 / 关窗 / 强杀兜底）都分离并禁用设备，彻底从系统设置消失 |
 | **虚拟显示器集成** | 程序内完成激活/停用/定位（CCD API），无需手动操作显示设置 |
 | **鼠标可见** | 光标直接绘制进视频帧；扩展模式下即"指针穿越" |
 | **直连模式** | `sender <IP>` 跳过发现阶段，SSDP 多播被网络策略拦截时仍可连接 |
@@ -95,11 +95,12 @@ TwinView/
 ├── makefile                  # 跨平台构建（Linux/macOS/Windows MinGW）
 ├── src/
 │   ├── app.cpp               # 图形启动器（SDL2 + SDL2_ttf）：接收/发送/搜索/投屏
-│   ├── sender.cpp            # 采集、握手、推流、虚拟显示器生命周期管理
+│   ├── sender.cpp            # 采集、握手、推流
 │   ├── receiver.cpp          # 全屏显示、SSDP 广播、计算服务、端口服务
 │   ├── discover.cpp/.h       # SSDP 发现引擎
 │   ├── gpu_accelerate.c/.h   # 远程 CPU 卸载（RLE 压缩 / 色彩修正）
-│   └── ports.cpp/.h          # 远程端口检查服务
+│   ├── ports.cpp/.h          # 远程端口检查服务
+│   └── vdd.cpp/.h            # Windows 虚拟显示器生命周期（sender + GUI 共用）
 ├── bin/                      # 可执行程序 + 运行时 DLL（构建输出）
 ├── scripts/                  # Windows 便捷启动脚本
 ├── installer/                # Inno Setup 打包脚本（TwinView.iss）
@@ -113,7 +114,7 @@ TwinView/
 | 程序 | 职责 |
 |------|------|
 | `app` | 图形启动器：接收/发送选择、SSDP 搜索、机器列表（投屏/扩展）、手动 IP |
-| `sender` | 采集画面（GDI/X11/CoreGraphics），协商模式，推流；扩展模式下管理虚拟显示器的激活与定位 |
+| `sender` | 采集画面（GDI/X11/CoreGraphics），协商模式，推流；扩展模式下经 vdd 模块管理虚拟显示器的激活与定位 |
 | `receiver` | SSDP 广播，全屏渲染，承载计算卸载与端口检查两个附加服务 |
 
 ### 网络端口
@@ -170,17 +171,36 @@ bin/sender 192.168.1.105 --mode extend    # 非交互：直接指定 mirror / ex
 ```
 选择扩展模式
   → vddStartup()：
-      CCD SetDisplayConfig 激活虚拟显示器（若未激活）
+      启用 Root\MttVDD 设备（若被禁用；SetupAPI，需管理员）
+      → CCD SetDisplayConfig 激活虚拟显示器（若上次会话遗留则直接接管）
       → 定位到现有桌面右侧，1920x1080@60
       → 自动锁定该显示器为采集源
   → 握手、推流（窗口/鼠标可穿越到虚拟屏）
-  → 会话结束 / Ctrl+C
-  → vddShutdown()：分离虚拟显示器（仅当它由本程序激活时）
+  → 会话结束 / Ctrl+C / 断开连接 / 关闭控制台窗口
+  → vddShutdown()：分离虚拟显示器 + 禁用 Root\MttVDD 设备
+      → 虚拟屏从「设置 → 屏幕」彻底消失（不是仅从桌面分离）
 ```
 
-实现于 [sender.cpp](src/sender.cpp) 的 `vddStartup` / `vddShutdown`，基于
-Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）与
-`ChangeDisplaySettingsEx`。
+实现于 [vdd.cpp](src/vdd.cpp) / [vdd.h](src/vdd.h)（sender 与 GUI 共用），基于
+Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
+`ChangeDisplaySettingsEx` 与 SetupAPI 设备启停（`DIF_PROPERTYCHANGE`）。
+
+> 注意：仅做 CCD 分离是不够的——PnP 显示设备仍会出现在「设置 → 屏幕」里并可被
+> 扩展。所以每次会话结束会**禁用设备**（整个 IddCx/UMDF 栈下线），下次扩展会话
+> 开始时自动重新启用。按硬件 ID `Root\MttVDD` 精确匹配，不影响其它厂商的虚拟
+> 显示适配器。
+
+**虚拟显示器不会残留**——所有退出路径都会拆除并禁用它：
+
+| 退出路径 | 处理方式 |
+|----------|----------|
+| 正常结束 / 对端断开 / 发送失败 | `main` 收尾时 `vddShutdown()` |
+| Ctrl+C | 优雅退出，同样走收尾 |
+| 关闭 sender 控制台窗口（X） | 在 `CTRL_CLOSE_EVENT` 处理函数内直接拆除 |
+| 进程 `exit()` | `atexit(vddShutdown)` 兜底 |
+| GUI「停止推流」 | 先发 Ctrl+C 优雅停止（最长等 8 秒），若被强杀则 GUI 调 `vddForceDetach()` 兜底 |
+
+推流套接字带 2 秒发送超时：对端断开或假死时发送很快失败，会话立即收尾拆除虚拟显示器，不会卡死。
 
 ### 4 — 帧流
 
@@ -228,6 +248,9 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）与
 - MinGW-w64（MSYS2）+ make——**不支持 MSVC**（构建仅走 g++/makefile）
 - SDL2、SDL2_ttf（MSYS2 包），Windows SDK（iphlpapi，端口检查器需要）
 - 扩展模式：虚拟显示器驱动（见[下文](#windows-虚拟显示器驱动)）
+- `sender` / `app` 内嵌 `requireAdministrator` 清单——**需以管理员运行**（启动时
+  UAC 确认一次）。扩展模式要用管理员权限启用/禁用虚拟显示设备，使其会话结束后
+  从「设置 → 屏幕」彻底消失。`receiver` 不需要。
 
 **macOS**
 
@@ -324,7 +347,7 @@ Windows 下也可用 `scripts/` 中的快捷脚本：`start_receiver.bat` 一键
 
 | 输入 | 作用 |
 |------|------|
-| Ctrl+C | 优雅退出（含虚拟显示器分离） |
+| Ctrl+C | 优雅退出（含虚拟显示器分离 + 设备禁用） |
 | 模式提示处 1/2 | 镜像 / 扩展（仅命令行交互模式） |
 
 ---
@@ -333,7 +356,7 @@ Windows 下也可用 `scripts/` 中的快捷脚本：`start_receiver.bat` 一键
 
 扩展模式依赖间接显示驱动（IddCx）提供虚拟显示器。本项目适配 **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**（MIT 协议，SignPath 正规签名）。
 
-驱动**只需安装一次**。装好后无需任何手动操作——sender 会在扩展会话开始时自动激活虚拟显示器、结束时自动分离。
+驱动**只需安装一次**。装好后无需任何手动操作——sender 会在扩展会话开始时自动启用设备并激活虚拟显示器、结束时分离并禁用设备（彻底从「设置 → 屏幕」消失）。
 
 ### 安装步骤（管理员 PowerShell）
 
@@ -356,7 +379,7 @@ pnputil /scan-devices
 
 ### 分辨率说明
 
-虚拟显示器激活后由 sender 自动配置为 **1920x1080@60** 并置于现有桌面右侧。如需修改默认分辨率，编辑 sender.cpp 中 `vddStartup()` 里的 `vddConfigure(dev, x, 0, 1920, 1080, 60)` 调用，或编辑驱动的 `vdd_settings.xml` 添加模式后重新编译。
+虚拟显示器激活后由 sender 自动配置为 **1920x1080@60** 并置于现有桌面右侧。分辨率可在会话开始时选择（交互模式）或默认 1920x1080；如需修改默认值，编辑 vdd.cpp 中 `vddStartup()` 里的 `vddConfigure(dev, x, 0, w, h, 60)` 调用，或编辑驱动的 `vdd_settings.xml` 添加模式后重新编译。
 
 ---
 
@@ -423,7 +446,7 @@ sudo ufw allow 8083/tcp comment 'TwinView Port Inspector'
 | "Virtual display driver not found" | MttVDD 驱动未安装 | 按[安装步骤](#windows-虚拟显示器驱动)安装驱动 |
 | "Virtual display did not come up" | 驱动安装但激活失败 | `pnputil /enum-devices /class Monitor` 检查设备状态，重启后再试 |
 | 扩展模式黑屏 / 无画面 | 两端握手不一致（模式值 0=镜像 1=扩展） | 接收端与发送端使用同版本二进制 |
-| Ctrl+C 后虚拟屏仍在 | 旧版本无优雅退出 | 已修复；确认使用新版 sender |
+| 断开后虚拟屏仍在「设置 → 屏幕」 | 旧版本只做 CCD 分离，或未以管理员运行 | 已修复：退出时禁用 Root\MttVDD 设备（需管理员权限运行 sender/app）。若日志出现 disable 失败，可在设备管理器手动禁用「Virtual Display Driver」 |
 
 ### 诊断命令
 

@@ -73,7 +73,7 @@ Extend mode requires a Windows indirect display driver (IddCx); see [installatio
 
 | Category | Capability |
 |----------|-----------|
-| **Extend mode** | Virtual display auto-attached at session start, auto-detached at session end (including Ctrl+C) |
+| **Extend mode** | Virtual display auto-enabled and attached at session start; on every exit path (normal end / Ctrl+C / disconnect / console close / hard-kill fallback) it is detached and the device is disabled, so it vanishes from system settings completely |
 | **Virtual display integration** | Activation/deactivation/positioning done in-process via the CCD API — no manual display-settings fiddling |
 | **Visible cursor** | The pointer is drawn into the video frames; in extend mode this equals "pointer crossing" |
 | **Direct connect** | `sender <IP>` skips discovery — works when SSDP multicast is blocked by network policy |
@@ -95,11 +95,12 @@ TwinView/
 ├── makefile                  # Cross-platform build (Linux/macOS/Windows MinGW)
 ├── src/
 │   ├── app.cpp               # GUI launcher (SDL2 + SDL2_ttf): receive/send/search/cast
-│   ├── sender.cpp            # Capture, handshake, streaming, virtual-display lifecycle
+│   ├── sender.cpp            # Capture, handshake, streaming
 │   ├── receiver.cpp          # Fullscreen render, SSDP broadcast, compute + port services
 │   ├── discover.cpp/.h       # SSDP discovery engine
 │   ├── gpu_accelerate.c/.h   # Remote CPU offload (RLE compress / color convert)
-│   └── ports.cpp/.h          # Remote port inspection service
+│   ├── ports.cpp/.h          # Remote port inspection service
+│   └── vdd.cpp/.h            # Windows virtual-display lifecycle (shared by sender + GUI)
 ├── bin/                      # Executables + runtime DLLs (build output)
 ├── scripts/                  # Windows convenience launch scripts
 ├── installer/                # Inno Setup packaging script (TwinView.iss)
@@ -113,7 +114,7 @@ TwinView/
 | Program | Responsibility |
 |---------|----------------|
 | `app` | GUI launcher: receive/send choice, SSDP search, device list (cast/extend), manual IP |
-| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode |
+| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode via the vdd module |
 | `receiver` | SSDP broadcast, fullscreen rendering, hosts the two sidecar services |
 
 ### Network Ports
@@ -170,16 +171,42 @@ Receiver → Sender   (12 bytes)
 ```
 Extend mode selected
   → vddStartup():
-      CCD SetDisplayConfig activates the virtual display (if not already active)
+      enable the Root\MttVDD device (if disabled; SetupAPI, needs admin)
+      → CCD SetDisplayConfig activates the virtual display (takes it over
+        if left over from a previous session)
       → positioned right of the existing desktop, 1920x1080@60
       → locked as the capture source
   → handshake, stream (windows/mouse can cross into the virtual screen)
-  → session end / Ctrl+C
-  → vddShutdown(): detaches the virtual display (only if this program attached it)
+  → session end / Ctrl+C / peer disconnect / console window closed
+  → vddShutdown(): detach the virtual display + DISABLE the Root\MttVDD
+    device → the virtual screen vanishes from Settings > Display entirely
+    (not merely detached from the desktop)
 ```
 
-Implemented in `vddStartup` / `vddShutdown` in [sender.cpp](src/sender.cpp), built on the
-Windows CCD API (`QueryDisplayConfig` / `SetDisplayConfig`) and `ChangeDisplaySettingsEx`.
+Implemented in [vdd.cpp](src/vdd.cpp) / [vdd.h](src/vdd.h) (shared by the sender and the GUI), built on the
+Windows CCD API (`QueryDisplayConfig` / `SetDisplayConfig`),
+`ChangeDisplaySettingsEx`, and SetupAPI device enable/disable (`DIF_PROPERTYCHANGE`).
+
+> Note: a CCD detach alone is NOT enough — the PnP display device still
+> shows up in Settings > Display and can still be extended to. Every
+> session end therefore **disables the device** (the whole IddCx/UMDF
+> stack goes down), and the next extend session re-enables it
+> automatically. Matching is exact on hardware ID `Root\MttVDD`, so other
+> vendors' virtual display adapters are untouched.
+
+**The virtual display never lingers** – every exit path tears it down and disables it:
+
+| Exit path | Handling |
+|-----------|----------|
+| Normal end / peer disconnect / send failure | `vddShutdown()` in `main` cleanup |
+| Ctrl+C | Graceful exit, same cleanup |
+| Sender console window closed (X) | Detached inside the `CTRL_CLOSE_EVENT` handler |
+| Process `exit()` | `atexit(vddShutdown)` fallback |
+| GUI "Stop streaming" | Ctrl+C graceful stop first (waits up to 8 s), then the GUI calls `vddForceDetach()` if the sender had to be hard-killed |
+
+The streaming socket has a 2 s send timeout: when the peer disconnects or
+goes silent the send fails quickly, the session ends, and the virtual
+display is detached immediately instead of hanging.
 
 ### 4 — Frame Streaming
 
@@ -227,6 +254,10 @@ Receiver  →  read frame header, read frame body
 - MinGW-w64 (MSYS2) + make — **MSVC is not supported** (the build only goes through g++/makefile)
 - SDL2, SDL2_ttf (MSYS2 packages), Windows SDK (iphlpapi, needed by the port inspector)
 - Extend mode: virtual display driver (see [below](#windows-virtual-display-driver))
+- `sender` / `app` embed a `requireAdministrator` manifest — **they must run elevated**
+  (one UAC prompt at launch). Extend mode needs admin rights to enable/disable the
+  virtual display device so it disappears from Settings > Display after the session.
+  `receiver` does not.
 
 **macOS**
 
@@ -323,7 +354,7 @@ On Windows you can also use the convenience scripts in `scripts/`: `start_receiv
 
 | Input | Action |
 |-------|--------|
-| Ctrl+C | Graceful exit (virtual display detached) |
+| Ctrl+C | Graceful exit (virtual display detached + device disabled) |
 | Mode prompt 1/2 | Mirror / Extend (interactive CLI only) |
 
 ---
@@ -332,7 +363,7 @@ On Windows you can also use the convenience scripts in `scripts/`: `start_receiv
 
 Extend mode relies on an indirect display driver (IddCx) to provide the virtual monitor. This project adapts **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)** (MIT license, properly signed via SignPath).
 
-The driver **only needs to be installed once**. Afterwards no manual steps are needed — sender attaches the virtual display when an extend session starts and detaches it when it ends.
+The driver **only needs to be installed once**. Afterwards no manual steps are needed — sender enables the device and attaches the virtual display when an extend session starts, and detaches + disables it when the session ends (so it disappears from Settings > Display completely).
 
 ### Installation (Administrator PowerShell)
 
@@ -355,7 +386,7 @@ pnputil /scan-devices
 
 ### Resolution Notes
 
-Once activated, the virtual display is automatically configured by sender to **1920x1080@60** and placed right of the existing desktop. To change the default, edit the `vddConfigure(dev, x, 0, 1920, 1080, 60)` call in `vddStartup()` in sender.cpp, or add modes to the driver's `vdd_settings.xml`.
+Once activated, the virtual display is automatically configured to **1920x1080@60** and placed right of the existing desktop. The resolution can be chosen at session start (interactive mode) or defaults to 1920x1080; to change the default, edit the `vddConfigure(dev, x, 0, w, h, 60)` call in `vddStartup()` in vdd.cpp, or add modes to the driver's `vdd_settings.xml`.
 
 ---
 
@@ -422,7 +453,7 @@ The receiver writes statistics to `gpu_stats.json` every 60 seconds and prints a
 | "Virtual display driver not found" | MttVDD driver not installed | Follow the [installation steps](#windows-virtual-display-driver) |
 | "Virtual display did not come up" | Driver installed but activation failed | Check device status with `pnputil /enum-devices /class Monitor`, reboot and retry |
 | Extend mode black screen / no video | Handshake mismatch between the two ends (mode 0=mirror 1=extend) | Use the same binary version on both ends |
-| Virtual display stays after Ctrl+C | Old build without graceful exit | Fixed — make sure you run the current sender |
+| Virtual display stays in Settings > Display after disconnect | Older builds only did a CCD detach, or sender/app not run as admin | Fixed: the Root\MttVDD device is disabled at exit (sender/app must run elevated). If the log shows a disable failure, manually disable "Virtual Display Driver" in Device Manager |
 
 ### Diagnostic Commands
 

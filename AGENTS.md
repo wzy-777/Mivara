@@ -33,14 +33,16 @@ make install-deps     # apt/dnf/pacman/brew + MSYS2
 - `sender` links as a **console** subsystem app (logs + interactive prompts + Ctrl+C). `receiver` and `app` link with `-mwindows` (GUI, stdout discarded).
 - SDL2_ttf needs a CJK font at runtime; `app.cpp` probes `msyh.ttc`/`simhei.ttf`/NotoSansCJK/wqy and exits with an error if none found.
 - The runtime DLL closure must sit in `bin/` next to the exes (already there). After adding a library, verify with `ldd bin/<exe>.exe` and copy missing DLLs into `bin/`.
-- Extend mode needs the MttVDD indirect-display driver installed once (`vdd/install_vdd.ps1`). `sender` auto-attaches/detaches a virtual display per session via CCD API (`vddStartup`/`vddShutdown` in `sender.cpp`). **Never break the Ctrl+C graceful path** — a hard exit leaves the virtual display attached to the user's desktop. The GUI stops the sender by sending Ctrl+C (`GenerateConsoleCtrlEvent`) and only hard-kills after a 3 s timeout.
+- Extend mode needs the MttVDD indirect-display driver installed once (`vdd/install_vdd.ps1`). The virtual display lifecycle lives in `src/vdd.cpp`/`vdd.h` (`vddStartup`/`vddShutdown`/`vddForceDetach`, CCD API + SetupAPI device enable/disable) and is linked into both `sender` and `app`. **Never break the Ctrl+C graceful path** — a hard exit leaves the virtual display attached to the user's desktop. Covered exit paths: normal end, send failure, Ctrl+C, console-window close (detaches inside the `CTRL_CLOSE_EVENT` handler), `atexit`. The GUI stops the sender by sending Ctrl+C (`GenerateConsoleCtrlEvent`), hard-kills only after an 8 s timeout, and calls `vddForceDetach()` as a safety net after a hard kill.
+- A CCD detach alone leaves the monitor visible in Settings > Display — teardown MUST also disable the PnP device (hardware ID `Root\MttVDD`, instance `ROOT\DISPLAY\000x`; match on hardware IDs, never touch other vendors' virtual display adapters). Enabling/disabling requires elevation: `sender` and `app` embed a `requireAdministrator` manifest via `res/admin.rc` + `res/admin.manifest` (windres, see makefile `RES_ADMIN`). `receiver` is not elevated. Disable failure degrades gracefully (warn + CCD-only).
 - `scripts/*.bat` are convenience wrappers that launch `bin/` exes; `启动投屏发送.bat` takes the receiver IP as an argument.
 
 ## Architecture (actual wiring)
 
 | File | Role |
 |------|------|
-| `src/sender.cpp` | capture (GDI/X11/CoreGraphics), handshake, streaming, virtual-display lifecycle. Biggest file — most work lands here. |
+| `src/sender.cpp` | capture (GDI/X11/CoreGraphics), handshake, streaming. Biggest file — most work lands here. |
+| `src/vdd.cpp/.h` | Windows virtual display (MttVDD) lifecycle: enable/disable PnP device (SetupAPI) + attach/detach/position via CCD API. Linked into sender + app. |
 | `src/receiver.cpp` | SSDP broadcast, SDL2 fullscreen render, hosts the two sidecar services |
 | `src/discover.cpp/.h` | SSDP discovery engine (UDP 1900) |
 | `src/gpu_accelerate.c/.h` | remote CPU offload protocol (RLE compress / color convert) served on 8082 |

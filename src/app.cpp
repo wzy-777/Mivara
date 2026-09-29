@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "discover.h"
+#include "vdd.h"
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -97,6 +98,7 @@ static std::vector<Button>   g_buttons;
 static std::string           g_manual_ip;
 static std::string           g_status_note;      /* extra line on status screens */
 static std::string           g_child_label;      /* "投屏" / "扩展" / "接收" */
+static bool                  g_child_extend = false;  /* sender in extend mode? */
 
 static std::vector<DiscoveredDevice> g_devices;
 static std::mutex                  g_dev_mtx;
@@ -242,30 +244,47 @@ static bool spawnChild(const std::string &path, const std::vector<std::string> &
 }
 
 /* Graceful stop: Ctrl+C (Windows) / SIGINT (POSIX) so the sender runs its
- * cleanup path including vddShutdown(). Falls back to hard kill after 3 s. */
+ * cleanup path including vddShutdown(). Falls back to hard kill after 8 s
+ * (vddShutdown + SetDisplayConfig can take a few seconds), then force-
+ * detaches the virtual display so it can never linger after a stop. */
 static void stopChild()
 {
     if (!g_child.active) return;
 #ifdef _WIN32
     FreeConsole();
     SetConsoleCtrlHandler(nullptr, TRUE);          /* GUI ignores Ctrl+C */
+    bool hard_kill = false;
     if (AttachConsole(g_child.pi.dwProcessId)) {
         GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-        if (WaitForSingleObject(g_child.pi.hProcess, 3000) == WAIT_TIMEOUT)
+        if (WaitForSingleObject(g_child.pi.hProcess, 8000) == WAIT_TIMEOUT) {
             TerminateProcess(g_child.pi.hProcess, 1);
+            hard_kill = true;
+        }
         FreeConsole();
     } else {
         TerminateProcess(g_child.pi.hProcess, 1);
+        hard_kill = true;
     }
     CloseHandle(g_child.pi.hProcess);
     CloseHandle(g_child.pi.hThread);
     g_child.active = false;
+    /* Safety net: a hard-killed extend sender never reached its own
+     * vddShutdown() – detach the virtual display from here instead. */
+    if (hard_kill && g_child_extend) {
+        std::cout << "强制停止：正在移除虚拟显示器...\n";
+        if (vddForceDetach())
+            std::cout << "虚拟显示器已移除\n";
+        else
+            std::cout << "虚拟显示器移除失败（可能本就未激活）\n";
+    }
+    g_child_extend = false;
 #else
     kill(g_child.pid, SIGINT);
     for (int i = 0; i < 30; i++) {
         int st = 0;
         if (waitpid(g_child.pid, &st, WNOHANG) == g_child.pid) {
             g_child.active = false;
+            g_child_extend = false;
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -273,6 +292,7 @@ static void stopChild()
     kill(g_child.pid, SIGKILL);
     waitpid(g_child.pid, nullptr, 0);
     g_child.active = false;
+    g_child_extend = false;
 #endif
 }
 
@@ -342,6 +362,7 @@ static void launchStream(const std::string &ip, int port, bool extend)
         g_screen = SCR_NOT_FOUND;
         return;
     }
+    g_child_extend = extend;
     g_child_label = extend ? "扩展" : "投屏";
     g_status_note = "目标: " + ip + ":" + std::to_string(port);
     g_screen = SCR_STREAMING;
@@ -363,6 +384,7 @@ static void launchReceiver()
         g_screen = SCR_HOME;
         return;
     }
+    g_child_extend = false;
     g_child_label = "接收";
     g_status_note.clear();
     g_screen = SCR_RECEIVING;

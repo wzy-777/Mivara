@@ -74,6 +74,7 @@ ifeq ($(UNAME_S),Linux)
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lX11
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
+    RES_ADMIN     :=
 endif
 
 # --------------------------------------------------------------------------
@@ -92,6 +93,7 @@ ifeq ($(UNAME_S),Darwin)
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -framework CoreGraphics -framework CoreFoundation
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
+    RES_ADMIN     :=
 endif
 
 # --------------------------------------------------------------------------
@@ -117,9 +119,12 @@ ifeq ($(OS),Windows_NT)
 
     NET_LIBS := -lws2_32 -liphlpapi -lpthread
     # sender: console subsystem (logs + Ctrl+C graceful stop), no SDL
-    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32
+    # -lsetupapi: enable/disable the Root\MttVDD device (vdd.cpp)
+    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
-    APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
+    APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -lsetupapi
+    # requireAdministrator manifest resource for sender + app
+    RES_ADMIN := $(BUILDDIR)/admin_rc.o
 endif
 
 # ============================================================================
@@ -133,6 +138,7 @@ APP_BIN      := $(BINDIR)/app$(EXE)
 OBJ_DISCOVER := $(BUILDDIR)/discover.o
 OBJ_GPU      := $(BUILDDIR)/gpu_accelerate.o
 OBJ_PORTS    := $(BUILDDIR)/ports.o
+OBJ_VDD      := $(BUILDDIR)/vdd.o
 OBJ_APP      := $(BUILDDIR)/app.o
 OBJ_SENDER   := $(BUILDDIR)/sender.o
 OBJ_RECEIVER := $(BUILDDIR)/receiver.o
@@ -164,6 +170,12 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp | $(BUILDDIR)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# requireAdministrator manifest resource (Windows only; RES_ADMIN empty elsewhere)
+ifneq ($(RES_ADMIN),)
+$(RES_ADMIN): res/admin.rc res/admin.manifest | $(BUILDDIR)
+	windres res/admin.rc -O coff -o $@
+endif
+
 # SDL headers/flags only for the two SDL binaries – sender must NOT get
 # -Dmain=SDL_main (pkg-config sdl2 cflags) since it links without SDL2main.
 $(OBJ_APP) $(OBJ_RECEIVER): CXXFLAGS += $(SDL_CFLAGS)
@@ -172,14 +184,16 @@ $(OBJ_APP) $(OBJ_RECEIVER): CXXFLAGS += $(SDL_CFLAGS)
 $(OBJ_DISCOVER): $(SRCDIR)/discover.h
 $(OBJ_PORTS): $(SRCDIR)/ports.h
 $(OBJ_GPU): $(SRCDIR)/gpu_accelerate.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h
+$(OBJ_VDD): $(SRCDIR)/vdd.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h
 $(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h
 
 # ============================================================================
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
@@ -187,7 +201,7 @@ $(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) | $(BIN
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
-$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) | $(BINDIR)
+$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
 	@echo "Built $(APP_BIN)"
 
@@ -240,8 +254,16 @@ check:
 	@echo "========================================="
 	@echo "  Source files:"
 	@for f in app.cpp sender.cpp receiver.cpp discover.cpp discover.h \
-               gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h; do \
+               gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
+               vdd.cpp vdd.h; do \
         if [ -f $(SRCDIR)/$$f ]; then \
+            echo "    OK  $$f"; \
+        else \
+            echo "    MISSING  $$f"; \
+        fi; \
+    done
+	@for f in res/admin.rc res/admin.manifest; do \
+        if [ -f $$f ]; then \
             echo "    OK  $$f"; \
         else \
             echo "    MISSING  $$f"; \
