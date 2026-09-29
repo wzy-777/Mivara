@@ -54,6 +54,7 @@ make install-deps     # apt/dnf/pacman/brew + MSYS2
 
 - Handshake over TCP 8081: 16-byte request (w, h, fps, mode) / 12-byte response (w, h, status), network byte order. `mode`: 0 = mirror, 1 = extend (`MODE_MIRROR` / `MODE_TRUE_EXTEND` in `sender.cpp`).
 - Ports: 1900/udp SSDP, 8081/tcp video, 8082/tcp compute offload (`GPU_ACCEL_PORT`), 8083/tcp port inspector (`PORTS_SERVICE_PORT`).
+- SSDP discovery: sender probes **per local NIC** with multicast **and** 255.255.255.255 broadcast (enterprise nets often drop multicast). Replies are keyed on the **datagram source address**, not the LOCATION IP (multi-homed receivers may advertise the wrong NIC). Receiver's LOCATION uses `getLocalIPForPeer(requester)` (same-subnet NIC).
 - Sender and receiver must be the **same binary version** — handshake/mode mismatches render as a black screen on the receiver. When touching the handshake or mode enum, consider both sides together.
 
 ## Repo hygiene (`.gitignore` is aggressive)

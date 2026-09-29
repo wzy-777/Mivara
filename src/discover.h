@@ -35,6 +35,10 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds = 5);
 bool hasReceivers();
 std::string listDevices(const std::vector<DiscoveredDevice> &devices);
 std::string getLocalIPAddress();
+/** All usable local IPv4 addresses (skips loopback/link-local). */
+std::vector<std::string> listLocalIPv4();
+/** Local IP of the interface the kernel would use to reach peer_ip (UDP connect + getsockname). */
+std::string getLocalIPForPeer(const std::string &peer_ip);
 bool testTcpConnection(const std::string &ip, int port, int timeout_ms = 1000);
 
 #endif

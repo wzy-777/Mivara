@@ -2,11 +2,11 @@
 
 [中文](README.md) | English
 
-**Zero-config LAN screen casting / true wireless second monitor**
+**Zero-config LAN screen casting / wireless second monitor**
 
 A cross-platform C++ project: turn any computer on your LAN into a second monitor.
 
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/wzy-777/TwinView)
+[![Version](https://img.shields.io/badge/version-0.8.1-blue)](https://github.com/wzy-777/TwinView)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#requirements)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -15,22 +15,44 @@ A cross-platform C++ project: turn any computer on your LAN into a second monito
 
 ## Table of Contents
 
-- [Introduction](#introduction)
-- [Features](#features)
-- [Architecture](#architecture)
-- [How It Works](#how-it-works)
-- [Display Modes](#display-modes)
-- [Requirements](#requirements)
-- [Installing Dependencies](#installing-dependencies)
-- [Building](#building)
-- [Usage](#usage)
-- [Windows Virtual Display Driver](#windows-virtual-display-driver)
-- [Network Configuration](#network-configuration)
-- [Performance](#performance)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [Acknowledgements](#acknowledgements)
-- [License](#license)
+- [TwinView](#twinview)
+  - [Table of Contents](#table-of-contents)
+  - [Introduction](#introduction)
+  - [Features](#features)
+  - [Architecture](#architecture)
+    - [Directory Layout](#directory-layout)
+    - [Executables](#executables)
+    - [Network Ports](#network-ports)
+  - [How It Works](#how-it-works)
+    - [1 — Discovery (SSDP)](#1--discovery-ssdp)
+    - [2 — Extend Handshake](#2--extend-handshake)
+    - [3 — Virtual Display Lifecycle (Extend Mode)](#3--virtual-display-lifecycle-extend-mode)
+    - [4 — Frame Streaming](#4--frame-streaming)
+    - [5 — Sidecar Services](#5--sidecar-services)
+  - [Display Modes](#display-modes)
+  - [Requirements](#requirements)
+  - [Installing Dependencies](#installing-dependencies)
+  - [Building](#building)
+    - [Windows Console Notes](#windows-console-notes)
+    - [Packaging the Installer (Windows)](#packaging-the-installer-windows)
+  - [Usage](#usage)
+    - [GUI (recommended)](#gui-recommended)
+    - [Receiver Keys](#receiver-keys)
+    - [Sender Keys](#sender-keys)
+  - [Windows Virtual Display Driver](#windows-virtual-display-driver)
+    - [Installation (Administrator PowerShell)](#installation-administrator-powershell)
+    - [Resolution Notes](#resolution-notes)
+  - [Network Configuration](#network-configuration)
+    - [Firewall Rules (Receiver)](#firewall-rules-receiver)
+    - [Network Requirements](#network-requirements)
+  - [Performance](#performance)
+    - [Bandwidth (uncompressed RGB24)](#bandwidth-uncompressed-rgb24)
+    - [Latency](#latency)
+  - [Troubleshooting](#troubleshooting)
+    - [Diagnostic Commands](#diagnostic-commands)
+  - [Roadmap](#roadmap)
+  - [Acknowledgements](#acknowledgements)
+  - [License](#license)
 
 ---
 
@@ -51,11 +73,11 @@ Extend mode requires a Windows indirect display driver (IddCx); see [installatio
 
 | Category | Capability |
 |----------|-----------|
-| **True extend mode** | Virtual display auto-attached at session start, auto-detached at session end (including Ctrl+C) |
+| **Extend mode** | Virtual display auto-attached at session start, auto-detached at session end (including Ctrl+C) |
 | **Virtual display integration** | Activation/deactivation/positioning done in-process via the CCD API — no manual display-settings fiddling |
 | **Visible cursor** | The pointer is drawn into the video frames; in extend mode this equals "pointer crossing" |
 | **Direct connect** | `sender <IP>` skips discovery — works when SSDP multicast is blocked by network policy |
-| **Discovery** | Zero-config SSDP discovery (UDP 1900 multicast) |
+| **Discovery** | Zero-config SSDP discovery (UDP 1900 multicast + broadcast fallback) |
 | **GUI** | SDL2_ttf interface: receive/send, automatic search, device list (cast/extend), manual IP entry |
 | **Performance** | Up to 120 FPS streaming, 4 MB socket buffers, TCP_NODELAY |
 | **CPU offload** | RLE frame compression and color conversion offloaded to the receiver's CPU (TCP 8082) |
@@ -111,10 +133,14 @@ TwinView/
 
 ```
 Receiver  →  joins 239.255.255.250:1900, periodically sends NOTIFY, listens for M-SEARCH
-Sender    →  broadcasts M-SEARCH, collects 200 OK replies, lists receivers for the user
+Sender    →  sends M-SEARCH per NIC (multicast + broadcast fallback), collects 200 OK replies, lists receivers for the user
 ```
 
-If multicast is blocked by network policy (some enterprise switches), use direct connect:
+- The sender probes on every local NIC (multicast + 255.255.255.255 broadcast) — broadcast often still gets through on enterprise networks that drop multicast
+- Replies are keyed on the **datagram source address** (LOCATION may name the wrong NIC on multi-homed receivers; the source address is always reachable)
+- The receiver's LOCATION uses the NIC IP on the **same subnet** as the requester
+
+If network policy blocks even broadcast, use direct connect:
 
 ```
 bin/sender 192.168.1.105        # skip discovery, connect straight to 8081
@@ -182,7 +208,7 @@ Receiver  →  read frame header, read frame body
 | Mirror | "Cast" / `--mode mirror` (default) | Receiver shows the sender's primary screen in a resizable window |
 | Extend | "Extend" / `--mode extend` | Sender auto-activates a virtual display; receiver shows it borderless fullscreen as a **real desktop workspace** — windows can be dragged in, the mouse crosses over |
 
-> Earlier "simulated extend" variants (extend-right/below/left: fullscreen mirror with a blue seam line) were removed — they never created a real desktop workspace. True extend is always mode 2.
+> Earlier "simulated extend" variants (extend-right/below/left: fullscreen mirror with a blue seam line) were removed — they never created a real desktop workspace. Extend is always mode 2.
 
 ---
 
@@ -222,6 +248,20 @@ make install-deps          # Linux/macOS/MSYS2 automatic install
 ---
 
 ## Building
+
+Build from source in three steps: install dependencies → make → run the binaries in `bin/`.
+
+```bash
+git clone https://github.com/wzy-777/TwinView.git
+cd TwinView
+make install-deps    # 1. install system dependencies (auto-detects the package manager)
+make                 # 2. build everything (output goes to bin/)
+./bin/app            # 3. run the GUI (or bin/sender, bin/receiver)
+```
+
+> Windows: run the same commands in an MSYS2 MinGW64 terminal; MSVC is not supported.
+
+Individual targets and development helpers:
 
 ```bash
 make              # everything (bin/sender, bin/receiver, bin/app)
@@ -265,52 +305,11 @@ bin/app
 Choose "Receive" or "Send":
 
 - **Receive**: shows the local IP, ports and a "receiving" status while launching the receiver to wait for connections; "Stop" ends it
-- **Send**: shows "searching"; once devices are found, each row offers "Cast" (mirror) or "Extend" (real second desktop); streaming can be stopped at any time
+- **Send**: shows "searching"; once devices are found, each row offers "Cast" (mirror) or "Extend"; streaming can be stopped at any time
 - **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same cast/extend choice
 - **ESC**: back from the manual-IP page; on other pages stop the current session and return home; on the home screen quits
 
 On Windows you can also use the convenience scripts in `scripts/`: `start_receiver.bat` starts the receiver in one click; `启动投屏发送.bat <receiver-IP>` direct-connects and sends.
-
-### Command Line
-
-**Receiver machine** (the machine that becomes the monitor):
-
-```
-bin/receiver
-```
-
-**Sender machine** (the screen source):
-
-```
-bin/sender                      # SSDP auto-discovery
-bin/sender 192.168.1.105        # direct connect (recommended, skips discovery)
-bin/sender 192.168.1.105 --mode extend   # non-interactive mode selection
-```
-
-Interactive flow (sender):
-
-```
-Direct connection mode: 192.168.1.105:8081
-Selected: 192.168.1.105:8081
-
-  Select display mode:
-  1  Mirror        (duplicate this screen)
-  2  Extend        (real 2nd desktop – virtual display is
-                   attached automatically for the session)
-  Choice [1]: 2
-
-Mode: Extend
-Activating virtual display...
-Virtual display ready: \\.\DISPLAY18  1920x1080 @(3840,0)
-Extended desktop active:
-  Sender:   1920x1080
-  Receiver: 1920x1080
-  Layout:   Extend
-  Total:    1920x1080 (real desktop space – move windows & mouse across)
-Streaming – Ctrl+C to stop
-```
-
-The virtual display detaches automatically after Ctrl+C or a stream interruption.
 
 ### Receiver Keys
 
@@ -416,7 +415,7 @@ The receiver writes statistics to `gpu_stats.json` every 60 seconds and prints a
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| No receivers found | UDP 1900 multicast blocked | Use direct connect `sender <IP>` |
+| No receivers found | UDP 1900 multicast and broadcast both blocked | Use direct connect `sender <IP>` |
 | Exits instantly / no logs from receiver | `receiver`/`app` use the GUI subsystem (-mwindows), stdout discarded | sender logs to console natively; relink receiver/app with `-mconsole` to see output |
 | Missing *.dll | Incomplete runtime DLL closure | Resolve with `ldd bin/app.exe` and copy missing DLLs into `bin/` (next to the exe) |
 | Connection refused | Receiver not running | Check port 8081, restart the receiver |
@@ -438,10 +437,8 @@ make check                                          # environment self-check
 ## Roadmap
 
 - [x] Screen mirroring
-- [x] **True extend mode (virtual display auto attach/detach + per-monitor capture + pointer crossing, Windows)**
+- [x] Extend mode (virtual display auto attach/detach + per-monitor capture + pointer crossing, Windows)
 - [x] Direct connect (bypass SSDP multicast)
-- [x] Mouse cursor drawn into frames
-- [x] Graceful exit (Ctrl+C triggers virtual display detach)
 - [x] Remote CPU offload (RLE compression + color conversion, real timing)
 - [x] Extend handshake (resolution exchange)
 - [x] GUI launcher (SDL2_ttf interface: receive/send/search/device list/manual IP)
@@ -457,6 +454,7 @@ make check                                          # environment self-check
 - [ ] Adaptive frame rate
 - [ ] Wayland support
 - [ ] Virtual display solutions for macOS/Linux
+- [ ] Screen stitching
 
 ---
 

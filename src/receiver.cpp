@@ -456,10 +456,14 @@ static void ssdpAdvertisementThread()
         char buf[2048];
         struct sockaddr_in from = {};
         ACCEPT_LEN_T flen = sizeof(from);
-        std::string lip = getLocalIPAddress();
         while (g_running) {
+#ifdef _WIN32
+            DWORD tv = 1000; /* SO_RCVTIMEO is DWORD ms on Windows */
+            setsockopt(rsock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
+#else
             struct timeval tv = {1, 0};
             setsockopt(rsock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
+#endif
             int n = (int)recvfrom(rsock, buf, (int)sizeof(buf) - 1, 0,
                                   (struct sockaddr *)&from,
                                   (ACCEPT_LEN_T *)&flen);
@@ -468,6 +472,9 @@ static void ssdpAdvertisementThread()
             std::string req(buf);
             if (req.find("M-SEARCH")                == std::string::npos) continue;
             if (req.find("urn:screen-share:receiver") == std::string::npos) continue;
+            /* Advertise the IP of the NIC facing the requester (multi-homed safe) */
+            std::string lip = getLocalIPForPeer(inet_ntoa(from.sin_addr));
+            if (lip.empty()) lip = getLocalIPAddress();
             std::string resp_str =
                 "HTTP/1.1 200 OK\r\n"
                 "CACHE-CONTROL: max-age=30\r\n"
@@ -479,7 +486,8 @@ static void ssdpAdvertisementThread()
                 "USN: uuid:screen-share-" + lip + "\r\n\r\n";
             sendto(rsock, resp_str.c_str(), (int)resp_str.size(), 0,
                    (struct sockaddr *)&from, (ACCEPT_LEN_T)flen);
-            std::cout << "SSDP: replied to " << inet_ntoa(from.sin_addr) << "\n";
+            std::cout << "SSDP: replied to " << inet_ntoa(from.sin_addr)
+                      << " (as " << lip << ")\n";
         } });
 
     /* NOTIFY thread */
@@ -508,11 +516,17 @@ static void ssdpAdvertisementThread()
         dest.sin_family = AF_INET;
         dest.sin_port = htons(SSDP_PORT);
         inet_pton(AF_INET, SSDP_ADDR, &dest.sin_addr);
+        struct sockaddr_in bdest = {};
+        bdest.sin_family = AF_INET;
+        bdest.sin_port = htons(SSDP_PORT);
+        bdest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
         int nc = 0;
         while (g_running)
         {
             sendto(nsock, notify.c_str(), (int)notify.size(), 0,
                    (struct sockaddr *)&dest, sizeof(dest));
+            sendto(nsock, notify.c_str(), (int)notify.size(), 0,
+                   (struct sockaddr *)&bdest, sizeof(bdest));
             std::cout << "SSDP: NOTIFY #" << ++nc << "\n";
             for (int i = 0; i < 30 && g_running; i++)
                 std::this_thread::sleep_for(std::chrono::seconds(1));

@@ -3,7 +3,7 @@
 ; Output: dist\TwinView-Setup-<version>.exe
 
 #define AppName "TwinView"
-#define AppVersion "0.8.0"
+#define AppVersion "0.8.1"
 #define AppPublisher "TwinView"
 #define AppExeName "app.exe"
 

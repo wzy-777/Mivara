@@ -4,6 +4,7 @@
 #include "discover.h"
 #include <iostream>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 #include <ctime>
@@ -12,6 +13,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/socket.h>
@@ -29,6 +31,224 @@
 static const char *SSDP_MULTICAST_GROUP = "239.255.255.250";
 static const int SSDP_MULTICAST_PORT = 1900;
 static const int SOCKET_BUFFER_SIZE = 8 * 1024 * 1024; // 8MB socket buffer
+
+#ifdef _WIN32
+typedef SOCKET disc_sock_t;
+#define DISC_INVALID INVALID_SOCKET
+#define DISC_CLOSE(s) closesocket(s)
+#else
+typedef int disc_sock_t;
+#define DISC_INVALID (-1)
+#define DISC_CLOSE(s) close(s)
+#endif
+
+/**
+ * All usable local IPv4 addresses (skips loopback + link-local).
+ */
+std::vector<std::string> listLocalIPv4()
+{
+    std::vector<std::string> out;
+#ifdef _WIN32
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size = 16 * 1024;
+    std::vector<char> buf(size);
+    IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)buf.data();
+    ULONG ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &size);
+    if (ret == ERROR_BUFFER_OVERFLOW)
+    {
+        buf.resize(size);
+        addrs = (IP_ADAPTER_ADDRESSES *)buf.data();
+        ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &size);
+    }
+    if (ret != NO_ERROR)
+        return out;
+    for (IP_ADAPTER_ADDRESSES *a = addrs; a; a = a->Next)
+    {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next)
+        {
+            if (u->Address.lpSockaddr->sa_family != AF_INET)
+                continue;
+            char ipbuf[INET_ADDRSTRLEN] = {};
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)u->Address.lpSockaddr;
+            if (!inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf)))
+                continue;
+            std::string ip = ipbuf;
+            if (ip.rfind("127.", 0) == 0 || ip.rfind("169.254.", 0) == 0)
+                continue;
+            out.push_back(ip);
+        }
+    }
+#else
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) != 0)
+        return out;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+            continue;
+        char ipbuf[INET_ADDRSTRLEN] = {};
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ifa->ifa_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf)))
+            continue;
+        std::string ip = ipbuf;
+        if (ip.rfind("127.", 0) == 0 || ip.rfind("169.254.", 0) == 0)
+            continue;
+        out.push_back(ip);
+    }
+    freeifaddrs(ifaddr);
+#endif
+    return out;
+}
+
+/* ip + on-link prefix length pairs */
+struct LocalIface
+{
+    std::string ip;
+    int prefix;
+};
+
+static std::vector<LocalIface> listLocalIPv4Ifaces()
+{
+    std::vector<LocalIface> out;
+#ifdef _WIN32
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size = 16 * 1024;
+    std::vector<char> buf(size);
+    IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)buf.data();
+    ULONG ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &size);
+    if (ret == ERROR_BUFFER_OVERFLOW)
+    {
+        buf.resize(size);
+        addrs = (IP_ADAPTER_ADDRESSES *)buf.data();
+        ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &size);
+    }
+    if (ret != NO_ERROR)
+        return out;
+    for (IP_ADAPTER_ADDRESSES *a = addrs; a; a = a->Next)
+    {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next)
+        {
+            if (u->Address.lpSockaddr->sa_family != AF_INET)
+                continue;
+            char ipbuf[INET_ADDRSTRLEN] = {};
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)u->Address.lpSockaddr;
+            if (!inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf)))
+                continue;
+            std::string ip = ipbuf;
+            if (ip.rfind("127.", 0) == 0 || ip.rfind("169.254.", 0) == 0)
+                continue;
+            out.push_back({ip, (int)u->OnLinkPrefixLength});
+        }
+    }
+#else
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) != 0)
+        return out;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+            continue;
+        char ipbuf[INET_ADDRSTRLEN] = {};
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ifa->ifa_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf)))
+            continue;
+        std::string ip = ipbuf;
+        if (ip.rfind("127.", 0) == 0 || ip.rfind("169.254.", 0) == 0)
+            continue;
+        int prefix = 32;
+        if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET)
+        {
+            uint32_t mask = ntohl(((const struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr);
+            prefix = 0;
+            while (mask & 0x80000000u) { prefix++; mask <<= 1; }
+        }
+        out.push_back({ip, prefix});
+    }
+    freeifaddrs(ifaddr);
+#endif
+    return out;
+}
+
+/**
+ * Local IP of the interface facing peer_ip: prefers an on-link address in
+ * the same subnet, then the kernel route lookup. VPN/TUN proxies often
+ * hijack the route table, so the on-link check comes first.
+ */
+std::string getLocalIPForPeer(const std::string &peer_ip)
+{
+    struct in_addr peer_addr;
+    if (peer_ip.empty() || inet_pton(AF_INET, peer_ip.c_str(), &peer_addr) != 1)
+        return "";
+
+    uint32_t peer = ntohl(peer_addr.s_addr);
+    for (const LocalIface &iface : listLocalIPv4Ifaces())
+    {
+        if (iface.prefix <= 0 || iface.prefix > 32)
+            continue;
+        struct in_addr a;
+        if (inet_pton(AF_INET, iface.ip.c_str(), &a) != 1)
+            continue;
+        uint32_t local = ntohl(a.s_addr);
+        uint32_t mask = iface.prefix == 32 ? 0xFFFFFFFFu : ~((1u << (32 - iface.prefix)) - 1);
+        if ((local & mask) == (peer & mask))
+            return iface.ip;
+    }
+
+    /* Fallback: UDP connect() performs only a route lookup — no packet sent */
+    struct sockaddr_in peer_sa = {};
+    peer_sa.sin_family = AF_INET;
+    peer_sa.sin_addr = peer_addr;
+    peer_sa.sin_port = htons(9); /* arbitrary; never contacted */
+
+#ifdef _WIN32
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET)
+        return "";
+    if (connect(sock, (struct sockaddr *)&peer_sa, sizeof(peer_sa)) == SOCKET_ERROR)
+    {
+        closesocket(sock);
+        return "";
+    }
+    struct sockaddr_in local = {};
+    int len = sizeof(local);
+    if (getsockname(sock, (struct sockaddr *)&local, &len) == SOCKET_ERROR)
+    {
+        closesocket(sock);
+        return "";
+    }
+    closesocket(sock);
+#else
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+        return "";
+    if (connect(sock, (struct sockaddr *)&peer_sa, sizeof(peer_sa)) < 0)
+    {
+        close(sock);
+        return "";
+    }
+    struct sockaddr_in local = {};
+    socklen_t len = sizeof(local);
+    if (getsockname(sock, (struct sockaddr *)&local, &len) < 0)
+    {
+        close(sock);
+        return "";
+    }
+    close(sock);
+#endif
+
+    char buf[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf)))
+        return "";
+    return std::string(buf);
+}
 
 /**
  * Initialize sockets (Windows only)
@@ -58,57 +278,27 @@ void cleanupSockets()
 }
 
 /**
- * Get the local IP address of this machine
+ * Get the local IP address of this machine.
+ * Prefers real LAN addresses over tunnel/VPN ranges (Clash TUN uses 198.18.x).
  */
 std::string getLocalIPAddress()
 {
-    std::string localIP = "127.0.0.1";
-
-#ifdef _WIN32
-    char hostname[256];
-    if (gethostname(hostname, sizeof(hostname)) == 0)
+    std::vector<std::string> ips = listLocalIPv4();
+    std::string best;
+    int best_score = -999;
+    for (const std::string &ip : ips)
     {
-        struct addrinfo hints, *res;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        if (getaddrinfo(hostname, NULL, &hints, &res) == 0)
-        {
-            struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
-            localIP = inet_ntoa(addr->sin_addr);
-            freeaddrinfo(res);
-        }
+        int score = 0;
+        if (ip.rfind("10.", 0) == 0) score = 3;
+        else if (ip.rfind("192.168.", 0) == 0) score = 3;
+        else if (ip.rfind("172.", 0) == 0) score = 2;
+        else if (ip.rfind("198.18.", 0) == 0 || ip.rfind("198.19.", 0) == 0 ||
+                 ip.rfind("100.64.", 0) == 0 || ip.rfind("100.65.", 0) == 0) score = -3;
+        else score = 1;
+        if (score > best_score) { best_score = score; best = ip; }
     }
-#else
-    struct ifaddrs *ifaddr, *ifa;
-    if (getifaddrs(&ifaddr) == 0)
-    {
-        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
-        {
-            if (ifa->ifa_addr &&
-                ifa->ifa_addr->sa_family == AF_INET &&
-                (ifa->ifa_flags & IFF_UP) &&
-                !(ifa->ifa_flags & IFF_LOOPBACK))
-            {
-                struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
-                char *ip = inet_ntoa(addr->sin_addr);
-
-                if (strncmp(ip, "192.168.", 8) != 0)
-                {
-                    localIP = ip;
-                    break;
-                }
-                else if (localIP == "127.0.0.1")
-                {
-                    localIP = ip;
-                }
-            }
-        }
-        freeifaddrs(ifaddr);
-    }
-#endif
-    return localIP;
+    if (!best.empty()) return best;
+    return "127.0.0.1";
 }
 
 /**
@@ -183,28 +373,12 @@ bool testTcpConnection(const std::string &ip, int port, int timeout_ms)
 bool parseSsdpResponse(const std::string &response, std::string &ip, int &port)
 {
     size_t loc_pos = response.find("LOCATION: ");
-    // if (loc_pos == std::string::npos)
-    //     loc_pos = response.find("Location: ");
-
-    // if (loc_pos == std::string::npos)
-    //     return false;
-
-    switch (loc_pos) {
-        case std::string::npos:
-            loc_pos = response.find("Location");
-            break;
-
-        default:
-            return false;
-    }
-
-    // size_t line_end = response.find("\r\n", loc_pos);
-    // if (line_end == std::string::npos)
-    //     line_end = response.find("\n", loc_pos);
-
-    // if (line_end == std::string::npos)
-    //     return false;
-
+    if (loc_pos == std::string::npos)
+        loc_pos = response.find("Location: ");
+    if (loc_pos == std::string::npos)
+        loc_pos = response.find("Location");
+    if (loc_pos == std::string::npos)
+        return false;
 
     size_t line_end = response.find_first_of("\r\n", loc_pos);
     if (line_end == std::string::npos) {
@@ -225,11 +399,14 @@ bool parseSsdpResponse(const std::string &response, std::string &ip, int &port)
             return false;
     }
 
-    std::string url = response.substr(loc_pos + 10, line_end - loc_pos - 10);
+    /* Value starts after the header name's colon — don't hardcode "LOCATION: " length */
+    size_t colon = response.find(':', loc_pos);
+    if (colon == std::string::npos || colon >= line_end)
+        return false;
+    std::string url = response.substr(colon + 1, line_end - colon - 1);
 
     url.erase(0, url.find_first_not_of(" \t\r\n"));
     url.erase(url.find_last_not_of(" \t\r\n") + 1);
-
     size_t protocol_pos = url.find("://");
     if (protocol_pos == std::string::npos)
         return false;
@@ -281,69 +458,76 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
     if (!initSockets())
         return discovered_receivers;
 
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == INVALID_SOCKET)
-    {
-        std::cerr << "X. Failed to create socket" << std::endl;
-        cleanupSockets();
-        return discovered_receivers;
-    }
-#else
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-    {
-        std::cerr << "X. Failed to create socket" << std::endl;
-        cleanupSockets();
-        return discovered_receivers;
-    }
-#endif
-
     int reuse = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
-
-    // Set socket buffer size
     int sock_buf_size = SOCKET_BUFFER_SIZE;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&sock_buf_size, sizeof(sock_buf_size));
 
-    struct ip_mreq mreq;
-    mreq.imr_multiaddr.s_addr = inet_addr(SSDP_MULTICAST_GROUP);
-    mreq.imr_interface.s_addr = INADDR_ANY;
+    /* One socket per local NIC: binding to INADDR_ANY lets a VPN/TUN
+       (e.g. Clash) steal the source address, and the receiver's reply
+       then never comes back. */
+    std::vector<std::string> local_ips = listLocalIPv4();
+    if (local_ips.empty())
+        local_ips.push_back(""); /* fall back to INADDR_ANY */
 
-    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq)) < 0)
+    std::vector<disc_sock_t> socks;
+    for (const std::string &lip : local_ips)
     {
-        std::cerr << "X. Failed to join multicast group" << std::endl;
+        disc_sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s == DISC_INVALID)
+            continue;
+
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&sock_buf_size, sizeof(sock_buf_size));
+        int bc = 1;
+        setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char *)&bc, sizeof(bc));
+
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_port = 0;
+        if (lip.empty())
+            bind_addr.sin_addr.s_addr = INADDR_ANY;
+        else
+            inet_pton(AF_INET, lip.c_str(), &bind_addr.sin_addr);
+
+        if (bind(s, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
+        {
+            DISC_CLOSE(s);
+            continue;
+        }
+
+        /* Scope multicast to this NIC as well */
+        if (!lip.empty())
+        {
+            struct ip_mreq mreq;
+            mreq.imr_multiaddr.s_addr = inet_addr(SSDP_MULTICAST_GROUP);
+            inet_pton(AF_INET, lip.c_str(), &mreq.imr_interface);
+            setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq));
+            struct in_addr ifaddr;
+            inet_pton(AF_INET, lip.c_str(), &ifaddr);
+            setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&ifaddr, sizeof(ifaddr));
+        }
+
 #ifdef _WIN32
-        closesocket(sock);
+        /* Windows SO_RCVTIMEO takes DWORD milliseconds — a struct timeval here
+           would be misread as a 5ms timeout and discovery would give up at once */
+        DWORD tv = (DWORD)timeout_seconds * 1000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
 #else
-        close(sock);
+        struct timeval tv;
+        tv.tv_sec = timeout_seconds;
+        tv.tv_usec = 0;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
 #endif
+
+        socks.push_back(s);
+    }
+
+    if (socks.empty())
+    {
+        std::cerr << "X. Failed to create discovery sockets" << std::endl;
         cleanupSockets();
         return discovered_receivers;
     }
-
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = INADDR_ANY;
-    bind_addr.sin_port = 0;
-
-    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
-    {
-        std::cerr << "X. Failed to bind socket" << std::endl;
-#ifdef _WIN32
-        closesocket(sock);
-#else
-        close(sock);
-#endif
-        cleanupSockets();
-        return discovered_receivers;
-    }
-
-    struct timeval tv;
-    tv.tv_sec = timeout_seconds;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
 
     std::string msearch =
         "M-SEARCH * HTTP/1.1\r\n"
@@ -360,11 +544,25 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
     dest_addr.sin_port = htons(SSDP_MULTICAST_PORT);
     inet_pton(AF_INET, SSDP_MULTICAST_GROUP, &dest_addr.sin_addr);
 
-    std::cout << "📡 Sending SSDP M-SEARCH requests..." << std::endl;
+    /* Broadcast fallback: many enterprise networks drop multicast between
+       hosts but still pass subnet broadcast. Same M-SEARCH, same port. */
+    struct sockaddr_in bcast_addr;
+    memset(&bcast_addr, 0, sizeof(bcast_addr));
+    bcast_addr.sin_family = AF_INET;
+    bcast_addr.sin_port = htons(SSDP_MULTICAST_PORT);
+    bcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    std::cout << "📡 Sending SSDP M-SEARCH requests (multicast + broadcast, "
+              << socks.size() << " NIC(s))..." << std::endl;
     for (int i = 0; i < 3; i++)
     {
-        sendto(sock, msearch.c_str(), msearch.length(), 0,
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        for (disc_sock_t s : socks)
+        {
+            sendto(s, msearch.c_str(), (int)msearch.length(), 0,
+                   (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            sendto(s, msearch.c_str(), (int)msearch.length(), 0,
+                   (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
@@ -377,50 +575,74 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
     int response_count = 0;
     while (response_count < 30)
     {
-        int bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
-                             (struct sockaddr *)&sender_addr, &sender_len);
-
-        if (bytes < 0)
+        bool got_any = false;
+        for (disc_sock_t s : socks)
         {
-            break;
-        }
+            sender_len = sizeof(sender_addr);
+            int bytes = (int)recvfrom(s, buffer, (int)sizeof(buffer) - 1, 0,
+                                      (struct sockaddr *)&sender_addr, &sender_len);
 
-        buffer[bytes] = '\0';
-        std::string response(buffer);
-
-        if (response.find("urn:screen-share:receiver") != std::string::npos ||
-            response.find("screen-share") != std::string::npos)
-        {
-            std::string ip;
-            int port = 8081;
-
-            if (parseSsdpResponse(response, ip, port))
+            if (bytes < 0)
             {
-                std::cout << "✓ Found potential receiver: " << ip << ":" << port << std::endl;
+                continue;
+            }
+            got_any = true;
 
-                std::cout << "   Testing connection..." << std::endl;
-                if (testTcpConnection(ip, port, 500))
+            buffer[bytes] = '\0';
+            std::string response(buffer);
+
+            if (response.find("urn:screen-share:receiver") != std::string::npos ||
+                response.find("screen-share") != std::string::npos)
+            {
+                std::string loc_ip;
+                int port = 8081;
+                parseSsdpResponse(response, loc_ip, port); /* best-effort: at least for the port */
+
+                /* The datagram source address is by definition reachable —
+                   prefer it over LOCATION, which multi-homed receivers may
+                   fill with a wrong NIC. */
+                std::string src_ip = inet_ntoa(sender_addr.sin_addr);
+                std::string ip;
+                if (testTcpConnection(src_ip, port, 500))
                 {
+                    ip = src_ip;
+                }
+                else if (!loc_ip.empty() && loc_ip != src_ip && testTcpConnection(loc_ip, port, 500))
+                {
+                    ip = loc_ip;
+                    std::cout << "   (using LOCATION address " << loc_ip << ")" << std::endl;
+                }
+
+                if (!ip.empty())
+                {
+                    std::cout << "✓ Found receiver: " << ip << ":" << port << std::endl;
                     discovered_receivers.emplace_back(ip, port);
-                    std::cout << "   ✓ Connection successful!" << std::endl;
                 }
                 else
                 {
-                    std::cout << "   X. Connection failed (port not open)" << std::endl;
+                    std::cout << "   X. Receiver at " << src_ip << ":" << port
+                              << " not reachable (LOCATION: " << loc_ip << ")" << std::endl;
                 }
+                response_count++;
             }
-            response_count++;
         }
+        /* Every socket timed out with nothing left to read */
+        if (!got_any)
+            break;
     }
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+    for (disc_sock_t s : socks)
+        DISC_CLOSE(s);
 
     cleanupSockets();
 
+    /* Dedupe: sort first — std::unique only collapses adjacent duplicates */
+    std::sort(discovered_receivers.begin(), discovered_receivers.end(),
+              [](const DiscoveredDevice &a, const DiscoveredDevice &b)
+              {
+                  return a.ip_address < b.ip_address ||
+                         (a.ip_address == b.ip_address && a.tcp_port < b.tcp_port);
+              });
     discovered_receivers.erase(
         std::unique(discovered_receivers.begin(), discovered_receivers.end(),
                     [](const DiscoveredDevice &a, const DiscoveredDevice &b)

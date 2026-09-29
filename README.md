@@ -2,11 +2,11 @@
 
 中文 | [English](README_EN.md)
 
-**零配置局域网投屏 / 真·无线扩展屏**
+**零配置局域网投屏 / 无线扩展屏**
 
 一个跨平台的 C++ 项目：把局域网内的任何一台电脑变成你的第二台显示器。
 
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/wzy-777/TwinView)
+[![Version](https://img.shields.io/badge/version-0.8.1-blue)](https://github.com/wzy-777/TwinView)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#环境要求)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#环境要求)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -15,22 +15,44 @@
 
 ## 目录
 
-- [项目简介](#项目简介)
-- [功能特性](#功能特性)
-- [架构](#架构)
-- [工作原理](#工作原理)
-- [显示模式](#显示模式)
-- [环境要求](#环境要求)
-- [安装依赖](#安装依赖)
-- [编译](#编译)
-- [使用指南](#使用指南)
-- [Windows 虚拟显示器驱动](#windows-虚拟显示器驱动)
-- [网络配置](#网络配置)
-- [性能](#性能)
-- [故障排除](#故障排除)
-- [路线图](#路线图)
-- [致谢](#致谢)
-- [许可证](#许可证)
+- [TwinView (幻屏)](#twinview-幻屏)
+  - [目录](#目录)
+  - [项目简介](#项目简介)
+  - [功能特性](#功能特性)
+  - [架构](#架构)
+    - [目录结构](#目录结构)
+    - [可执行程序](#可执行程序)
+    - [网络端口](#网络端口)
+  - [工作原理](#工作原理)
+    - [1 — 发现（SSDP）](#1--发现ssdp)
+    - [2 — 扩展握手](#2--扩展握手)
+    - [3 — 虚拟显示器生命周期（扩展模式）](#3--虚拟显示器生命周期扩展模式)
+    - [4 — 帧流](#4--帧流)
+    - [5 — 附加服务](#5--附加服务)
+  - [显示模式](#显示模式)
+  - [环境要求](#环境要求)
+  - [安装依赖](#安装依赖)
+  - [编译](#编译)
+    - [Windows 控制台说明](#windows-控制台说明)
+    - [打包安装程序（Windows）](#打包安装程序windows)
+  - [使用指南](#使用指南)
+    - [图形界面（推荐）](#图形界面推荐)
+    - [接收端按键](#接收端按键)
+    - [发送端按键](#发送端按键)
+  - [Windows 虚拟显示器驱动](#windows-虚拟显示器驱动)
+    - [安装步骤（管理员 PowerShell）](#安装步骤管理员-powershell)
+    - [分辨率说明](#分辨率说明)
+  - [网络配置](#网络配置)
+    - [防火墙规则（接收端）](#防火墙规则接收端)
+    - [网络要求](#网络要求)
+  - [性能](#性能)
+    - [带宽（未压缩 RGB24）](#带宽未压缩-rgb24)
+    - [延迟](#延迟)
+  - [故障排除](#故障排除)
+    - [诊断命令](#诊断命令)
+  - [路线图](#路线图)
+  - [致谢](#致谢)
+  - [许可证](#许可证)
 
 ---
 
@@ -51,11 +73,11 @@ TwinView（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工�
 
 | 类别 | 能力 |
 |------|------|
-| **真·扩展屏** | 会话开始自动附加虚拟显示器，会话结束（含 Ctrl+C）自动分离 |
+| **扩展屏** | 会话开始自动附加虚拟显示器，会话结束（含 Ctrl+C）自动分离 |
 | **虚拟显示器集成** | 程序内完成激活/停用/定位（CCD API），无需手动操作显示设置 |
 | **鼠标可见** | 光标直接绘制进视频帧；扩展模式下即"指针穿越" |
 | **直连模式** | `sender <IP>` 跳过发现阶段，SSDP 多播被网络策略拦截时仍可连接 |
-| **发现** | SSDP（UDP 1900 多播）零配置自动发现接收端 |
+| **发现** | SSDP（UDP 1900 多播 + 广播兜底）零配置自动发现接收端 |
 | **图形界面** | SDL2_ttf 中文 GUI：接收/发送、自动搜索、机器列表（投屏/扩展）、手动输入 IP |
 | **性能** | 120 FPS 推流、4 MB 流 socket 缓冲、TCP_NODELAY 优化 |
 | **CPU 卸载** | RLE 帧压缩与色彩修正可卸载到接收端 CPU（TCP 8082） |
@@ -111,10 +133,14 @@ TwinView/
 
 ```
 接收端  →  加入 239.255.255.250:1900，周期 NOTIFY 广播，监听 M-SEARCH
-发送端  →  广播 M-SEARCH，收集 200 OK 应答，列出接收端供用户选择
+发送端  →  逐网卡发送 M-SEARCH（多播 + 广播兜底），收集 200 OK 应答，列出接收端供用户选择
 ```
 
-若网络策略拦截多播（部分企业网/交换机会），可使用直连模式：
+- 发送端在每块本地网卡上分别发探测（多播 + 255.255.255.255 广播），企业网丢多播时广播往往仍可达
+- 应答以**数据包源地址**为准（LOCATION 多网卡机器可能写错网卡，源地址必可达）
+- 接收端应答的 LOCATION 使用与请求方**同子网**的网卡 IP
+
+若网络策略连广播也拦截，可使用直连模式：
 
 ```
 bin/sender 192.168.1.105        # 跳过发现，直接连接 8081
@@ -183,7 +209,7 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）与
 | 镜像 | 「投屏」/ `--mode mirror`（默认） | 接收端以可缩放窗口显示发送端主屏画面 |
 | 扩展 | 「扩展」/ `--mode extend` | 发送端自动激活虚拟显示器；接收端无边框全屏显示这块**真实桌面空间**——窗口可拖入、鼠标可穿越 |
 
-> 早期版本的"模拟扩展"（extend-right/below/left：接收端全屏显示主屏画面并画一条蓝色拼接线）已移除——它们并不创建真实桌面空间。真实扩展一律使用模式 2。
+> 早期版本的"模拟扩展"（extend-right/below/left：接收端全屏显示主屏画面并画一条蓝色拼接线）已移除——它们并不创建真实桌面空间。扩展一律使用模式 2。
 
 ---
 
@@ -223,6 +249,20 @@ make install-deps          # Linux/macOS/MSYS2 自动安装
 ---
 
 ## 编译
+
+从源码编译三步：装依赖 → make → 运行 `bin/` 下的产物。
+
+```bash
+git clone https://github.com/wzy-777/TwinView.git
+cd TwinView
+make install-deps    # 1. 安装系统依赖（Linux/macOS/MSYS2 自动识别包管理器）
+make                 # 2. 编译全部程序（产物输出到 bin/）
+./bin/app            # 3. 运行图形界面（或 bin/sender、bin/receiver）
+```
+
+> Windows：在 MSYS2 MinGW64 终端中执行同样的命令；不支持 MSVC。
+
+可单独构建或使用开发辅助目标：
 
 ```bash
 make              # 全部构建（bin/sender、bin/receiver、bin/app）
@@ -266,52 +306,11 @@ bin/app
 打开后选择「接收」或「发送」：
 
 - **接收**：显示本机 IP、端口与"正在接收"状态，同时启动接收端等待连接；「停止接收」结束
-- **发送**：显示"搜索中"，搜到设备后列出机器清单，每台可选「投屏」（镜像）或「扩展」（真实第二桌面）；推流中可「停止」
+- **发送**：显示"搜索中"，搜到设备后列出机器清单，每台可选「投屏」（镜像）或「扩展」；推流中可「停止」
 - **未搜到设备**：提供「继续搜索」「手动输入ip」「退出」三个选项；手动输入 IP 后同样进入投屏/扩展选择
 - **ESC**：手动输入页返回；其他页面停止当前会话并回首页；首页退出
 
 Windows 下也可用 `scripts/` 中的快捷脚本：`start_receiver.bat` 一键启动接收端；`启动投屏发送.bat <接收端IP>` 直连发送。
-
-### 命令行
-
-**接收端机器**（将被当作显示器的机器）：
-
-```
-bin/receiver
-```
-
-**发送端机器**（画面来源）：
-
-```
-bin/sender                      # SSDP 自动发现
-bin/sender 192.168.1.105        # 直连模式（推荐，跳过发现）
-bin/sender 192.168.1.105 --mode extend   # 非交互直接指定模式
-```
-
-交互流程（发送端）：
-
-```
-Direct connection mode: 192.168.1.105:8081
-Selected: 192.168.1.105:8081
-
-  Select display mode:
-  1  Mirror        (duplicate this screen)
-  2  Extend        (real 2nd desktop – virtual display is
-                   attached automatically for the session)
-  Choice [1]: 2
-
-Mode: Extend
-Activating virtual display...
-Virtual display ready: \\.\DISPLAY18  1920x1080 @(3840,0)
-Extended desktop active:
-  Sender:   1920x1080
-  Receiver: 1920x1080
-  Layout:   Extend
-  Total:    1920x1080 (real desktop space – move windows & mouse across)
-Streaming – Ctrl+C to stop
-```
-
-Ctrl+C 或流中断后，虚拟显示器自动从桌面分离。
 
 ### 接收端按键
 
@@ -417,7 +416,7 @@ sudo ufw allow 8083/tcp comment 'TwinView Port Inspector'
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
-| No receivers found | UDP 1900 多播被拦 | 用直连模式 `sender <IP>` |
+| No receivers found | UDP 1900 多播/广播均被拦 | 用直连模式 `sender <IP>` |
 | 程序秒退 / 接收端无日志 | `receiver`/`app` 是 GUI 子系统（-mwindows），stdout 丢弃 | sender 自带控制台日志；receiver/app 需手动用 `-mconsole` 重新链接看输出 |
 | 找不到 *.dll | 运行时 DLL 闭包不全 | 用 `ldd bin/app.exe` 解析闭包，把缺失 DLL 拷到 `bin/`（与 exe 同目录） |
 | Connection refused | 接收端未运行 | 检查 8081 端口，重启接收端 |
@@ -439,10 +438,8 @@ make check                                        # 环境自检
 ## 路线图
 
 - [x] 屏幕镜像
-- [x] **真·扩展屏（虚拟显示器自动激活/分离 + 按显示器采集 + 鼠标穿越，Windows）**
+- [x] 扩展屏（虚拟显示器自动激活/分离 + 按显示器采集 + 鼠标穿越，Windows）
 - [x] 直连模式（绕过 SSDP 多播）
-- [x] 鼠标光标绘制进帧
-- [x] 优雅退出（Ctrl+C 触发虚拟显示器分离）
 - [x] 远程 CPU 卸载（RLE 压缩 + 色彩修正，真实耗时测量）
 - [x] 扩展握手（分辨率交换）
 - [x] 图形启动器（SDL2_ttf 中文界面：接收/发送/搜索/机器列表/手动 IP）
@@ -458,6 +455,7 @@ make check                                        # 环境自检
 - [ ] 自适应帧率
 - [ ] Wayland 支持
 - [ ] macOS/Linux 虚拟显示器方案
+- [ ] 屏幕拼接
 
 ---
 
