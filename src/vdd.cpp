@@ -197,10 +197,15 @@ static bool vddApplyTopology(bool active)
         else        paths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;
         touched = true;
     }
-    if (!touched) return false;
+    if (!touched) {
+        std::cerr << "VDD: no CCD paths matched the MTT/VDD monitor name\n";
+        return false;
+    }
 
     LONG st = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
                                SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY);
+    if (st != ERROR_SUCCESS)
+        std::cerr << "VDD: SetDisplayConfig failed (" << st << ")\n";
     return st == ERROR_SUCCESS;
 }
 

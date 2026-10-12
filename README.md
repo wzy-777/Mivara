@@ -6,7 +6,8 @@
 
 一个跨平台的 C++ 项目：把局域网内的任何一台电脑变成你的第二台显示器。
 
-[![Version](https://img.shields.io/badge/version-0.8.1-blue)](https://github.com/wzy-777/TwinView)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/wzy-777/TwinView)
+[![下载最新安装包](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/TwinView/releases/latest/download/TwinView-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#环境要求)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#环境要求)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -29,6 +30,8 @@
     - [3 — 虚拟显示器生命周期（扩展模式）](#3--虚拟显示器生命周期扩展模式)
     - [4 — 帧流](#4--帧流)
     - [5 — 附加服务](#5--附加服务)
+  - [编解码](#编解码)
+  - [设置与历史](#设置与历史)
   - [显示模式](#显示模式)
   - [环境要求](#环境要求)
   - [安装依赖](#安装依赖)
@@ -75,12 +78,16 @@ TwinView（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工�
 |------|------|
 | **扩展屏** | 会话开始自动启用并挂载虚拟显示器，任何退出路径（正常结束 / Ctrl+C / 断开 / 关窗 / 强杀兜底）都分离并禁用设备，彻底从系统设置消失 |
 | **虚拟显示器集成** | 程序内完成激活/停用/定位（CCD API），无需手动操作显示设置 |
+| **视频编码** | H.264 / H.265 / AV1（FFmpeg），硬件优先（NVENC/QSV/AMF/VAAPI）自动回退软件（libx264/libx265/SVT-AV1）；保留原始/RLE 无损选项 |
+| **运行时调参** | 传输中随时改编码/画质/码率/帧率/缩放/色度，秒级热生效不断流（换编码瞬断一两帧后恢复） |
 | **鼠标可见** | 光标直接绘制进视频帧；扩展模式下即"指针穿越" |
 | **直连模式** | `sender <IP>` 跳过发现阶段，SSDP 多播被网络策略拦截时仍可连接 |
-| **发现** | SSDP（UDP 1900 多播 + 广播兜底）零配置自动发现接收端 |
-| **图形界面** | SDL2_ttf 中文 GUI：接收/发送、自动搜索、机器列表（投屏/扩展）、手动输入 IP |
+| **发现** | SSDP（UDP 1900 多播 + 广播兜底）零配置自动发现接收端，显示主机名 |
+| **连接历史** | 主页内嵌最近 20 条连接，一键直连免搜索 |
+| **图形界面** | SDL2_ttf 中文 GUI：左侧导航（主页/设置）、接收/发送、连接历史、自动搜索、机器列表（投屏/扩展）、手动输入 IP、实时状态面板、独立日志窗口 |
+| **自启动 / 自动接收** | 开机自启动（Windows 计划任务，登录免 UAC）；自动接收开启后打开软件直接进入接收模式（默认关） |
 | **性能** | 120 FPS 推流、4 MB 流 socket 缓冲、TCP_NODELAY 优化 |
-| **CPU 卸载** | RLE 帧压缩与色彩修正可卸载到接收端 CPU（TCP 8082） |
+| **CPU 卸载** | RLE 帧压缩与色彩修正可卸载到接收端 CPU（TCP 8082，仅 RLE 模式） |
 | **端口检查器** | 远程列出/查询/终止接收端任意端口进程（TCP 8083） |
 | **跨平台** | Linux（X11）、Windows 10/11、macOS 10.15+ |
 
@@ -94,9 +101,13 @@ TwinView（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工�
 TwinView/
 ├── makefile                  # 跨平台构建（Linux/macOS/Windows MinGW）
 ├── src/
-│   ├── app.cpp               # 图形启动器（SDL2 + SDL2_ttf）：接收/发送/搜索/投屏
+│   ├── app.cpp               # 图形启动器（SDL2 + SDL2_ttf）：左侧导航 + 主页/设置（历史内嵌主页）
 │   ├── sender.cpp            # 采集、握手、推流
 │   ├── receiver.cpp          # 全屏显示、SSDP 广播、计算服务、端口服务
+│   ├── proto.h               # 协议 v2（握手/控制包/编码枚举）
+│   ├── codec.cpp/.h          # FFmpeg 编解码（H.264/H.265/AV1，sender + receiver）
+│   ├── config.cpp/.h         # GUI 设置持久化（config.ini）
+│   ├── history.cpp/.h        # 连接历史（history.ini）
 │   ├── discover.cpp/.h       # SSDP 发现引擎
 │   ├── gpu_accelerate.c/.h   # 远程 CPU 卸载（RLE 压缩 / 色彩修正）
 │   ├── ports.cpp/.h          # 远程端口检查服务
@@ -113,7 +124,7 @@ TwinView/
 
 | 程序 | 职责 |
 |------|------|
-| `app` | 图形启动器：接收/发送选择、SSDP 搜索、机器列表（投屏/扩展）、手动 IP |
+| `app` | 图形启动器：左侧导航（主页/设置）、接收/发送选择、主页内嵌连接历史、SSDP 搜索、机器列表（投屏/扩展）、手动 IP、运行时调参 |
 | `sender` | 采集画面（GDI/X11/CoreGraphics），协商模式，推流；扩展模式下经 vdd 模块管理虚拟显示器的激活与定位 |
 | `receiver` | SSDP 广播，全屏渲染，承载计算卸载与端口检查两个附加服务 |
 
@@ -151,20 +162,30 @@ bin/sender 192.168.1.105 --mode extend    # 非交互：直接指定 mirror / ex
 
 ### 2 — 扩展握手
 
-选定接收端与显示模式后，发送端连接 TCP 8081 交换握手包：
+选定接收端与显示模式后，发送端连接 TCP 8081 交换握手包（协议 v2，全部为网络字节序）：
 
 ```
-发送端 → 接收端   (16 字节，网络字节序)
-  uint32  sender_width
-  uint32  sender_height
-  uint32  fps
-  uint32  mode          0=镜像  1=扩展
+发送端 → 接收端   HsRequestV2（48 字节，uint32 x 12）
+  magic          0x54564853 ('TVHS')
+  version        2
+  width, height  采集尺寸（缩放由编码器内部完成）
+  fps            目标帧率
+  mode           0=镜像  1=扩展
+  codec          0=原始 1=RLE 2=H.264 3=H.265 4=AV1
+  codec_flags    bit0=希望硬件编码
+  bitrate_kbps   0=质量（CRF）模式
+  quality        0..51（CRF 类；0xFFFFFFFF = 编码器默认哨兵，保留未用）
+  gop_frames     IDR 间隔（0=默认 2*fps）
+  reserved       0
 
-接收端 → 发送端   (12 字节)
-  uint32  receiver_width
-  uint32  receiver_height
-  uint32  status        0=OK
+接收端 → 发送端   HsResponseV2（36 字节）
+  magic, version, recv_width, recv_height
+  status         0=OK 1=版本 2=编码 3=尺寸 4=解码器 5=旧协议
+  codec          接受的编码
+  codec_flags, reserved[2]
 ```
+
+两端必须为同一版本。旧版（16 字节握手）会被识别为 legacy peer 并给出明确报错，不会再黑屏。
 
 ### 3 — 虚拟显示器生命周期（扩展模式）
 
@@ -207,18 +228,60 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 ```
 发送端   →  采集画面（扩展模式=虚拟屏；镜像=主屏）
         →  将鼠标光标绘制进帧（GetCursorInfo + DrawIconEx）
-        →  可选经计算卸载服务 RLE 压缩
+        →  按协商编码处理：
+             H.264/H.265/AV1  → FFmpeg 编码（硬件优先，低延迟调优）→ 发送访问单元
+             RLE              → 可选经计算卸载服务压缩（8082）
+             原始             → 直接发送 RGB24
         →  发送 [uint32 帧长][帧数据]
 
 接收端   →  读帧头、读帧体
-        →  若帧长 < 原始大小则 RLE 解压
-        →  SDL_UpdateTexture → RenderCopy → RenderPresent
+        →  编码流 → FFmpeg 解码 → YUV/NV12 纹理渲染
+        →  RLE → 解压 → RGB24 纹理
+        →  SDL_UpdateTexture/YUVTexture → RenderCopy → RenderPresent
 ```
+
+控制包：`0xFFFFFFFF` + `ctrl_type` + 负载。`CTRL_RESIZE`（扩展模式分辨率变化）与 `CTRL_RECONFIG`（运行时参数变化）都携带完整 `HsRequestV2`，接收端据此重建解码器并跳到下一个关键帧。
 
 ### 5 — 附加服务
 
 - **计算卸载（8082）**：PING / COMPRESS（RLE 压缩）/ COLORCONV（BGR→RGB），处理发生在接收端 CPU，含真实耗时测量（Linux/macOS 用 `clock_gettime`，Windows 用 `QueryPerformanceCounter`）。服务不可用时发送端静默回退为本地未压缩帧。
 - **端口检查（8083）**：LIST_TCP / LIST_UDP / LIST_ALL / GET_PORT / KILL_PORT。端口数据按平台原生采集：Linux 读 `/proc/net/*` + inode→PID 映射；macOS 调 `lsof`；Windows 用 `GetExtendedTcpTable`/`GetExtendedUdpTable` + `CreateToolhelp32Snapshot`。
+
+---
+
+## 编解码
+
+| 编码 | 说明 | 默认 |
+|------|------|------|
+| **H.264** | 画质/延迟均衡；硬件（NVENC/QSV/AMF/VAAPI）优先，回退 libx264 | ✅ |
+| **H.265** | 同码率画质更好；硬件优先，回退 libx265 | |
+| **AV1** | 压缩率最高；硬件优先，回退 SVT-AV1 | |
+| **原始** | 无损 RGB24，带宽最大 | |
+| **RLE** | 无损压缩（可远程卸载到接收端 CPU） | |
+
+低延迟调优：无 B 帧、`zerolatency`、GOP=2×fps、resize 后立即 IDR。桌面文字建议在设置中开启 4:4:4 色度（仅软件编码）。
+
+## 设置与历史
+
+GUI「设置」页可配置（保存在 `%LOCALAPPDATA%\TwinView\config.ini`）：
+
+| 设置 | 默认 | 说明 |
+|------|------|------|
+| 编码方式 | H.264 | 自动/H.264/H.265/AV1/原始/RLE |
+| 硬件加速 | 开 | 优先使用 GPU 编码 |
+| 画质 / 码率 | 23 / 0 | 码率>0 时按码率，否则 CRF |
+| 帧率 / 缩放 | 60 / 100% | 发送端上限与预缩小 |
+| 色度 | 4:2:0 | 4:4:4 文字更锐（软件编码） |
+| 状态控制台 | 关 | 开启可显示经典 cmd 窗口 |
+| 日志窗口 | 关 | 启动时自动打开独立日志窗 |
+| 开机自启动 | 关 | 注册 Windows 计划任务（onlogon，登录免 UAC 弹窗）；卸载时自动清理 |
+| 自动接收 | 关 | 打开软件后直接进入接收模式 |
+
+**运行时调参**：传输过程中打开「设置」修改参数并点「确定」，参数秒级热生效、连接不断（编码/缩放切换会瞬断一两帧）。经典控制台模式下无 stdin 通道，将自动按新参数重启会话。
+
+传输状态默认显示在 GUI 状态面板（实时 FPS/码率/编码器），可另开独立日志窗口查看子进程输出。
+
+「主页」的接收/发送按钮下方即连接历史（`history.ini`，最近 20 条），点击即可直连（投屏/扩展），无需重新搜索；支持删除单条与清空。
 
 ---
 
@@ -229,7 +292,7 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 | 镜像 | 「投屏」/ `--mode mirror`（默认） | 接收端以可缩放窗口显示发送端主屏画面 |
 | 扩展 | 「扩展」/ `--mode extend` | 发送端自动激活虚拟显示器；接收端无边框全屏显示这块**真实桌面空间**——窗口可拖入、鼠标可穿越 |
 
-> 早期版本的"模拟扩展"（extend-right/below/left：接收端全屏显示主屏画面并画一条蓝色拼接线）已移除——它们并不创建真实桌面空间。扩展一律使用模式 2。
+> 早期版本的"模拟扩展"（extend-right/below/left：接收端全屏显示主屏画面并画一条蓝色拼接线）已移除——它们并不创建真实桌面空间。扩展一律使用 `--mode extend`（协议 mode 1）。
 
 ---
 
@@ -268,6 +331,13 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 ```bash
 make install-deps          # Linux/macOS/MSYS2 自动安装
 ```
+
+| 组件 | 用途 |
+|------|------|
+| g++ / make | C++17 构建 |
+| libX11-dev | Linux 屏幕采集 |
+| SDL2 / SDL2_ttf | 接收端渲染 + GUI（中文字体） |
+| **FFmpeg**（libavcodec/libavutil/libswscale） | H.264/H.265/AV1 编解码（MSYS2: `mingw-w64-x86_64-ffmpeg`） |
 
 ---
 
@@ -314,7 +384,7 @@ make run          # 构建并启动图形启动器（另有 run-sender / run-rec
 # 产物：dist\TwinView-Setup-<版本>.exe
 ```
 
-安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（不含体积超限的厂商 GUI），安装后在开始菜单/桌面创建快捷方式。
+安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（不含体积超限的厂商 GUI），安装后在开始菜单/桌面创建快捷方式。完成页的「启动 TwinView」勾选项直接拉起管理员权限的 GUI（安装器以提权令牌启动，无二次 UAC 弹窗）。
 
 ---
 
@@ -326,12 +396,16 @@ make run          # 构建并启动图形启动器（另有 run-sender / run-rec
 bin/app
 ```
 
-打开后选择「接收」或「发送」：
+打开后左侧为导航栏：**主页**（接收/发送 + 连接历史）、**设置**，栏底「退出」：
 
-- **接收**：显示本机 IP、端口与"正在接收"状态，同时启动接收端等待连接；「停止接收」结束
-- **发送**：显示"搜索中"，搜到设备后列出机器清单，每台可选「投屏」（镜像）或「扩展」；推流中可「停止」
+- **主页 · 接收**：显示本机 IP、端口与"正在接收"状态，同时启动接收端等待连接；「停止接收」结束
+- **主页 · 发送**：显示"搜索中"，搜到设备后列出机器清单（含主机名），每台可选「投屏」（镜像）或「扩展」；推流中可「停止」
+- **主页 · 连接历史**：接收/发送按钮下方列出最近 20 条连接，点击直连（免搜索），可删除单条或清空，滚轮翻页
+- **主页 · 会话中**：投屏/接收进行时可随时切到「设置」（会话不停）；「返回会话」或设置页按 ESC 回到实时状态；点「主页」回到主页（显示运行中，可停止）
+- **设置**：编码方式（自动/H.264/H.265/AV1/原始/RLE）、硬件加速、画质/码率/帧率/缩放/色度、状态面板/日志窗口/经典控制台、开机自启动/自动接收。**传输中改参数点「确定」即热生效不断流**
 - **未搜到设备**：提供「继续搜索」「手动输入ip」「退出」三个选项；手动输入 IP 后同样进入投屏/扩展选择
-- **ESC**：手动输入页返回；其他页面停止当前会话并回首页；首页退出
+- **推流状态**：默认在 GUI 状态面板实时显示 FPS / 码率 / 编码器；「日志」按钮打开独立日志窗口（子进程输出）。默认不弹出 cmd 控制台，可在设置中开启
+- **ESC**：设置丢弃编辑并返回会话；手动输入页返回；投屏/接收页停止会话回主页；主页退出
 
 Windows 下也可用 `scripts/` 中的快捷脚本：`start_receiver.bat` 一键启动接收端；`启动投屏发送.bat <接收端IP>` 直连发送。
 
@@ -470,8 +544,9 @@ make check                                        # 环境自检
 - [x] 远程端口检查服务（TCP 8083）
 - [x] 每客户端统计 + JSON 导出
 - [ ] 接收端输入回传（键鼠控制在接收端侧真实生效）
-- [ ] **可选编码方案：RLE / H.264 / H.265 / AV1 四种方式作为可配置项**
-- [ ] GUI 高级设置（分辨率选择、编码方式、连接历史管理）
+- [x] 可选编码方案：RLE / H.264 / H.265 / AV1 四种方式作为可配置项
+- [x] GUI 高级设置（编码方式、连接历史管理）
+- [ ] GUI 高级设置：扩展分辨率选择（当前 GUI 固定默认 1920x1080）
 - [ ] 音频采集与传输
 - [ ] TLS 加密
 - [ ] 虚拟显示器分辨率自适应接收端（握手后协商）

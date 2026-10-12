@@ -128,6 +128,29 @@ ifeq ($(OS),Windows_NT)
 endif
 
 # ============================================================================
+# FFMPEG (libavcodec / libavutil / libswscale) – codec.cpp, sender, receiver
+# ============================================================================
+
+ifneq ($(shell pkg-config --exists libavcodec libavutil libswscale 2>/dev/null && echo 1),)
+    FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavutil libswscale)
+    FFMPEG_LIBS   := $(shell pkg-config --libs   libavcodec libavutil libswscale)
+else
+    FFMPEG_CFLAGS :=
+    FFMPEG_LIBS   := -lavcodec -lswscale -lavutil
+endif
+
+# sender + receiver link the codec stack (app stays FFmpeg-free)
+SENDER_LIBS   += $(FFMPEG_LIBS)
+RECEIVER_LIBS += $(FFMPEG_LIBS)
+
+# Windows: copy the mingw64 runtime DLL closure into bin/ (wired into 'all')
+ifeq ($(OS),Windows_NT)
+    DLL_TARGET := copy-dlls
+else
+    DLL_TARGET :=
+endif
+
+# ============================================================================
 # BINARY NAMES & OBJECTS
 # ============================================================================
 
@@ -139,6 +162,9 @@ OBJ_DISCOVER := $(BUILDDIR)/discover.o
 OBJ_GPU      := $(BUILDDIR)/gpu_accelerate.o
 OBJ_PORTS    := $(BUILDDIR)/ports.o
 OBJ_VDD      := $(BUILDDIR)/vdd.o
+OBJ_CODEC    := $(BUILDDIR)/codec.o
+OBJ_CONFIG   := $(BUILDDIR)/config.o
+OBJ_HISTORY  := $(BUILDDIR)/history.o
 OBJ_APP      := $(BUILDDIR)/app.o
 OBJ_SENDER   := $(BUILDDIR)/sender.o
 OBJ_RECEIVER := $(BUILDDIR)/receiver.o
@@ -147,10 +173,10 @@ OBJ_RECEIVER := $(BUILDDIR)/receiver.o
 # PHONY TARGET DECLARATIONS
 # ============================================================================
 
-.PHONY: all clean debug sender receiver app run run-sender run-receiver check install-deps help
+.PHONY: all clean debug sender receiver app run run-sender run-receiver check install-deps help copy-dlls
 
 # Default Target
-all: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)
+all: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(DLL_TARGET)
 	@echo "========================================="
 	@echo "Build complete!  → $(BINDIR)/"
 	@echo "  sender$(EXE)   receiver$(EXE)   app$(EXE)"
@@ -180,30 +206,45 @@ endif
 # -Dmain=SDL_main (pkg-config sdl2 cflags) since it links without SDL2main.
 $(OBJ_APP) $(OBJ_RECEIVER): CXXFLAGS += $(SDL_CFLAGS)
 
+# codec.o needs FFmpeg headers
+$(OBJ_CODEC): CXXFLAGS += $(FFMPEG_CFLAGS)
+
 # Header Change Tracking Maps
 $(OBJ_DISCOVER): $(SRCDIR)/discover.h
 $(OBJ_PORTS): $(SRCDIR)/ports.h
 $(OBJ_GPU): $(SRCDIR)/gpu_accelerate.h
 $(OBJ_VDD): $(SRCDIR)/vdd.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h
-$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h
+$(OBJ_CODEC): $(SRCDIR)/codec.h $(SRCDIR)/proto.h
+$(OBJ_CONFIG): $(SRCDIR)/config.h
+$(OBJ_HISTORY): $(SRCDIR)/history.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h
+$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/config.h $(SRCDIR)/history.h
 
 # ============================================================================
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
-$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) | $(BINDIR)
+$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) | $(BINDIR)
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
-$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(RES_ADMIN) | $(BINDIR)
+$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
 	@echo "Built $(APP_BIN)"
+
+# Windows: copy the mingw64 runtime DLL closure (incl. FFmpeg) into bin/
+copy-dlls: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)
+	@echo "Copying runtime DLLs into $(BINDIR)/ ..."
+	@for d in $$(ldd $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) 2>/dev/null | \
+	              awk '/mingw64/{print $$3}' | sort -u); do \
+	    cp -n "$$d" $(BINDIR)/ 2>/dev/null || true; \
+	done
+	@echo "DLL closure updated"
 
 # Aliases
 sender:   $(SENDER_BIN)
@@ -255,7 +296,8 @@ check:
 	@echo "  Source files:"
 	@for f in app.cpp sender.cpp receiver.cpp discover.cpp discover.h \
                gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
-               vdd.cpp vdd.h; do \
+               vdd.cpp vdd.h codec.cpp codec.h proto.h \
+               config.cpp config.h history.cpp history.h; do \
         if [ -f $(SRCDIR)/$$f ]; then \
             echo "    OK  $$f"; \
         else \
@@ -287,29 +329,35 @@ install-deps:
 	@echo "Installing dependencies..."
 	@if command -v apt-get >/dev/null 2>&1; then \
         sudo apt-get update && \
-        sudo apt-get install -y g++ make libx11-dev libsdl2-dev libsdl2-ttf-dev; \
+        sudo apt-get install -y g++ make libx11-dev libsdl2-dev libsdl2-ttf-dev \
+            libavcodec-dev libavutil-dev libswscale-dev; \
 	elif command -v dnf >/dev/null 2>&1; then \
-        sudo dnf install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel; \
+        sudo dnf install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel \
+            ffmpeg-free-devel || sudo dnf install -y gcc-c++ make libX11-devel \
+            SDL2-devel SDL2_ttf-devel ffmpeg-devel; \
 	elif command -v yum >/dev/null 2>&1; then \
-        sudo yum install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel; \
+        sudo yum install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel \
+            ffmpeg-devel; \
 	elif command -v pacman >/dev/null 2>&1; then \
         if [ -n "$$MINGW_PACKAGE_PREFIX" ]; then \
             pacman -S --needed --noconfirm \
                 "$${MINGW_PACKAGE_PREFIX}-gcc" make \
                 "$${MINGW_PACKAGE_PREFIX}-pkgconf" \
                 "$${MINGW_PACKAGE_PREFIX}-SDL2" \
-                "$${MINGW_PACKAGE_PREFIX}-SDL2_ttf"; \
+                "$${MINGW_PACKAGE_PREFIX}-SDL2_ttf" \
+                "$${MINGW_PACKAGE_PREFIX}-ffmpeg"; \
         else \
-            sudo pacman -S --needed --noconfirm gcc make libx11 sdl2 sdl2_ttf; \
+            sudo pacman -S --needed --noconfirm gcc make libx11 sdl2 sdl2_ttf ffmpeg; \
         fi; \
 	elif command -v brew >/dev/null 2>&1; then \
-        brew install sdl2 sdl2_ttf; \
+        brew install sdl2 sdl2_ttf ffmpeg; \
 	else \
         echo "Unsupported package manager.  Install manually:"; \
         echo "  g++ / clang++ (C++17)"; \
         echo "  libX11-dev  (Linux screen capture)"; \
         echo "  libSDL2-dev"; \
         echo "  libSDL2-ttf-dev  (GUI launcher)"; \
+        echo "  libavcodec-dev libavutil-dev libswscale-dev  (H.264/H.265/AV1)"; \
     fi
 	@echo "Done"
 

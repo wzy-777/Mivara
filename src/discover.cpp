@@ -332,7 +332,10 @@ bool testTcpConnection(const std::string &ip, int port, int timeout_ms)
 
     int result = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
 
-    bool connected = false;
+    /* A non-blocking connect may complete immediately.  The old code only
+       handled EINPROGRESS/WSAEWOULDBLOCK, so a healthy receiver was reported
+       as unreachable whenever connect() returned 0. */
+    bool connected = (result == 0);
 
 #ifdef _WIN32
     if (result == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
@@ -350,10 +353,14 @@ bool testTcpConnection(const std::string &ip, int port, int timeout_ms)
 
         if (select(sock + 1, NULL, &fdset, NULL, &tv) == 1)
         {
-            int so_error;
+            int so_error = 0;
+#ifdef _WIN32
+            int len = sizeof(so_error);
+#else
             socklen_t len = sizeof(so_error);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len);
-            if (so_error == 0)
+#endif
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                           (char *)&so_error, &len) == 0 && so_error == 0)
                 connected = true;
         }
     }
@@ -368,10 +375,52 @@ bool testTcpConnection(const std::string &ip, int port, int timeout_ms)
 }
 
 /**
+ * Extract the SSDP NAME: header (device friendly name), line-based and
+ * case-insensitive on the header name. Returns "" when absent.
+ */
+static std::string parseSsdpName(const std::string &response)
+{
+    size_t pos = 0;
+    while (pos < response.size())
+    {
+        size_t eol = response.find_first_of("\r\n", pos);
+        std::string line = response.substr(pos, (eol == std::string::npos) ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? response.size() : eol + 1;
+        if (pos < response.size() && response[eol] == '\r' && response[pos] == '\n')
+            pos++;
+
+        if (line.size() < 5)
+            continue;
+        /* header name match "NAME:" case-insensitive */
+        bool match = true;
+        static const char *kName = "NAME:";
+        for (int i = 0; i < 5; i++)
+        {
+            char c = line[(size_t)i];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            if (c != kName[i]) { match = false; break; }
+        }
+        if (!match)
+            continue;
+        std::string val = line.substr(5);
+        size_t a = val.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos)
+            return std::string();
+        size_t b = val.find_last_not_of(" \t\r\n");
+        return val.substr(a, b - a + 1);
+    }
+    return std::string();
+}
+
+/**
  * Parse SSDP response to extract IP and port
  */
-bool parseSsdpResponse(const std::string &response, std::string &ip, int &port)
+bool parseSsdpResponse(const std::string &response, std::string &ip, int &port,
+                       std::string *name = nullptr)
 {
+    if (name)
+        *name = parseSsdpName(response);
+
     size_t loc_pos = response.find("LOCATION: ");
     if (loc_pos == std::string::npos)
         loc_pos = response.find("Location: ");
@@ -554,6 +603,20 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
 
     std::cout << "📡 Sending SSDP M-SEARCH requests (multicast + broadcast, "
               << socks.size() << " NIC(s))..." << std::endl;
+    std::vector<struct sockaddr_in> directed_broadcasts;
+    for (const LocalIface &iface : listLocalIPv4Ifaces())
+    {
+        if (iface.prefix <= 0 || iface.prefix >= 32) continue;
+        struct in_addr ip_addr;
+        if (inet_pton(AF_INET, iface.ip.c_str(), &ip_addr) != 1) continue;
+        uint32_t ip = ntohl(ip_addr.s_addr);
+        uint32_t mask = ~((1u << (32 - iface.prefix)) - 1);
+        struct sockaddr_in directed = {};
+        directed.sin_family = AF_INET;
+        directed.sin_port = htons(SSDP_MULTICAST_PORT);
+        directed.sin_addr.s_addr = htonl((ip & mask) | ~mask);
+        directed_broadcasts.push_back(directed);
+    }
     for (int i = 0; i < 3; i++)
     {
         for (disc_sock_t s : socks)
@@ -562,6 +625,9 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
                    (struct sockaddr *)&dest_addr, sizeof(dest_addr));
             sendto(s, msearch.c_str(), (int)msearch.length(), 0,
                    (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+            for (const auto &directed : directed_broadcasts)
+                sendto(s, msearch.c_str(), (int)msearch.length(), 0,
+                       (const struct sockaddr *)&directed, sizeof(directed));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -596,7 +662,8 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
             {
                 std::string loc_ip;
                 int port = 8081;
-                parseSsdpResponse(response, loc_ip, port); /* best-effort: at least for the port */
+                std::string dev_name;
+                parseSsdpResponse(response, loc_ip, port, &dev_name); /* best-effort: at least for the port */
 
                 /* The datagram source address is by definition reachable —
                    prefer it over LOCATION, which multi-homed receivers may
@@ -617,6 +684,7 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
                 {
                     std::cout << "✓ Found receiver: " << ip << ":" << port << std::endl;
                     discovered_receivers.emplace_back(ip, port);
+                    discovered_receivers.back().name = dev_name;
                 }
                 else
                 {

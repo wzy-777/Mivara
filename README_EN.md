@@ -6,7 +6,8 @@
 
 A cross-platform C++ project: turn any computer on your LAN into a second monitor.
 
-[![Version](https://img.shields.io/badge/version-0.8.1-blue)](https://github.com/wzy-777/TwinView)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/wzy-777/TwinView)
+[![Download Latest Installer](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/TwinView/releases/latest/download/TwinView-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#requirements)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -29,6 +30,8 @@ A cross-platform C++ project: turn any computer on your LAN into a second monito
     - [3 — Virtual Display Lifecycle (Extend Mode)](#3--virtual-display-lifecycle-extend-mode)
     - [4 — Frame Streaming](#4--frame-streaming)
     - [5 — Sidecar Services](#5--sidecar-services)
+  - [Codecs](#codecs)
+  - [Settings & History](#settings--history)
   - [Display Modes](#display-modes)
   - [Requirements](#requirements)
   - [Installing Dependencies](#installing-dependencies)
@@ -75,12 +78,16 @@ Extend mode requires a Windows indirect display driver (IddCx); see [installatio
 |----------|-----------|
 | **Extend mode** | Virtual display auto-enabled and attached at session start; on every exit path (normal end / Ctrl+C / disconnect / console close / hard-kill fallback) it is detached and the device is disabled, so it vanishes from system settings completely |
 | **Virtual display integration** | Activation/deactivation/positioning done in-process via the CCD API — no manual display-settings fiddling |
+| **Video codecs** | H.264 / H.265 / AV1 (FFmpeg), hardware-first (NVENC/QSV/AMF/VAAPI) with automatic software fallback (libx264/libx265/SVT-AV1); raw/RLE lossless options kept |
+| **Live reconfigure** | Change codec/quality/bitrate/fps/scale/chroma mid-session — applied in seconds without dropping the stream (codec switches blip for a frame or two) |
 | **Visible cursor** | The pointer is drawn into the video frames; in extend mode this equals "pointer crossing" |
 | **Direct connect** | `sender <IP>` skips discovery — works when SSDP multicast is blocked by network policy |
-| **Discovery** | Zero-config SSDP discovery (UDP 1900 multicast + broadcast fallback) |
-| **GUI** | SDL2_ttf interface: receive/send, automatic search, device list (cast/extend), manual IP entry |
+| **Discovery** | Zero-config SSDP discovery (UDP 1900 multicast + broadcast fallback), shows hostnames |
+| **Connection history** | Last 20 connections embedded on the Home screen — one-click direct connect, no search needed |
+| **GUI** | SDL2_ttf interface: left nav (Home / Settings), receive/send, connection history, automatic search, device list (cast/extend), manual IP entry, live status panel, independent log window |
+| **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt); auto-receive opens the app directly in receive mode when enabled (off by default) |
 | **Performance** | Up to 120 FPS streaming, 4 MB socket buffers, TCP_NODELAY |
-| **CPU offload** | RLE frame compression and color conversion offloaded to the receiver's CPU (TCP 8082) |
+| **CPU offload** | RLE frame compression and color conversion offloaded to the receiver's CPU (TCP 8082, RLE mode only) |
 | **Port inspector** | Remotely list/query/kill processes on any port of the receiver (TCP 8083) |
 | **Cross-platform** | Linux (X11), Windows 10/11, macOS 10.15+ |
 
@@ -94,9 +101,13 @@ Extend mode requires a Windows indirect display driver (IddCx); see [installatio
 TwinView/
 ├── makefile                  # Cross-platform build (Linux/macOS/Windows MinGW)
 ├── src/
-│   ├── app.cpp               # GUI launcher (SDL2 + SDL2_ttf): receive/send/search/cast
+│   ├── app.cpp               # GUI launcher (SDL2 + SDL2_ttf): left nav + Home/Settings (history embedded in Home)
 │   ├── sender.cpp            # Capture, handshake, streaming
 │   ├── receiver.cpp          # Fullscreen render, SSDP broadcast, compute + port services
+│   ├── proto.h               # Protocol v2 (handshake / control packets / codec enum)
+│   ├── codec.cpp/.h          # FFmpeg encode/decode (H.264/H.265/AV1, sender + receiver)
+│   ├── config.cpp/.h         # GUI settings persistence (config.ini)
+│   ├── history.cpp/.h        # Connection history (history.ini)
 │   ├── discover.cpp/.h       # SSDP discovery engine
 │   ├── gpu_accelerate.c/.h   # Remote CPU offload (RLE compress / color convert)
 │   ├── ports.cpp/.h          # Remote port inspection service
@@ -113,7 +124,7 @@ TwinView/
 
 | Program | Responsibility |
 |---------|----------------|
-| `app` | GUI launcher: receive/send choice, SSDP search, device list (cast/extend), manual IP |
+| `app` | GUI launcher: left nav (Home/Settings), receive/send choice, connection history on Home, SSDP search, device list (cast/extend), manual IP, live reconfigure |
 | `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode via the vdd module |
 | `receiver` | SSDP broadcast, fullscreen rendering, hosts the two sidecar services |
 
@@ -151,20 +162,30 @@ bin/sender 192.168.1.105 --mode extend    # non-interactive: set mirror / extend
 
 ### 2 — Extend Handshake
 
-After the receiver and display mode are chosen, the sender connects over TCP 8081 and exchanges a handshake:
+After the receiver and display mode are chosen, the sender connects over TCP 8081 and exchanges a handshake (protocol v2, all fields network byte order):
 
 ```
-Sender → Receiver   (16 bytes, network byte order)
-  uint32  sender_width
-  uint32  sender_height
-  uint32  fps
-  uint32  mode          0=mirror  1=extend
+Sender → Receiver   HsRequestV2 (48 bytes, 12 x uint32)
+  magic          0x54564853 ('TVHS')
+  version        2
+  width, height  capture size (downscaling happens inside the encoder)
+  fps            target frame rate
+  mode           0=mirror  1=extend
+  codec          0=raw 1=RLE 2=H.264 3=H.265 4=AV1
+  codec_flags    bit0 = sender wants hardware encode
+  bitrate_kbps   0 = quality (CRF) mode
+  quality        0..51 (CRF-like; 0xFFFFFFFF = encoder-default sentinel, reserved/unused)
+  gop_frames     IDR interval (0 = default 2*fps)
+  reserved       0
 
-Receiver → Sender   (12 bytes)
-  uint32  receiver_width
-  uint32  receiver_height
-  uint32  status        0=OK
+Receiver → Sender   HsResponseV2 (36 bytes)
+  magic, version, recv_width, recv_height
+  status         0=OK 1=version 2=codec 3=dims 4=decoder 5=legacy
+  codec          accepted codec
+  codec_flags, reserved[2]
 ```
+
+Both ends must run the same version. A legacy peer (old 16-byte handshake) is detected and reported explicitly — no silent black screen.
 
 ### 3 — Virtual Display Lifecycle (Extend Mode)
 
@@ -213,18 +234,60 @@ display is detached immediately instead of hanging.
 ```
 Sender    →  capture (extend mode = virtual screen; mirror = primary screen)
           →  draw the mouse cursor into the frame (GetCursorInfo + DrawIconEx)
-          →  optionally RLE-compress via the compute offload service
+          →  encode per the negotiated codec:
+               H.264/H.265/AV1  → FFmpeg encode (hardware-first, low-latency tuned) → send AU
+               RLE              → optionally compress via the compute offload service (8082)
+               raw              → send RGB24 as-is
           →  send [uint32 frame length][frame data]
 
 Receiver  →  read frame header, read frame body
-          →  RLE-decompress if frame length < raw size
-          →  SDL_UpdateTexture → RenderCopy → RenderPresent
+          →  coded → FFmpeg decode → YUV/NV12 texture render
+          →  RLE → decompress → RGB24 texture
+          →  SDL_UpdateTexture/YUVTexture → RenderCopy → RenderPresent
 ```
+
+Control packets: `0xFFFFFFFF` + `ctrl_type` + body. `CTRL_RESIZE` (extend-mode resolution change) and `CTRL_RECONFIG` (runtime parameter change) both carry a full `HsRequestV2`; the receiver re-inits its decoder and skips to the next keyframe.
 
 ### 5 — Sidecar Services
 
 - **Compute offload (8082)**: PING / COMPRESS (RLE) / COLORCONV (BGR→RGB), executed on the receiver's CPU with real timing measurements (`clock_gettime` on Linux/macOS, `QueryPerformanceCounter` on Windows). If the service is unavailable, the sender silently falls back to local uncompressed frames.
 - **Port inspector (8083)**: LIST_TCP / LIST_UDP / LIST_ALL / GET_PORT / KILL_PORT. Port data is collected natively per platform: Linux reads `/proc/net/*` + inode→PID mapping; macOS shells out to `lsof`; Windows uses `GetExtendedTcpTable`/`GetExtendedUdpTable` + `CreateToolhelp32Snapshot`.
+
+---
+
+## Codecs
+
+| Codec | Notes | Default |
+|-------|-------|---------|
+| **H.264** | Balanced quality/latency; hardware (NVENC/QSV/AMF/VAAPI) first, falls back to libx264 | ✅ |
+| **H.265** | Better quality per bitrate; hardware first, falls back to libx265 | |
+| **AV1** | Best compression; hardware first, falls back to SVT-AV1 | |
+| **Raw** | Lossless RGB24, highest bandwidth | |
+| **RLE** | Lossless compression (can offload to the receiver's CPU) | |
+
+Low-latency tuning: no B-frames, `zerolatency`, GOP = 2×fps, immediate IDR after resize. For desktop text, enable 4:4:4 chroma in Settings (software encoders only).
+
+## Settings & History
+
+The GUI Settings screen (persisted to `%LOCALAPPDATA%\TwinView\config.ini`):
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Codec | H.264 | auto/H.264/H.265/AV1/raw/RLE |
+| Hardware accel | on | Prefer GPU encoding |
+| Quality / Bitrate | 23 / 0 | Bitrate > 0 uses bitrate mode, otherwise CRF |
+| FPS / Scale | 60 / 100% | Sender cap and pre-downscale |
+| Chroma | 4:2:0 | 4:4:4 = sharper text (software encode) |
+| Status console | off | Shows the classic cmd window |
+| Log window | off | Auto-open the independent log window |
+| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); cleaned up on uninstall |
+| Auto-receive | off | Enter receive mode as soon as the app opens |
+
+**Live reconfigure**: while streaming, change any transfer parameter in Settings and press OK — it takes effect within seconds without dropping the connection (codec/scale switches blip for a frame or two). In classic console mode there is no stdin channel, so the session is restarted with the new parameters instead.
+
+Transfer status is shown live in the GUI status panel (FPS / bitrate / encoder); the independent log window shows child-process output. The cmd console is hidden by default and can be re-enabled in Settings.
+
+The connection-history list (`history.ini`, last 20 entries) sits under the receive/send cards on the Home screen — click to connect directly (cast/extend) without searching; individual entries can be deleted or cleared.
 
 ---
 
@@ -235,7 +298,7 @@ Receiver  →  read frame header, read frame body
 | Mirror | "Cast" / `--mode mirror` (default) | Receiver shows the sender's primary screen in a resizable window |
 | Extend | "Extend" / `--mode extend` | Sender auto-activates a virtual display; receiver shows it borderless fullscreen as a **real desktop workspace** — windows can be dragged in, the mouse crosses over |
 
-> Earlier "simulated extend" variants (extend-right/below/left: fullscreen mirror with a blue seam line) were removed — they never created a real desktop workspace. Extend is always mode 2.
+> Earlier "simulated extend" variants (extend-right/below/left: fullscreen mirror with a blue seam line) were removed — they never created a real desktop workspace. Extend always uses `--mode extend` (protocol mode 1).
 
 ---
 
@@ -275,6 +338,13 @@ Receiver  →  read frame header, read frame body
 ```bash
 make install-deps          # Linux/macOS/MSYS2 automatic install
 ```
+
+| Component | Purpose |
+|-----------|---------|
+| g++ / make | C++17 build |
+| libX11-dev | Linux screen capture |
+| SDL2 / SDL2_ttf | Receiver rendering + GUI (CJK fonts) |
+| **FFmpeg** (libavcodec/libavutil/libswscale) | H.264/H.265/AV1 encode/decode (MSYS2: `mingw-w64-x86_64-ffmpeg`) |
 
 ---
 
@@ -317,11 +387,11 @@ Builds use `-O3 -march=native -flto`; output goes to `bin/`.
 Build the installer with Inno Setup:
 
 ```powershell
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\TwinView.iss
+& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\TwinView.iss
 # Output: dist\TwinView-Setup-<version>.exe
 ```
 
-The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and creates Start-menu/desktop shortcuts.
+The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and creates Start-menu/desktop shortcuts. The "Launch TwinView" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).
 
 ---
 
@@ -333,12 +403,16 @@ The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual d
 bin/app
 ```
 
-Choose "Receive" or "Send":
+The left side holds the nav bar: **Home** (receive/send + connection history), **Settings**, and "Quit" at the bottom:
 
-- **Receive**: shows the local IP, ports and a "receiving" status while launching the receiver to wait for connections; "Stop" ends it
-- **Send**: shows "searching"; once devices are found, each row offers "Cast" (mirror) or "Extend"; streaming can be stopped at any time
+- **Home · Receive**: shows the local IP, ports and a "receiving" status while launching the receiver to wait for connections; "Stop" ends it
+- **Home · Send**: shows "searching"; once devices are found (with hostnames), each row offers "Cast" (mirror) or "Extend"; streaming can be stopped at any time
+- **Home · Connection history**: the last 20 connections are listed under the receive/send cards — click to connect directly (no search); delete single entries or clear all; mouse wheel scrolls
+- **Home · In session**: while casting/receiving you can switch to Settings (the session keeps running); "Back to session" or ESC in Settings returns to the live status, while "Home" goes to the Home screen (shows the session running, with Stop)
+- **Settings**: codec (auto/H.264/H.265/AV1/raw/RLE), hardware accel, quality/bitrate/FPS/scale/chroma, status panel / log window / classic console, auto-start / auto-receive. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
 - **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same cast/extend choice
-- **ESC**: back from the manual-IP page; on other pages stop the current session and return home; on the home screen quits
+- **Streaming status**: live FPS / bitrate / encoder in the GUI status panel; the "Log" button opens the independent log window (child-process output). The cmd console is hidden by default — re-enable it in Settings
+- **ESC**: discard Settings edits and return to the session; back from the manual-IP page; stop the session on cast/receive screens and go home; quits from home
 
 On Windows you can also use the convenience scripts in `scripts/`: `start_receiver.bat` starts the receiver in one click; `启动投屏发送.bat <receiver-IP>` direct-connects and sends.
 
@@ -477,8 +551,9 @@ make check                                          # environment self-check
 - [x] Remote port inspection service (TCP 8083)
 - [x] Per-client statistics + JSON export
 - [ ] Receiver input back-channel (real keyboard/mouse control from the receiver side)
-- [ ] **Optional encoders: RLE / H.264 / H.265 / AV1 as a selectable option**
-- [ ] GUI advanced settings (resolution choice, encoder choice, connection history)
+- [x] Optional encoders: RLE / H.264 / H.265 / AV1 as a selectable option
+- [x] GUI advanced settings (encoder picker, connection history)
+- [ ] GUI advanced settings: extend-resolution choice (currently fixed at the 1920x1080 default in the GUI)
 - [ ] Audio capture and streaming
 - [ ] TLS encryption
 - [ ] Virtual display resolution adapts to the receiver (post-handshake negotiation)
