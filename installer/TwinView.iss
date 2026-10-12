@@ -3,7 +3,7 @@
 ; Output: dist\TwinView-Setup-<version>.exe
 
 #define AppName "TwinView"
-#define AppVersion "0.8.1"
+#define AppVersion "0.9.0"
 #define AppPublisher "TwinView"
 #define AppExeName "app.exe"
 
@@ -32,8 +32,8 @@ WizardStyle=modern
 Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标:"
 
 [Files]
-; binaries + runtime DLL closure
-Source: "..\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs
+; binaries + runtime DLL closure (sender_noUAC.exe is a local test artifact, never ship it)
+Source: "..\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs; Excludes: "sender_noUAC.exe"
 ; helper scripts
 Source: "..\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion
 ; docs
@@ -51,4 +51,12 @@ Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\bin\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\bin\{#AppExeName}"; Description: "启动 {#AppName}"; Flags: nowait postinstall skipifsilent
+; runascurrentuser is REQUIRED: postinstall entries default to runasoriginaluser
+; (unelevated), but app.exe embeds a requireAdministrator manifest, so a plain
+; CreateProcess from the unelevated original user fails with ERROR_ELEVATION_REQUIRED.
+; runascurrentuser inherits Setup's elevated token — the checkbox just works, no 2nd UAC.
+Filename: "{app}\bin\{#AppExeName}"; Description: "启动 {#AppName}"; WorkingDir: "{app}\bin"; Flags: nowait postinstall skipifsilent runascurrentuser
+
+[UninstallRun]
+; remove the auto-start scheduled task registered by app.exe (task name must match app.cpp)
+Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""TwinView"" /f"; Flags: runhidden; RunOnceId: "DelAutoStartTask"

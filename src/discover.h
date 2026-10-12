@@ -17,6 +17,8 @@ struct DiscoveredDevice
     int tcp_port;
     std::string service_uuid;
     std::string location_url;
+    /** SSDP NAME: header (hostname); empty → display falls back to ip. */
+    std::string name;
 
     DiscoveredDevice(const std::string &ip, int port, const std::string &uuid = "")
         : ip_address(ip), tcp_port(port), service_uuid(uuid)

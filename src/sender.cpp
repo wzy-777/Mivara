@@ -15,18 +15,12 @@
  *
  * In mirror mode the primary screen is streamed as-is.
  *
- * Handshake (sender → receiver):
- *   uint32_t  sender_width     – sender screen width
- *   uint32_t  sender_height    – sender screen height
- *   uint32_t  fps              – target frame rate
- *   uint32_t  mode             – 0=mirror  1=true-extend
+ * Handshake: protocol v2, see proto.h.
+ *   sender → receiver : HsRequestV2  (48 bytes, magic 'TVHS', version 2)
+ *   receiver → sender : HsResponseV2 (36 bytes, status = HsStatus)
+ * Stream frames: u32 pkt_size + payload (RAW / RLE / one coded AU).
+ * Control: u32 CTRL_MARKER + u32 CtrlType + body (CTRL_RESIZE = HsRequestV2).
  *
- * Handshake response (receiver → sender):
- *   uint32_t  receiver_width   – receiver display width
- *   uint32_t  receiver_height  – receiver display height
- *   uint32_t  status           – 0=ok
- *
- * After the handshake the sender streams frames exactly as before.
  * In extend_right mode the sender also registers a virtual desktop offset
  * so that OS-level pointer warp (optional, per platform) can move the
  * mouse to the receiver screen edge naturally.
@@ -46,6 +40,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -57,6 +52,8 @@
 #include "gpu_accelerate.h"
 #include "ports.h"
 #include "vdd.h"
+#include "proto.h"
+#include "codec.h"
 
 /* ── Platform headers ───────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -133,6 +130,22 @@ static uint32_t DISPLAY_MODE = MODE_MIRROR;      /* default: mirror */
 /* Receiver display dimensions (filled after handshake response) */
 static int RECV_WIDTH  = 1920;
 static int RECV_HEIGHT = 1080;
+
+/* Codec / stream configuration (CLI, see plan §7). Defaults match config.ini. */
+static CodecId    g_codec       = CODEC_H264;
+static bool       g_want_hw     = true;
+static int        g_bitrate_kbps = 0;    /* 0 = quality/CRF mode */
+static int        g_quality     = 23;
+static int        g_scale_pct   = 100;   /* coded size = capture * pct / 100 */
+static int        g_chroma_444  = 0;
+static std::string g_enc_impl   = "none"; /* Encoder::implName() once open */
+static bool       g_enc_hw      = false;
+
+/* Runtime reconfigure: GUI writes SETP|k=v|… lines to our stdin (default
+ * hidden spawn mode). Last-wins pending line, applied at the loop top. */
+static std::mutex        g_setp_mtx;
+static std::string       g_pending_setp;
+static std::string       g_recv_ip;    /* receiver address (RLE 8082 lifecycle) */
 
 #ifdef _WIN32
 /* True-Extend mode: capture a specific monitor instead of the primary.
@@ -547,6 +560,274 @@ static void showStats(int frames, long elapsed, size_t bytes)
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * MACHINE-READABLE STATS  –  one line per STATS_INTERVAL_SEC (GUI contract)
+ *   STAT|t=..|frames=..|fps=..|kbps=..|codec=..|hw=..|mode=..|src=WxH|dst=WxH|quality=..
+ * plus STAT|event=start|..  /  STAT|event=stop|..  /  STAT|event=error|msg=..
+ * Values never contain '|'.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static const char *statCodecName()
+{
+    if (g_codec == CODEC_RAW) return "raw";
+    if (g_codec == CODEC_RLE) return "rle";
+    return g_enc_impl.c_str();
+}
+
+static const char *statModeName()
+{
+    return DISPLAY_MODE == MODE_TRUE_EXTEND ? "extend" : "mirror";
+}
+
+static void emitStatLine(long tsec, long frames, double fps, long kbps,
+                         const char *event = nullptr)
+{
+    std::cout << "STAT|";
+    if (event) std::cout << "event=" << event << "|";
+    std::cout << "t=" << tsec
+              << "|frames=" << frames
+              << "|fps=" << std::fixed << std::setprecision(1) << fps
+              << std::defaultfloat
+              << "|kbps=" << kbps
+              << "|codec=" << statCodecName()
+              << "|hw=" << (g_enc_hw ? 1 : 0)
+              << "|mode=" << statModeName()
+              << "|src=" << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
+              << "|dst=" << RECV_WIDTH << "x" << RECV_HEIGHT
+              << "|quality=" << g_quality
+              << "\n" << std::flush;
+}
+
+static void emitStatStart()
+{
+    std::cout << "STAT|event=start"
+              << "|codec=" << statCodecName()
+              << "|hw=" << (g_enc_hw ? 1 : 0)
+              << "|mode=" << statModeName()
+              << "|src=" << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
+              << "|dst=" << RECV_WIDTH << "x" << RECV_HEIGHT
+              << "|quality=" << g_quality
+              << "\n" << std::flush;
+}
+
+static void emitStatStop(long tsec, long frames)
+{
+    std::cout << "STAT|event=stop"
+              << "|t=" << tsec
+              << "|frames=" << frames
+              << "|codec=" << statCodecName()
+              << "\n" << std::flush;
+}
+
+static void emitStatError(const char *token)
+{
+    std::cout << "STAT|event=error|msg=" << token << "\n" << std::flush;
+}
+
+/* ── runtime reconfigure via stdin (SETP|k=v|… line protocol) ────────────── */
+struct SetpPatch {
+    bool has_codec = false;  CodecId codec = CODEC_H264;
+    bool has_hw = false;     bool hw = true;
+    bool has_bitrate = false; int bitrate = 0;
+    bool has_quality = false; int quality = 23;
+    bool has_fps = false;    int fps = 60;
+    bool has_scale = false;  int scale = 100;
+    bool has_chroma = false; int chroma444 = 0;
+    std::string err;         /* non-empty = reject the whole patch */
+};
+
+/* Strict integer parse: the WHOLE token must be decimal digits, so "1000abc",
+ * "" and "12x" are rejected instead of being silently truncated by atoi. */
+static bool parseIntStrict(const std::string &v, int &out)
+{
+    if (v.empty()) return false;
+    size_t i = 0;
+    if (v[0] == '+' || v[0] == '-') i = 1;
+    if (i >= v.size()) return false;
+    long long n = 0;
+    for (size_t j = i; j < v.size(); j++) {
+        if (v[j] < '0' || v[j] > '9') return false;
+        n = n * 10 + (v[j] - '0');
+        if (n > 2147483647LL) return false;
+    }
+    out = (v[0] == '-') ? (int)-n : (int)n;
+    return true;
+}
+
+static bool parseSetpLine(const std::string &line, SetpPatch &p)
+{
+    /* SETP|k=v|k=v|… — values carry no '|' (same grammar as STAT|). */
+    size_t pos = 5;
+    while (pos < line.size()) {
+        size_t bar = line.find('|', pos);
+        std::string tok = (bar == std::string::npos) ? line.substr(pos)
+                                                     : line.substr(pos, bar - pos);
+        pos = (bar == std::string::npos) ? line.size() : bar + 1;
+        size_t eq = tok.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+        if (k == "codec") {
+            CodecId c = codecFromString(v);
+            /* "auto" maps to h264; reject anything unknown */
+            if (v != "auto" && v != "h264" && v != "h265" && v != "av1" &&
+                v != "raw" && v != "rle") {
+                p.err = "bad_value_codec"; return false;
+            }
+            p.has_codec = true; p.codec = c;
+        } else if (k == "hw") {
+            if (v != "0" && v != "1") { p.err = "bad_value_hw"; return false; }
+            p.has_hw = true; p.hw = (v == "1");
+        } else if (k == "bitrate") {
+            int n = 0;
+            if (!parseIntStrict(v, n) || n < 0 || n > 100000) {
+                p.err = "bad_value_bitrate"; return false;
+            }
+            p.has_bitrate = true; p.bitrate = n;
+        } else if (k == "quality") {
+            int n = 0;
+            if (!parseIntStrict(v, n) || n < 0 || n > 51) {
+                p.err = "bad_value_quality"; return false;
+            }
+            p.has_quality = true; p.quality = n;
+        } else if (k == "fps") {
+            int n = 0;
+            if (!parseIntStrict(v, n) || n < 1 || n > 240) {
+                p.err = "bad_value_fps"; return false;
+            }
+            p.has_fps = true; p.fps = n;
+        } else if (k == "scale") {
+            int n = 0;
+            if (!parseIntStrict(v, n) || n < 25 || n > 100) {
+                p.err = "bad_value_scale"; return false;
+            }
+            p.has_scale = true; p.scale = n;
+        } else if (k == "chroma") {
+            if (v != "420" && v != "444") { p.err = "bad_value_chroma"; return false; }
+            p.has_chroma = true; p.chroma444 = (v == "444") ? 1 : 0;
+        }
+        /* unknown keys ignored (forward compatible) */
+    }
+    return true;
+}
+
+/* Dedicated thread: stdin is a pipe when spawned by the GUI (SETP lines) and
+ * the console when run by hand (lines typed during the stream). Detached —
+ * it blocks on getline until process exit. */
+static void stdinReaderLoop()
+{
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("SETP|", 0) == 0) {
+            std::lock_guard<std::mutex> lk(g_setp_mtx);
+            g_pending_setp = line;              /* last-wins */
+        } else if (line == "PING") {
+            std::cout << "STAT|event=pong\n" << std::flush;
+        }
+    }
+}
+
+static void startStdinReader()
+{
+    std::thread(stdinReaderLoop).detach();
+}
+
+/* Take the pending SETP line, if any. */
+static bool takePendingSetp(std::string &out)
+{
+    std::lock_guard<std::mutex> lk(g_setp_mtx);
+    if (g_pending_setp.empty()) return false;
+    out.swap(g_pending_setp);
+    return true;
+}
+
+/* 8082 remote-RLE offload: connect only while the codec is RLE. */
+static void gpuOffloadConnect()
+{
+    if (GPU_SOCK_VALID(g_gpu_sock) || g_recv_ip.empty()) return;
+    std::cout << COL_MAGENTA << "GPU offload: " << g_recv_ip << ":"
+              << GPU_ACCEL_PORT << " ...\n" << COL_RESET;
+    g_gpu_sock = gpu_remote_connect(g_recv_ip.c_str());
+    if (GPU_SOCK_VALID(g_gpu_sock)) {
+        g_gpu_active = true;
+        std::cout << COL_GREEN << "Remote compute (CPU offload) active\n" << COL_RESET;
+    } else {
+        std::cout << COL_YELLOW << "Compute service unavailable – local CPU only\n"
+                  << COL_RESET;
+    }
+}
+
+static void gpuOffloadDisconnect()
+{
+    if (GPU_SOCK_VALID(g_gpu_sock)) {
+        gpu_remote_disconnect(g_gpu_sock);
+        g_gpu_sock = GPU_INVALID_SOCK;
+    }
+    g_gpu_active = false;
+}
+
+/* ── protocol v2 helpers ─────────────────────────────────────────────────── */
+static bool isCodedCodec() { return g_codec >= CODEC_H264; }
+
+static HsRequestV2 makeHsRequest(int w, int h)
+{
+    HsRequestV2 r = {};
+    r.magic        = htonl(TVHS_MAGIC);
+    r.version      = htonl(TVHS_VERSION);
+    r.width        = htonl((uint32_t)w);
+    r.height       = htonl((uint32_t)h);
+    r.fps          = htonl((uint32_t)TARGET_FPS);
+    r.mode         = htonl(DISPLAY_MODE);
+    r.codec        = htonl((uint32_t)g_codec);
+    r.codec_flags  = htonl(g_want_hw ? CODEC_FLAG_WANT_HW : 0u);
+    r.bitrate_kbps = htonl((uint32_t)(g_bitrate_kbps > 0 ? g_bitrate_kbps : 0));
+    r.quality      = htonl((uint32_t)g_quality);
+    r.gop_frames   = 0;                 /* 0 = default 2*fps */
+    r.reserved     = 0;
+    return r;
+}
+
+/* Coded (stream) size for a given capture size, honoring --scale.
+ * Coded dims are even; src stays the capture size so the encoder's
+ * swscale pass performs the downscale. */
+static void codedDims(int src_w, int src_h, int &cw, int &ch)
+{
+    cw = src_w;
+    ch = src_h;
+    if (g_scale_pct < 100) {
+        cw = (src_w * g_scale_pct) / 100;
+        ch = (src_h * g_scale_pct) / 100;
+    }
+    cw &= ~1;
+    ch &= ~1;
+    if (cw < 2) cw = 2;
+    if (ch < 2) ch = 2;
+}
+
+static const char *hsStatusMsg(uint32_t st)
+{
+    switch (st) {
+    case HS_OK:          return "OK";
+    case HS_ERR_VERSION: return "protocol version mismatch — please update both TwinView ends";
+    case HS_ERR_CODEC:   return "receiver rejected the codec";
+    case HS_ERR_DIMS:    return "receiver rejected the stream dimensions";
+    case HS_ERR_DECODER: return "receiver has no decoder for this codec";
+    case HS_ERR_LEGACY:  return "peer is a legacy TwinView build — please update both TwinView ends";
+    default:             return "unknown handshake error";
+    }
+}
+
+static const char *hsStatusToken(uint32_t st)
+{
+    switch (st) {
+    case HS_ERR_VERSION: return "version_mismatch";
+    case HS_ERR_CODEC:   return "codec_rejected";
+    case HS_ERR_DIMS:    return "dims_rejected";
+    case HS_ERR_DECODER: return "decoder_unavailable";
+    case HS_ERR_LEGACY:  return "legacy_peer";
+    default:             return "handshake_rejected";
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * PORTS INTERACTIVE MENU  –  inspect/manage receiver's ports
  * ══════════════════════════════════════════════════════════════════════════ */
 static void print_port_entries(const PortEntry *entries, uint32_t count)
@@ -719,7 +1000,7 @@ int main(int argc, char* argv[])
 
     std::cout << COL_CYAN << COL_BOLD
               << "========================================\n"
-                 "  TwinView SENDER v0.8.0\n"
+                 "  TwinView SENDER v0.9.0\n"
                  "========================================\n" << COL_RESET
               << "  Source: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
               << "  @ " << TARGET_FPS << " FPS\n"
@@ -743,20 +1024,46 @@ int main(int argc, char* argv[])
 
     /* Discover receivers (or use direct IP from command line).
      * CLI: sender [ip] [port] [--mode mirror|extend]
+     *          [--codec auto|h264|h265|av1|raw|rle] [--hw 0|1]
+     *          [--bitrate <kbps>] [--quality <0-51>] [--fps <n>]
+     *          [--scale <pct>] [--chroma 420|444]
      *   --mode is non-interactive (GUI/automation): skips the prompts
      *   and, for extend, uses the default 1920x1080 virtual display. */
     std::string cli_mode;                       /* empty = ask interactively */
     std::string cli_ip;
+    std::string cli_codec = "h264";
     int cli_port = 8081;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             cli_mode = argv[++i];
+        } else if (std::strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
+            cli_codec = argv[++i];
+        } else if (std::strcmp(argv[i], "--hw") == 0 && i + 1 < argc) {
+            g_want_hw = (std::atoi(argv[++i]) != 0);
+        } else if (std::strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) {
+            g_bitrate_kbps = std::atoi(argv[++i]);
+            if (g_bitrate_kbps < 0) g_bitrate_kbps = 0;
+        } else if (std::strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
+            g_quality = std::atoi(argv[++i]);
+            if (g_quality < 0)  g_quality = 0;
+            if (g_quality > 51) g_quality = 51;
+        } else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            TARGET_FPS = std::atoi(argv[++i]);
+            if (TARGET_FPS < 1)   TARGET_FPS = 1;
+            if (TARGET_FPS > 240) TARGET_FPS = 240;
+        } else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+            g_scale_pct = std::atoi(argv[++i]);
+            if (g_scale_pct < 25)   g_scale_pct = 25;
+            if (g_scale_pct > 100)  g_scale_pct = 100;
+        } else if (std::strcmp(argv[i], "--chroma") == 0 && i + 1 < argc) {
+            g_chroma_444 = (std::atoi(argv[++i]) == 444) ? 1 : 0;
         } else if (cli_ip.empty()) {
             cli_ip = argv[i];
         } else {
             cli_port = std::atoi(argv[i]);
         }
     }
+    g_codec = codecFromString(cli_codec);   /* "auto" → CODEC_H264 */
 
     std::vector<DiscoveredDevice> receivers;
     if (!cli_ip.empty()) {
@@ -822,6 +1129,7 @@ int main(int argc, char* argv[])
         if (cli_mode.empty()) selectExtendResolution(vdd_w, vdd_h);
         VddInfo vdd;
         if (!vddStartup(vdd_w, vdd_h, vdd)) {
+            emitStatError("vdd_startup_failed");
             cleanupSockets(); return 1;
         }
         g_cap_device   = vdd.device;
@@ -832,18 +1140,11 @@ int main(int argc, char* argv[])
     }
 #endif
 
-    /* Attempt GPU offload */
-    std::cout << COL_MAGENTA << "GPU offload: "
-              << sel.ip_address << ":" << GPU_ACCEL_PORT << " ...\n"
-              << COL_RESET;
-    g_gpu_sock = gpu_remote_connect(sel.ip_address.c_str());
-    if (GPU_SOCK_VALID(g_gpu_sock)) {
-        g_gpu_active = true;
-        std::cout << COL_GREEN << "Remote compute (CPU offload) active\n" << COL_RESET;
-    } else {
-        std::cout << COL_YELLOW << "Compute service unavailable – local CPU only\n"
-                  << COL_RESET;
-    }
+    /* Remote compute offload (8082) is only used by the RLE path – connecting
+     * it for RAW or coded streams would traverse the LAN twice for nothing. */
+    g_recv_ip = sel.ip_address;
+    if (g_codec == CODEC_RLE)
+        gpuOffloadConnect();
 
     /* Connect to port inspection service */
     std::cout << COL_MAGENTA << "Port inspector: "
@@ -868,19 +1169,10 @@ int main(int argc, char* argv[])
         cleanupSockets(); return 1;
     }
 
-    /* ── Extended handshake ── */
-    struct {
-        uint32_t sender_width;
-        uint32_t sender_height;
-        uint32_t fps;
-        uint32_t mode;        /* MODE_MIRROR / MODE_TRUE_EXTEND */
-    } hs_out = {
-        htonl((uint32_t)SCREEN_WIDTH),
-        htonl((uint32_t)SCREEN_HEIGHT),
-        htonl((uint32_t)TARGET_FPS),
-        htonl(DISPLAY_MODE)
-    };
+    /* ── Handshake v2 (proto.h): HsRequestV2 → HsResponseV2 ── */
+    HsRequestV2 hs_out = makeHsRequest(SCREEN_WIDTH, SCREEN_HEIGHT);
     if (!conn.sendAll(&hs_out, sizeof(hs_out))) {
+        emitStatError("handshake_send_failed");
         if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
         if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
 #ifdef _WIN32
@@ -889,14 +1181,40 @@ int main(int argc, char* argv[])
         cleanupSockets(); return 1;
     }
 
-    /* Receive receiver's display size */
-    struct {
-        uint32_t recv_width;
-        uint32_t recv_height;
-        uint32_t status;
-    } hs_in = {};
-    if (!conn.recvAll(&hs_in, sizeof(hs_in)) || ntohl(hs_in.status) != 0) {
-        std::cerr << COL_RED << "Handshake response failed\n" << COL_RESET;
+    HsResponseV2 hs_in = {};
+    if (!conn.recvAll(&hs_in, sizeof(hs_in))) {
+        std::cerr << COL_RED
+                  << "No handshake response – the peer is probably a legacy "
+                     "TwinView build; please update both TwinView ends\n"
+                  << COL_RESET;
+        emitStatError("legacy_peer");
+        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
+        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    uint32_t hs_magic  = ntohl(hs_in.magic);
+    uint32_t hs_status = ntohl(hs_in.status);
+    if (hs_magic != TVHS_MAGIC) {
+        std::cerr << COL_RED
+                  << "Bad handshake response (no TVHS magic) – peer is "
+                     "probably a legacy TwinView build; please update both "
+                     "TwinView ends\n"
+                  << COL_RESET;
+        emitStatError("legacy_peer");
+        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
+        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (hs_status != HS_OK) {
+        std::cerr << COL_RED << "Handshake rejected: "
+                  << hsStatusMsg(hs_status) << "\n" << COL_RESET;
+        emitStatError(hsStatusToken(hs_status));
         if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
         if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
 #ifdef _WIN32
@@ -920,30 +1238,180 @@ int main(int argc, char* argv[])
         std::cout << SCREEN_WIDTH << "x" << SCREEN_HEIGHT << " (mirror)\n";
     std::cout << COL_RESET;
 
+    /* ── Encoder for coded streams (raw/RLE pass through untouched) ── */
+    Encoder encoder;
+    EncoderConfig enc_cfg;
+    if (isCodedCodec()) {
+        enc_cfg.codec       = g_codec;
+        codedDims(SCREEN_WIDTH, SCREEN_HEIGHT, enc_cfg.width, enc_cfg.height);
+        enc_cfg.src_width   = SCREEN_WIDTH;
+        enc_cfg.src_height  = SCREEN_HEIGHT;
+        enc_cfg.fps         = TARGET_FPS;
+        enc_cfg.bitrate_kbps = g_bitrate_kbps;
+        enc_cfg.quality     = g_quality;
+        enc_cfg.want_hw     = g_want_hw;
+        enc_cfg.gop_frames  = 0;
+        enc_cfg.chroma_444  = g_chroma_444;
+
+        std::string enc_err = encoder.open(enc_cfg);
+        if (!enc_err.empty()) {
+            std::cerr << COL_RED << "Encoder open failed: " << enc_err
+                      << "\n" << COL_RESET;
+            emitStatError("encoder_open_failed");
+            if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
+            if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
+#ifdef _WIN32
+            vddShutdown();
+#endif
+            cleanupSockets(); return 1;
+        }
+        g_enc_impl = encoder.implName();
+        g_enc_hw   = encoder.isHw();
+        std::cout << COL_GREEN << "Using encoder: " << g_enc_impl
+                  << (g_enc_hw ? " (hw)" : " (sw)")
+                  << " quality=" << g_quality
+                  << " gop=" << encoder.gopFrames()
+                  << COL_RESET << "\n" << std::flush;
+    } else {
+        std::cout << COL_GREEN << "Using raw/RLE transport" << COL_RESET
+                  << "\n" << std::flush;
+    }
+
     std::cout << COL_GREEN << "Streaming – Ctrl+C to stop\n" << COL_RESET;
+    emitStatStart();
+    startStdinReader();   /* SETP|… runtime reconfigure lines from the GUI */
 
     /* ── Streaming loop ── */
-    const auto frame_dur   = std::chrono::microseconds(1000000 / TARGET_FPS);
+    auto       frame_dur   = std::chrono::microseconds(1000000 / TARGET_FPS);
     auto       last_stats  = std::chrono::steady_clock::now();
     auto       sess_start  = last_stats;
     int        frames_sent = 0;
     size_t     total_bytes = 0;
+    size_t     stat_bytes  = 0;   /* payload since the last stats interval */
+    int        stat_frames = 0;
     int        fbehind     = 0;
     std::vector<uint8_t> comp_buf;
+    std::vector<uint8_t> au;
 
     while (g_running) {
         auto t0 = std::chrono::steady_clock::now();
 
+        /* ── Runtime reconfigure (SETP from the GUI) ── */
+        {
+            std::string setp;
+            if (takePendingSetp(setp)) {
+                SetpPatch p;
+                if (!parseSetpLine(setp, p)) {
+                    emitStatError(p.err.c_str());
+                } else {
+                    const bool codec_changed = p.has_codec && p.codec != g_codec;
+                    /* Receiver-side impact: codec / scale (geometry) / chroma
+                     * (profile) require a decoder reset; fps/bitrate/quality/
+                     * hw are sender-local. */
+                    const bool need_notify =
+                        codec_changed || p.has_scale || p.has_chroma;
+                    const bool need_rebuild =
+                        codec_changed ||
+                        (p.has_hw && p.hw != g_want_hw) ||
+                        (p.has_bitrate && p.bitrate != g_bitrate_kbps) ||
+                        (p.has_quality && p.quality != g_quality) ||
+                        (p.has_scale && p.scale != g_scale_pct) ||
+                        (p.has_chroma && p.chroma444 != g_chroma_444) ||
+                        (isCodedCodec() && p.has_fps && p.fps != TARGET_FPS);
+
+                    /* 8082 offload follows the codec */
+                    if (codec_changed) {
+                        if (p.codec == CODEC_RLE) gpuOffloadConnect();
+                        else                      gpuOffloadDisconnect();
+                    }
+
+                    if (p.has_codec)  g_codec = p.codec;
+                    if (p.has_hw)     g_want_hw = p.hw;
+                    if (p.has_bitrate) g_bitrate_kbps = p.bitrate;
+                    if (p.has_quality) g_quality = p.quality;
+                    if (p.has_scale)  g_scale_pct = p.scale;
+                    if (p.has_chroma) g_chroma_444 = p.chroma444;
+                    if (p.has_fps) {
+                        TARGET_FPS = p.fps;
+                        frame_dur = std::chrono::microseconds(1000000 / TARGET_FPS);
+                    }
+
+                    /* Mirror the VDD-resize pattern: rebuild first so the
+                     * next AU is an IDR of the new config, then notify. */
+                    if (isCodedCodec() && need_rebuild) {
+                        enc_cfg.codec = g_codec;
+                        codedDims(SCREEN_WIDTH, SCREEN_HEIGHT,
+                                  enc_cfg.width, enc_cfg.height);
+                        enc_cfg.src_width   = SCREEN_WIDTH;
+                        enc_cfg.src_height  = SCREEN_HEIGHT;
+                        enc_cfg.fps         = TARGET_FPS;
+                        enc_cfg.bitrate_kbps = g_bitrate_kbps;
+                        enc_cfg.quality     = g_quality;
+                        enc_cfg.want_hw     = g_want_hw;
+                        enc_cfg.gop_frames  = 0;
+                        enc_cfg.chroma_444  = g_chroma_444;
+                        std::string enc_err = encoder.open(enc_cfg);
+                        if (!enc_err.empty()) {
+                            std::cerr << COL_RED
+                                      << "Encoder rebuild failed: " << enc_err
+                                      << "\n" << COL_RESET;
+                            emitStatError("encoder_rebuild_failed");
+                            break;
+                        }
+                        g_enc_impl = encoder.implName();
+                        g_enc_hw   = encoder.isHw();
+                        encoder.forceKeyframe();
+                    } else if (codec_changed && !isCodedCodec()) {
+                        encoder.close();   /* left coded mode behind */
+                    }
+
+                    /* Tell the receiver BEFORE the next bitstream bytes so it
+                     * re-inits its decoder in time. */
+                    if (need_notify) {
+                        HsRequestV2 rs = makeHsRequest(SCREEN_WIDTH, SCREEN_HEIGHT);
+                        uint32_t marker = htonl(CTRL_MARKER);
+                        uint32_t ctype  = htonl(CTRL_RECONFIG);
+                        if (!conn.sendAll(&marker, 4) ||
+                            !conn.sendAll(&ctype, 4) ||
+                            !conn.sendAll(&rs, sizeof(rs))) {
+                            std::cerr << COL_RED << "Reconfig notify failed\n"
+                                      << COL_RESET;
+                            emitStatError("reconfig_notify_failed");
+                            break;
+                        }
+                    }
+                    std::cout << COL_GREEN << "Reconfigured: codec="
+                              << codecToString(g_codec)
+                              << " quality=" << g_quality
+                              << " bitrate=" << g_bitrate_kbps
+                              << " fps=" << TARGET_FPS
+                              << " scale=" << g_scale_pct
+                              << " chroma=" << (g_chroma_444 ? "444" : "420")
+                              << "\n" << COL_RESET;
+                    double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - sess_start).count();
+                    long kbps_now = elapsed > 0
+                                        ? (long)(total_bytes * 8.0 / elapsed / 1000.0)
+                                        : 0;
+                    emitStatLine((long)elapsed, frames_sent,
+                                 elapsed > 0 ? frames_sent / elapsed : 0.0,
+                                 kbps_now, "applied");
+                    continue;   /* skip this frame */
+                }
+            }
+        }
+
 #ifdef _WIN32
         /* Live resolution change: if the user resized the virtual display
          * in Windows display settings mid-stream, follow it. Tell the
-         * receiver via a 0xFFFFFFFF marker + fresh 16-byte header. */
+         * receiver via CTRL_MARKER + CTRL_RESIZE + a fresh HsRequestV2. */
         if (DISPLAY_MODE == MODE_TRUE_EXTEND && (frames_sent & 31) == 0) {
             int nx = 0, ny = 0, nw = 0, nh = 0;
             if (!vddFindMonitorRect(g_cap_device, nx, ny, nw, nh)) {
                 std::cerr << COL_RED
                           << "\nVirtual display is gone – ending session\n"
                           << COL_RESET;
+                emitStatError("vdd_lost");
                 break;
             }
             if (nw != SCREEN_WIDTH || nh != SCREEN_HEIGHT ||
@@ -954,17 +1422,35 @@ int main(int argc, char* argv[])
                 g_cap_origin.x = nx;
                 g_cap_origin.y = ny;
 
-                struct { uint32_t w, h, fps, mode; } rs = {
-                    htonl((uint32_t)SCREEN_WIDTH),
-                    htonl((uint32_t)SCREEN_HEIGHT),
-                    htonl((uint32_t)TARGET_FPS),
-                    htonl(DISPLAY_MODE)
-                };
-                uint32_t marker = 0xFFFFFFFFu;
+                /* Rebuild the encoder at the new size first so the AU that
+                 * follows the control packet is an IDR of the new geometry. */
+                if (isCodedCodec()) {
+                    codedDims(SCREEN_WIDTH, SCREEN_HEIGHT,
+                              enc_cfg.width, enc_cfg.height);
+                    enc_cfg.src_width  = SCREEN_WIDTH;
+                    enc_cfg.src_height = SCREEN_HEIGHT;
+                    std::string enc_err = encoder.open(enc_cfg);
+                    if (!enc_err.empty()) {
+                        std::cerr << COL_RED
+                                  << "Encoder rebuild failed: " << enc_err
+                                  << "\n" << COL_RESET;
+                        emitStatError("encoder_rebuild_failed");
+                        break;
+                    }
+                    g_enc_impl = encoder.implName();
+                    g_enc_hw   = encoder.isHw();
+                    encoder.forceKeyframe();
+                }
+
+                HsRequestV2 rs = makeHsRequest(SCREEN_WIDTH, SCREEN_HEIGHT);
+                uint32_t marker = htonl(CTRL_MARKER);
+                uint32_t ctype  = htonl(CTRL_RESIZE);
                 if (!conn.sendAll(&marker, 4) ||
+                    !conn.sendAll(&ctype, 4) ||
                     !conn.sendAll(&rs, sizeof(rs))) {
                     std::cerr << COL_RED << "Resize notify failed\n"
                               << COL_RESET;
+                    emitStatError("resize_notify_failed");
                     break;
                 }
                 std::cout << COL_GREEN << "Resolution changed → "
@@ -977,45 +1463,81 @@ int main(int argc, char* argv[])
 
         auto frame = captureScreen();
 
-        /* GPU offload: RLE compress on receiver */
-        const uint8_t *send_ptr  = frame.data();
-        uint32_t       send_size = (uint32_t)frame.size();
-
-        if (g_gpu_active) {
-            uint8_t *out = nullptr;
-            int csz = gpu_remote_compress(g_gpu_sock, frame.data(),
-                                          (uint32_t)SCREEN_WIDTH,
-                                          (uint32_t)SCREEN_HEIGHT, &out);
-            if (csz > 0 && out) {
-                comp_buf.assign(out, out + csz);
-                free(out);
-                send_ptr  = comp_buf.data();
-                send_size = (uint32_t)csz;
-            } else {
-                gpu_remote_disconnect(g_gpu_sock);
-                g_gpu_sock   = GPU_INVALID_SOCK;
-                g_gpu_active = false;
-                std::cerr << COL_YELLOW
-                          << "GPU lost – CPU fallback\n" << COL_RESET;
+        if (isCodedCodec()) {
+            /* Coded: one access unit per frame, framed like any DATA packet */
+            std::string enc_err = encoder.encode(frame.data(), au);
+            if (!enc_err.empty()) {
+                std::cerr << COL_RED << "Encode failed: " << enc_err
+                          << "\n" << COL_RESET;
+                emitStatError("encode_failed");
+                break;
             }
-        }
+            if (!au.empty()) {           /* empty = no packet this frame */
+                uint32_t net_sz = htonl((uint32_t)au.size());
+                if (!conn.sendAll(&net_sz, 4) ||
+                    !conn.sendAll(au.data(), au.size())) {
+                    std::cerr << COL_RED << "Frame send failed\n" << COL_RESET;
+                    emitStatError("send_failed");
+                    break;
+                }
+                frames_sent++;
+                total_bytes += 4 + au.size();
+                stat_bytes  += 4 + au.size();
+                stat_frames++;
+            }
+        } else {
+            /* RAW / RLE transport (unchanged). GPU offload: RLE compress on
+             * the receiver, only active when the negotiated codec is RLE. */
+            const uint8_t *send_ptr  = frame.data();
+            uint32_t       send_size = (uint32_t)frame.size();
 
-        uint32_t net_sz = htonl(send_size);
-        if (!conn.sendAll(&net_sz, 4) ||
-            !conn.sendAll(send_ptr, send_size)) {
-            std::cerr << COL_RED << "Frame send failed\n" << COL_RESET;
-            break;
-        }
+            if (g_gpu_active) {
+                uint8_t *out = nullptr;
+                int csz = gpu_remote_compress(g_gpu_sock, frame.data(),
+                                              (uint32_t)SCREEN_WIDTH,
+                                              (uint32_t)SCREEN_HEIGHT, &out);
+                if (csz > 0 && out) {
+                    comp_buf.assign(out, out + csz);
+                    free(out);
+                    send_ptr  = comp_buf.data();
+                    send_size = (uint32_t)csz;
+                } else {
+                    gpu_remote_disconnect(g_gpu_sock);
+                    g_gpu_sock   = GPU_INVALID_SOCK;
+                    g_gpu_active = false;
+                    std::cerr << COL_YELLOW
+                              << "GPU lost – CPU fallback\n" << COL_RESET;
+                }
+            }
 
-        frames_sent++;
-        total_bytes += 4 + send_size;
+            uint32_t net_sz = htonl(send_size);
+            if (!conn.sendAll(&net_sz, 4) ||
+                !conn.sendAll(send_ptr, send_size)) {
+                std::cerr << COL_RED << "Frame send failed\n" << COL_RESET;
+                emitStatError("send_failed");
+                break;
+            }
+
+            frames_sent++;
+            total_bytes += 4 + send_size;
+            stat_bytes  += 4 + send_size;
+            stat_frames++;
+        }
 
         auto now  = std::chrono::steady_clock::now();
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(
                         now - last_stats).count();
         if (secs >= STATS_INTERVAL_SEC) {
             showStats(frames_sent, secs, total_bytes);
-            last_stats = now;
+            double ifps = secs > 0 ? (double)stat_frames / (double)secs : 0.0;
+            long ikbps = (long)((double)stat_bytes / 1024.0 /
+                                (double)(secs > 0 ? secs : 1));
+            long tsec = (long)std::chrono::duration_cast<std::chrono::seconds>(
+                            now - sess_start).count();
+            emitStatLine(tsec, frames_sent, ifps, ikbps);
+            last_stats  = now;
+            stat_bytes  = 0;
+            stat_frames = 0;
         }
 
         /* Adaptive timing */
@@ -1050,6 +1572,8 @@ int main(int argc, char* argv[])
                                        << " MB/s\n";
     std::cout << COL_CYAN << "========================================\n"
               << COL_RESET;
+
+    emitStatStop((long)total_s, frames_sent);
 
     if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
     if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);

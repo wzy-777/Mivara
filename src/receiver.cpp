@@ -18,9 +18,12 @@
  *
  * In mirror mode a normal resizable window is used (original behaviour).
  *
- * Extended handshake (receiver → sender):
- *   Receiver reads sender's dimensions + mode, opens the appropriate window,
- *   then sends back its own display size so sender can display total layout.
+ * Handshake: protocol v2 (proto.h). The first u32 must be TVHS_MAGIC —
+ * anything else is a legacy peer and is rejected with a visible error.
+ *   sender → receiver : HsRequestV2  (48 bytes)
+ *   receiver → sender : HsResponseV2 (36 bytes, status = HsStatus)
+ * Stream frames: u32 pkt_size + payload (RAW / RLE / one coded AU).
+ * Control: u32 CTRL_MARKER + u32 CtrlType + body (CTRL_RESIZE = HsRequestV2).
  *
  * Cross-platform notes
  * --------------------
@@ -49,6 +52,8 @@
 #include "discover.h"
 #include "gpu_accelerate.h"
 #include "ports.h"
+#include "proto.h"
+#include "codec.h"
 
 /* ── Platform headers ───────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -392,6 +397,73 @@ static int send_all_p(plat_sock_t s, const void *buf, size_t len)
 /* ── Forward declaration ─────────────────────────────────────────────────── */
 static bool handleClientConnection(plat_sock_t client);
 
+/* ── Machine-readable status lines (same contract as the sender) ─────────── */
+static void emitRxStat(const char *event, const std::string &extra)
+{
+    std::cout << "STAT|event=" << event;
+    if (!extra.empty())
+        std::cout << "|" << extra;
+    std::cout << "\n" << std::flush;
+}
+
+/* SSDP friendly name: this machine's hostname (fallback "TwinView"). */
+static std::string localHostName()
+{
+    char host[256] = {0};
+    if (gethostname(host, sizeof(host) - 1) != 0 || host[0] == '\0')
+        return "TwinView";
+    host[sizeof(host) - 1] = '\0';
+    return std::string(host);
+}
+
+/* Convert a wire-order HsRequestV2 to host order (in place). */
+static void hsReqFromWire(HsRequestV2 &r)
+{
+    r.magic        = ntohl(r.magic);
+    r.version      = ntohl(r.version);
+    r.width        = ntohl(r.width);
+    r.height       = ntohl(r.height);
+    r.fps          = ntohl(r.fps);
+    r.mode         = ntohl(r.mode);
+    r.codec        = ntohl(r.codec);
+    r.codec_flags  = ntohl(r.codec_flags);
+    r.bitrate_kbps = ntohl(r.bitrate_kbps);
+    r.quality      = ntohl(r.quality);
+    r.gop_frames   = ntohl(r.gop_frames);
+    r.reserved     = ntohl(r.reserved);
+}
+
+/* A legacy (pre-v2) peer must NOT end as a black screen: log the error,
+ * show it in a small SDL window title, then close the connection. */
+static void showLegacyPeerError()
+{
+    const char *msg =
+        "Handshake from legacy TwinView build \xe2\x80\x94 please update both ends";
+    std::cerr << COLOR_RED << msg << COLOR_RESET << "\n";
+    emitRxStat("error", "msg=legacy_peer");
+
+    if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+        SDL_Window *w = SDL_CreateWindow(msg, SDL_WINDOWPOS_CENTERED,
+                                         SDL_WINDOWPOS_CENTERED, 640, 60,
+                                         SDL_WINDOW_SHOWN);
+        if (w) {
+            auto until = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(8);
+            SDL_Event ev;
+            while (std::chrono::steady_clock::now() < until) {
+                while (SDL_PollEvent(&ev)) {
+                    if (ev.type == SDL_QUIT || ev.type == SDL_KEYDOWN ||
+                        ev.type == SDL_MOUSEBUTTONDOWN)
+                        until = std::chrono::steady_clock::now();
+                }
+                SDL_Delay(50);
+            }
+            SDL_DestroyWindow(w);
+        }
+        SDL_Quit();
+    }
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * QUERY THIS RECEIVER'S DISPLAY SIZE via SDL2
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -427,17 +499,6 @@ static void ssdpAdvertisementThread()
     setsockopt(rsock, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
     setsockopt(rsock, SOL_SOCKET, SO_RCVBUF, (char *)&sb, sizeof(sb));
 
-    struct ip_mreq mreq = {};
-    mreq.imr_multiaddr.s_addr = inet_addr(SSDP_ADDR);
-    mreq.imr_interface.s_addr = INADDR_ANY;
-    if (setsockopt(rsock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   (char *)&mreq, sizeof(mreq)) < 0)
-    {
-        std::cerr << "SSDP: multicast join failed\n";
-        PLAT_CLOSE(rsock);
-        return;
-    }
-
     struct sockaddr_in baddr = {};
     baddr.sin_family = AF_INET;
     baddr.sin_addr.s_addr = INADDR_ANY;
@@ -448,6 +509,16 @@ static void ssdpAdvertisementThread()
         PLAT_CLOSE(rsock);
         return;
     }
+
+    /* Binding is enough to receive unicast and broadcast M-SEARCH packets.
+       Multicast membership is best-effort: VPNs and some enterprise networks
+       reject the join, but that must not disable discovery altogether. */
+    struct ip_mreq mreq = {};
+    mreq.imr_multiaddr.s_addr = inet_addr(SSDP_ADDR);
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    if (setsockopt(rsock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   (char *)&mreq, sizeof(mreq)) < 0)
+        std::cerr << "SSDP: multicast join failed; broadcast discovery remains available\n";
     std::cout << "SSDP: listening\n";
 
     /* M-SEARCH response thread */
@@ -483,6 +554,7 @@ static void ssdpAdvertisementThread()
                     std::to_string(TCP_STREAM_PORT) + "/\r\n"
                 "SERVER: ScreenShare/1.0\r\n"
                 "ST: urn:screen-share:receiver\r\n"
+                "NAME: " + localHostName() + "\r\n"
                 "USN: uuid:screen-share-" + lip + "\r\n\r\n";
             sendto(rsock, resp_str.c_str(), (int)resp_str.size(), 0,
                    (struct sockaddr *)&from, (ACCEPT_LEN_T)flen);
@@ -510,7 +582,9 @@ static void ssdpAdvertisementThread()
                                               "NT: urn:screen-share:receiver\r\n"
                                               "NTS: ssdp:alive\r\n"
                                               "SERVER: ScreenShare/1.0\r\n"
-                                              "USN: uuid:screen-share-" +
+                                              "NAME: " +
+            localHostName() + "\r\n"
+                              "USN: uuid:screen-share-" +
             lip + "\r\n\r\n";
         struct sockaddr_in dest = {};
         dest.sin_family = AF_INET;
@@ -616,56 +690,94 @@ static bool handleClientConnection(plat_sock_t client)
     /* Record client connection */
     g_gpu_stats.recordClient(client_ip);
 
-    /* ── Receive extended handshake ── */
-    struct
-    {
-        uint32_t sender_width;
-        uint32_t sender_height;
-        uint32_t fps;
-        uint32_t mode;
-    } hs_in = {};
+    /* ── Handshake v2 (proto.h) ──
+     * The first u32 must be TVHS_MAGIC. Anything else is a legacy
+     * (pre-v2) TwinView build: report it visibly and close – no silence. */
+    Decoder decoder; /* opened below for coded streams */
+    CodecId sess_codec = CODEC_RAW;
+    HsRequestV2 req = {};
 
-    if (recv_all(client, &hs_in, sizeof(hs_in)) < 0)
+    if (recv_all(client, &req.magic, 4) < 0)
     {
         std::cerr << "Handshake receive failed\n";
         g_gpu_stats.recordClientDisconnect();
         return false;
     }
-
-    SCREEN_WIDTH = (int)ntohl(hs_in.sender_width);
-    SCREEN_HEIGHT = (int)ntohl(hs_in.sender_height);
-    TARGET_FPS = (int)ntohl(hs_in.fps);
-    DISPLAY_MODE = ntohl(hs_in.mode);
-
-    /* Validate */
-    if (SCREEN_WIDTH <= 0 || SCREEN_WIDTH > 7680 ||
-        SCREEN_HEIGHT <= 0 || SCREEN_HEIGHT > 4320 ||
-        TARGET_FPS <= 0 || TARGET_FPS > 240)
+    if (ntohl(req.magic) != TVHS_MAGIC)
     {
-        std::cerr << "Invalid handshake\n";
+        showLegacyPeerError();
         g_gpu_stats.recordClientDisconnect();
         return false;
     }
+    if (recv_all(client, ((char *)&req) + 4, sizeof(req) - 4) < 0)
+    {
+        std::cerr << "Handshake receive failed\n";
+        g_gpu_stats.recordClientDisconnect();
+        return false;
+    }
+    hsReqFromWire(req);
+
+    SCREEN_WIDTH = (int)req.width;
+    SCREEN_HEIGHT = (int)req.height;
+    TARGET_FPS = (int)req.fps;
+    DISPLAY_MODE = req.mode;
+
+    /* Validate dimensions / codec; coded streams need a working decoder
+     * (reject, no silent downgrade – see plan §1). */
+    uint32_t hs_status = HS_OK;
+    if (req.version != TVHS_VERSION)
+        hs_status = HS_ERR_VERSION;
+    else if (SCREEN_WIDTH <= 0 || SCREEN_WIDTH > 7680 ||
+             SCREEN_HEIGHT <= 0 || SCREEN_HEIGHT > 4320 ||
+             TARGET_FPS <= 0 || TARGET_FPS > 240)
+        hs_status = HS_ERR_DIMS;
+    else if (req.codec > (uint32_t)CODEC_AV1)
+        hs_status = HS_ERR_CODEC;
+
+    if (hs_status == HS_OK && req.codec >= (uint32_t)CODEC_H264)
+    {
+        sess_codec = (CodecId)req.codec;
+        std::string derr = decoder.open(sess_codec, SCREEN_WIDTH, SCREEN_HEIGHT);
+        if (!derr.empty())
+        {
+            std::cerr << "Decoder open failed: " << derr << "\n";
+            hs_status = HS_ERR_DECODER;
+        }
+    }
+    else if (hs_status == HS_OK)
+    {
+        sess_codec = (CodecId)req.codec;
+    }
+
+    if (hs_status != HS_OK)
+        std::cerr << "Handshake rejected (status " << hs_status << ")\n";
 
     const char *modeStr =
         DISPLAY_MODE == MODE_TRUE_EXTEND ? "extend" : "mirror";
 
     std::cout << "Sender: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
-              << " @ " << TARGET_FPS << " FPS  mode=" << modeStr << "\n";
+              << " @ " << TARGET_FPS << " FPS  mode=" << modeStr
+              << "  codec=" << codecToString(sess_codec) << "\n";
 
-    /* ── Send back our display size ── */
-    struct
-    {
-        uint32_t recv_width;
-        uint32_t recv_height;
-        uint32_t status;
-    } hs_out = {
-        htonl((uint32_t)MY_DISPLAY_WIDTH),
-        htonl((uint32_t)MY_DISPLAY_HEIGHT),
-        htonl(0u)};
+    /* ── Send back our display size + status ── */
+    HsResponseV2 hs_out = {};
+    hs_out.magic = htonl(TVHS_MAGIC);
+    hs_out.version = htonl(TVHS_VERSION);
+    hs_out.recv_width = htonl((uint32_t)MY_DISPLAY_WIDTH);
+    hs_out.recv_height = htonl((uint32_t)MY_DISPLAY_HEIGHT);
+    hs_out.status = htonl(hs_status);
+    hs_out.codec = htonl((uint32_t)sess_codec); /* echo */
+    hs_out.codec_flags = 0;
+    hs_out.reserved[0] = 0;
+    hs_out.reserved[1] = 0;
     if (send_all_p(client, &hs_out, sizeof(hs_out)) < 0)
     {
         std::cerr << "Handshake response send failed\n";
+        g_gpu_stats.recordClientDisconnect();
+        return false;
+    }
+    if (hs_status != HS_OK)
+    {
         g_gpu_stats.recordClientDisconnect();
         return false;
     }
@@ -748,13 +860,31 @@ static bool handleClientConnection(plat_sock_t client)
         SDL_RenderSetLogicalSize(ren, MY_DISPLAY_WIDTH, MY_DISPLAY_HEIGHT);
     }
 
-    /* Texture at sender's native resolution (renderer scales it) */
-    SDL_Texture *tex = SDL_CreateTexture(
-        ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING,
-        SCREEN_WIDTH, SCREEN_HEIGHT);
-    if (!tex)
+    /* Streaming texture. Raw/RLE = RGB24 at the sender's resolution.
+     * Coded streams create whichever layout the decoder emits (I420/NV12/
+     * RGB24) on the first frame, and again on resize. */
+    SDL_Texture *tex = nullptr;
+    Uint32 tex_pixfmt = 0;
+    int tex_w = 0, tex_h = 0;
+
+    auto ensureTex = [&](Uint32 fmt, int w, int h) -> bool {
+        if (tex && tex_pixfmt == fmt && tex_w == w && tex_h == h)
+            return true;
+        if (tex) { SDL_DestroyTexture(tex); tex = nullptr; }
+        tex = SDL_CreateTexture(ren, fmt, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (!tex) {
+            std::cerr << "Texture: " << SDL_GetError() << "\n";
+            return false;
+        }
+        tex_pixfmt = fmt;
+        tex_w = w;
+        tex_h = h;
+        return true;
+    };
+
+    if (sess_codec < CODEC_H264 &&
+        !ensureTex(SDL_PIXELFORMAT_RGB24, SCREEN_WIDTH, SCREEN_HEIGHT))
     {
-        std::cerr << "Texture: " << SDL_GetError() << "\n";
         SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
         SDL_Quit();
@@ -778,11 +908,24 @@ static bool handleClientConnection(plat_sock_t client)
     size_t full_frame = (size_t)SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL;
     std::vector<uint8_t> frame;
     frame.reserve(full_frame);
+    std::vector<uint8_t> rgb_scratch; /* FMT_OTHER → RGB24 conversion buffer */
+    DecodedFrame dec;
+    /* After CTRL_RESIZE the decoder is fresh: skip non-key frames (bounded
+     * so a mis-flagged IDR can never stall the stream into a black screen). */
+    int skip_until_key = 0;
 
     SDL_Event ev;
     bool streaming = true;
     int frames_rx = 0;
     auto start_time = std::chrono::steady_clock::now();
+
+    emitRxStat("start",
+               std::string("codec=") + codecToString(sess_codec) +
+                   "|mode=" + modeStr +
+                   "|src=" + std::to_string(SCREEN_WIDTH) + "x" +
+                   std::to_string(SCREEN_HEIGHT) +
+                   "|dst=" + std::to_string(MY_DISPLAY_WIDTH) + "x" +
+                   std::to_string(MY_DISPLAY_HEIGHT));
 
     while (streaming && g_running)
     {
@@ -831,48 +974,89 @@ static bool handleClientConnection(plat_sock_t client)
         }
         uint32_t frame_sz = ntohl(net_sz);
 
-        /* Live resolution change: the sender resized the virtual display.
-         * Marker 0xFFFFFFFF followed by a 16-byte header (same layout as
-         * the initial handshake). Recreate the texture and keep going. */
-        if (frame_sz == 0xFFFFFFFFu)
+        /* Control packet: CTRL_MARKER + u32 CtrlType + body (proto.h) */
+        if (frame_sz == CTRL_MARKER)
         {
-            struct { uint32_t w, h, fps, mode; } rs = {};
+            uint32_t ctype = 0;
+            if (recv_all(client, &ctype, 4) < 0)
             {
-                char *p = (char *)&rs;
-                size_t got = 0;
-                while (got < sizeof(rs))
+                streaming = false;
+                break;
+            }
+            ctype = ntohl(ctype);
+
+            if (ctype == CTRL_RESIZE || ctype == CTRL_RECONFIG)
+            {
+                HsRequestV2 rs = {};
+                if (recv_all(client, &rs, sizeof(rs)) < 0)
                 {
-                    int m = (int)recv(client, p + got,
-                                      (int)(sizeof(rs) - got), 0);
-                    if (m <= 0) { streaming = false; break; }
-                    got += (size_t)m;
+                    streaming = false;
+                    break;
                 }
-            }
-            if (!streaming) break;
+                hsReqFromWire(rs);
+                int nw = (int)rs.width, nh = (int)rs.height;
+                if (nw <= 0 || nw > 7680 || nh <= 0 || nh > 4320)
+                {
+                    std::cerr << "Bad resize header\n";
+                    break;
+                }
+                /* CTRL_RECONFIG carries live param changes: codec and fps may
+                 * differ from the handshake. Always re-open the decoder so a
+                 * new SPS/profile (e.g. chroma 420→444) is accepted. */
+                if (ctype == CTRL_RECONFIG && rs.codec <= (uint32_t)CODEC_AV1)
+                    sess_codec = (CodecId)rs.codec;
+                if (rs.fps > 0 && rs.fps <= 240)
+                    TARGET_FPS = (int)rs.fps;
+                SCREEN_WIDTH = nw;
+                SCREEN_HEIGHT = nh;
 
-            int nw = (int)ntohl(rs.w), nh = (int)ntohl(rs.h);
-            if (nw <= 0 || nw > 7680 || nh <= 0 || nh > 4320)
+                if (sess_codec >= CODEC_H264)
+                {
+                    std::string derr =
+                        decoder.open(sess_codec, SCREEN_WIDTH, SCREEN_HEIGHT);
+                    if (!derr.empty())
+                    {
+                        std::cerr << "Decoder rebuild failed: " << derr << "\n";
+                        emitRxStat("error", "msg=decoder_rebuild_failed");
+                        break;
+                    }
+                    skip_until_key = 30;
+                }
+                else
+                {
+                    skip_until_key = 0;
+                }
+
+                if (tex)
+                {
+                    SDL_DestroyTexture(tex);
+                    tex = nullptr;
+                }
+                tex_pixfmt = 0;
+                tex_w = tex_h = 0;
+                full_frame = (size_t)SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL;
+                frame.clear();
+                frame.reserve(full_frame);
+                std::cout << (ctype == CTRL_RECONFIG ? "Reconfigured: "
+                                                     : "Resolution changed: ")
+                          << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
+                          << "  codec=" << codecToString(sess_codec) << "\n";
+                emitRxStat(ctype == CTRL_RECONFIG ? "reconfig" : "resize",
+                           "src=" + std::to_string(SCREEN_WIDTH) +
+                               "x" + std::to_string(SCREEN_HEIGHT));
+                continue;
+            }
+            if (ctype == CTRL_EOS)
             {
-                std::cerr << "Bad resize header\n";
+                std::cout << "Sender ended the stream (EOS)\n";
+                streaming = false;
                 break;
             }
-            SCREEN_WIDTH  = nw;
-            SCREEN_HEIGHT = nh;
-
-            SDL_DestroyTexture(tex);
-            tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24,
-                                    SDL_TEXTUREACCESS_STREAMING,
-                                    SCREEN_WIDTH, SCREEN_HEIGHT);
-            if (!tex)
+            if (ctype == CTRL_FORCE_IDR)
             {
-                std::cerr << "Texture (resize): " << SDL_GetError() << "\n";
-                break;
+                continue; /* encoder-side request – nothing to do here */
             }
-            full_frame = (size_t)SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL;
-            frame.clear();
-            frame.reserve(full_frame);
-            std::cout << "Resolution changed: "
-                      << SCREEN_WIDTH << "x" << SCREEN_HEIGHT << "\n";
+            std::cerr << "Unknown control type: " << ctype << "\n";
             continue;
         }
 
@@ -899,41 +1083,100 @@ static bool handleClientConnection(plat_sock_t client)
         if (!streaming)
             break;
 
-        /*
-         * RLE decompression
-         * If the frame is smaller than a raw RGB frame it was RLE-compressed
-         * by the GPU service. Decompress: stream of [run r g b] tuples.
-         */
-        bool was_compressed = (frame_sz < (uint32_t)full_frame);
-
-        if (was_compressed)
+        if (sess_codec >= CODEC_H264)
         {
-            std::vector<uint8_t> dec;
-            dec.reserve(full_frame);
-            const uint8_t *src = frame.data();
-            const uint8_t *end = src + frame_sz;
-            while (src + 3 < end && dec.size() < full_frame)
+            /* Coded stream: one access unit per packet */
+            std::string derr = decoder.decode(frame.data(), frame.size(), dec);
+            if (!derr.empty())
             {
-                uint8_t run = *src++;
-                uint8_t r = *src++;
-                uint8_t g = *src++;
-                uint8_t b = *src++;
-                for (uint8_t j = 0;
-                     j < run && dec.size() + 3 <= full_frame; j++)
-                {
-                    dec.push_back(r);
-                    dec.push_back(g);
-                    dec.push_back(b);
-                }
+                std::cerr << "Decode failed: " << derr << "\n";
+                emitRxStat("error", "msg=decode_failed");
+                break;
             }
-            while (dec.size() < full_frame)
-                dec.push_back(0);
-            frame = std::move(dec);
+            if (!dec.valid())
+                continue; /* parser buffering – no frame for this AU yet */
+            if (skip_until_key > 0 && !dec.keyframe)
+            {
+                skip_until_key--;
+                continue;
+            }
+            skip_until_key = 0;
+
+            if (dec.fmt == DecodedFrame::FMT_I420)
+            {
+                if (!ensureTex(SDL_PIXELFORMAT_IYUV, dec.width, dec.height))
+                    break;
+                SDL_UpdateYUVTexture(tex, nullptr,
+                                     dec.plane[0], dec.stride[0],
+                                     dec.plane[1], dec.stride[1],
+                                     dec.plane[2], dec.stride[2]);
+            }
+            else if (dec.fmt == DecodedFrame::FMT_NV12)
+            {
+                if (!ensureTex(SDL_PIXELFORMAT_NV12, dec.width, dec.height))
+                    break;
+                SDL_UpdateNVTexture(tex, nullptr,
+                                    dec.plane[0], dec.stride[0],
+                                    dec.plane[1], dec.stride[1]);
+            }
+            else
+            {
+                if (!ensureTex(SDL_PIXELFORMAT_RGB24, dec.width, dec.height))
+                    break;
+                rgb_scratch.resize((size_t)dec.width * dec.height * 3);
+                std::string cerr_ =
+                    frameToRGB24(dec, rgb_scratch.data(), dec.width * 3);
+                if (!cerr_.empty())
+                {
+                    std::cerr << "RGB convert failed: " << cerr_ << "\n";
+                    break;
+                }
+                SDL_UpdateTexture(tex, nullptr, rgb_scratch.data(),
+                                  dec.width * 3);
+            }
+        }
+        else
+        {
+            /*
+             * RLE decompression – per the negotiated codec. A full-size
+             * payload is the raw fallback (GPU service unavailable).
+             * Decompress: stream of [run r g b] tuples.
+             */
+            bool was_compressed = (sess_codec == CODEC_RLE) &&
+                                  (frame_sz < (uint32_t)full_frame);
+
+            if (was_compressed)
+            {
+                std::vector<uint8_t> decbuf;
+                decbuf.reserve(full_frame);
+                const uint8_t *src = frame.data();
+                const uint8_t *end = src + frame_sz;
+                while (src + 3 < end && decbuf.size() < full_frame)
+                {
+                    uint8_t run = *src++;
+                    uint8_t r = *src++;
+                    uint8_t g = *src++;
+                    uint8_t b = *src++;
+                    for (uint8_t j = 0;
+                         j < run && decbuf.size() + 3 <= full_frame; j++)
+                    {
+                        decbuf.push_back(r);
+                        decbuf.push_back(g);
+                        decbuf.push_back(b);
+                    }
+                }
+                while (decbuf.size() < full_frame)
+                    decbuf.push_back(0);
+                frame = std::move(decbuf);
+            }
+
+            if (!ensureTex(SDL_PIXELFORMAT_RGB24, SCREEN_WIDTH, SCREEN_HEIGHT))
+                break;
+            SDL_UpdateTexture(tex, nullptr, frame.data(),
+                              SCREEN_WIDTH * BYTES_PER_PIXEL);
         }
 
         /* Render */
-        SDL_UpdateTexture(tex, nullptr, frame.data(),
-                          SCREEN_WIDTH * BYTES_PER_PIXEL);
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
         SDL_RenderCopy(ren, tex, nullptr, nullptr);
@@ -970,7 +1213,14 @@ static bool handleClientConnection(plat_sock_t client)
         std::cout << "  Avg FPS  : " << frames_rx / secs << "\n";
     std::cout << "========================================\n";
 
-    SDL_DestroyTexture(tex);
+    emitRxStat("stop", "frames=" + std::to_string(frames_rx) +
+                           "|t=" + std::to_string(secs) +
+                           "|codec=" + codecToString(sess_codec) +
+                           "|src=" + std::to_string(SCREEN_WIDTH) + "x" +
+                           std::to_string(SCREEN_HEIGHT));
+
+    if (tex)
+        SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
@@ -1003,7 +1253,7 @@ int main(int argc, char* argv[])
     queryMyDisplaySize();
 
     std::cout << "========================================\n"
-              << "         TwinView RECEIVER v0.8.0     \n"
+              << "         TwinView RECEIVER v0.9.0     \n"
               << "========================================\n"
               << "  Local IP   : " << getLocalIPAddress() << "\n"
               << "  My display : " << MY_DISPLAY_WIDTH
