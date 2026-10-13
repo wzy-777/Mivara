@@ -476,7 +476,7 @@ std::string Decoder::open(CodecId codec, int width, int height)
         return e;
     }
 
-    p_->parser = av_parser_init((int)av_id);
+    p_->parser = av_parser_init(av_id);
     if (!p_->parser) {
         close();
         return "decoder: parser init failed";
