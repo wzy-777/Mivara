@@ -41,6 +41,8 @@ make OPT_FLAGS="-O3 -march=x86-64 -flto"   # portable build for releases/install
 - Build: `"D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss` (ISCC is at that custom path on this machine, not Program Files).
 - Wizard language: this Inno install lacks `ChineseSimplified.isl`, so the installer UI is English; a comment in the .iss explains how to enable Chinese. Bump `AppVersion` in the .iss when releasing (also the version badge in both READMEs and the banners in `sender.cpp` and `receiver.cpp`).
 - The post-install "launch" checkbox must keep the `runascurrentuser` flag: `postinstall` entries default to `runasoriginaluser` (unelevated) and `app.exe` is `requireAdministrator`, so without it CreateProcess fails with ERROR_ELEVATION_REQUIRED. `[UninstallRun]` removes the `Mivara` Task Scheduler job registered by app auto-start (task name must match `applyAutoStart` in app.cpp).
+- Release notes must include the assets' SHA-256 (the versioned file and the fixed-name copy are the same binary — one hash covers both; quote it against the versioned name). The SmartScreen FAQ lives under Troubleshooting in both READMEs (anchors `#windows-smartscreen-提示说明` / `#windows-smartscreen-notice`); release notes link to it.
+- `winget/` holds the winget-pkgs submission manifests — copy into `manifests/w/wzy-777/Mivara/<version>/` of microsoft/winget-pkgs and open a PR each release. winget installation bypasses the SmartScreen prompts (the default community source rewrites MOTW to the trusted zone) — the only no-code-signing channel that does.
 
 ## Windows specifics (easy to get wrong)
 
