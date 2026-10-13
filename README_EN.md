@@ -600,6 +600,8 @@ This project is developed from **[RGM (Ralefaso GlassMirror)](https://github.com
 
 The virtual display driver comes from **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**.
 
+Windows installer code signing (application in progress): provided free of charge by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org) — see the [Code signing policy](CODE_SIGNING_POLICY.md).
+
 ## License
 
 [MIT](LICENSE) © 2026 wzy-777

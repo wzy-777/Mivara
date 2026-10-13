@@ -1,0 +1,109 @@
+# ============================================================================
+# Mivara – build the Windows release installer in CI
+# ============================================================================
+# Why CI:
+#   - reproducible release builds with the portable flag set
+#     (OPT_FLAGS="-O3 -march=x86-64 -flto"; the default -march=native build
+#     must never be redistributed);
+#   - SignPath Foundation's free OSS code signing requires the signed
+#     artifact to be produced by a trusted build system (GitHub Actions) —
+#     locally built installers cannot be signed. See CODE_SIGNING_POLICY.md.
+#
+# What it does: MSYS2 (MinGW64) build → Inno Setup packaging →
+#   dist/Mivara-Setup-<version>.exe uploaded as a workflow artifact.
+#   Publishing to a GitHub Release stays a manual step (download the
+#   artifact, verify its SHA-256, then create the release).
+#
+# Enabling SignPath signing — only after the SignPath Foundation project is
+# approved (the steps below the "SignPath" marker are inert until then):
+#   1. In the SignPath dashboard note: organization id, project slug,
+#      signing policy slug, artifact configuration slug (the artifact
+#      configuration root element must be <zip-file> — actions/upload-artifact
+#      zips by default).
+#   2. Repo → Settings → Secrets and variables → Actions:
+#        Secret   SIGNPATH_API_TOKEN
+#        Variable SIGNPATH_ENABLED = true
+#        Variable SIGNPATH_ORG_ID, SIGNPATH_PROJECT_SLUG,
+#                 SIGNPATH_POLICY_SLUG, SIGNPATH_ARTIFACT_CONFIG_SLUG
+#   3. Re-check action input names / version against the current docs:
+#      https://docs.signpath.io/trusted-build-systems/github
+# ============================================================================
+
+name: Release installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup MSYS2 (MinGW64) and build dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL2_ttf
+            mingw-w64-x86_64-ffmpeg
+
+      - name: Build (portable release flags)
+        run: |
+          export OS=Windows_NT   # the makefile's Windows branch is keyed on $(OS)
+          make clean
+          make OPT_FLAGS="-O3 -march=x86-64 -flto"
+          make check
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Package installer
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" |
+                  Select-Object -First 1 -ExpandProperty FullName
+          & $iscc "installer\Mivara.iss"
+          Get-ChildItem dist -Filter *.exe | Format-Table Name, Length
+
+      - name: Upload unsigned installer
+        id: upload-unsigned-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-unsigned
+          path: dist/Mivara-Setup-*.exe
+
+      # ---------------------- SignPath (inert until enabled) ----------------
+      - name: Submit signing request
+        id: signpath
+        if: vars.SIGNPATH_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned-artifact.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Upload signed installer
+        if: vars.SIGNPATH_ENABLED == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-signed
+          path: signed/*.exe
