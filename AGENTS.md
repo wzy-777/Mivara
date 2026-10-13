@@ -1,7 +1,9 @@
 # AGENTS.md
 
-TwinView (幻屏): C++17 LAN screen-mirroring / wireless second monitor.
+Mivara (幻屏): C++17 LAN screen-mirroring / wireless second monitor.
 Cross-platform (Windows / Linux X11 / macOS). Single package, no monorepo — everything is in `src/` and one `makefile`.
+
+**Renamed 2026-10-13: TwinView → Mivara (幻屏).** GitHub links to the old name redirect (301). The local checkout directory on this machine is still `D:\projects\TwinView\` — path references to it are intentional.
 
 Full user docs: `README.md` (Chinese) + `README_EN.md` (English twin). This file only covers what an agent would otherwise get wrong.
 
@@ -34,11 +36,11 @@ make OPT_FLAGS="-O3 -march=x86-64 -flto"   # portable build for releases/install
 
 ## Installer (Inno Setup)
 
-- `installer/TwinView.iss` packages `bin/` + `scripts/` + `vdd/` drivers (excludes the >100 MB vendor GUI) into `dist/TwinView-Setup-<ver>.exe`.
-- GitHub Release assets must include both `TwinView-Setup-<ver>.exe` and a **fixed-name copy `TwinView-Setup.exe`** — `https://github.com/wzy-777/TwinView/releases/latest/download/TwinView-Setup.exe` is the permanent latest-installer link (the README download badges point at it).
-- Build: `"D:\Program Files\Inno Setup 6\ISCC.exe" installer\TwinView.iss` (ISCC is at that custom path on this machine, not Program Files).
+- `installer/Mivara.iss` packages `bin/` + `scripts/` + `vdd/` drivers (excludes the >100 MB vendor GUI) into `dist/Mivara-Setup-<ver>.exe`.
+- GitHub Release assets must include both `Mivara-Setup-<ver>.exe` and a **fixed-name copy `Mivara-Setup.exe`** — `https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe` is the permanent latest-installer link (the README download badges point at it).
+- Build: `"D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss` (ISCC is at that custom path on this machine, not Program Files).
 - Wizard language: this Inno install lacks `ChineseSimplified.isl`, so the installer UI is English; a comment in the .iss explains how to enable Chinese. Bump `AppVersion` in the .iss when releasing (also the version badge in both READMEs and the banners in `sender.cpp` and `receiver.cpp`).
-- The post-install "launch" checkbox must keep the `runascurrentuser` flag: `postinstall` entries default to `runasoriginaluser` (unelevated) and `app.exe` is `requireAdministrator`, so without it CreateProcess fails with ERROR_ELEVATION_REQUIRED. `[UninstallRun]` removes the `TwinView` Task Scheduler job registered by app auto-start (task name must match `applyAutoStart` in app.cpp).
+- The post-install "launch" checkbox must keep the `runascurrentuser` flag: `postinstall` entries default to `runasoriginaluser` (unelevated) and `app.exe` is `requireAdministrator`, so without it CreateProcess fails with ERROR_ELEVATION_REQUIRED. `[UninstallRun]` removes the `Mivara` Task Scheduler job registered by app auto-start (task name must match `applyAutoStart` in app.cpp).
 
 ## Windows specifics (easy to get wrong)
 
@@ -61,7 +63,7 @@ make OPT_FLAGS="-O3 -march=x86-64 -flto"   # portable build for releases/install
 | `src/ports.cpp/.h` | remote port inspector on 8083 (LIST/GET/KILL) |
 | `src/proto.h` | protocol v2 shared by sender/receiver: HsRequestV2/HsResponseV2, CodecId, control packets |
 | `src/codec.h/.cpp` | FFmpeg Encoder/Decoder (H.264/H.265/AV1). Linked into sender + receiver only (app is FFmpeg-free) |
-| `src/config.h/.cpp` | GUI settings (%LOCALAPPDATA%\\TwinView\\config.ini), key=value (incl. `auto_start` → Task Scheduler `TwinView` job, `auto_receive`) |
+| `src/config.h/.cpp` | GUI settings (%LOCALAPPDATA%\\Mivara\\config.ini), key=value (incl. `auto_start` → Task Scheduler `Mivara` job, `auto_receive`) |
 | `src/history.h/.cpp` | connection history (history.ini, cap 20, newest first) |
 | `src/app.cpp` | SDL2 + SDL2_ttf GUI launcher: left nav (主页/设置) + session flows and connection history inside 主页 (history rows under the 接收/发送 cards; no separate history tab); SSDP search, device list (投屏/扩展), manual IP, settings; spawns sender/receiver as child processes with hidden console + stdout pipe (STAT| status panel + log window) and a **stdin pipe carrying `SETP|` reconfigure lines** |
 

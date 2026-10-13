@@ -15,7 +15,7 @@
  * DIF_PROPERTYCHANGE/DICS_DISABLE) so the virtual monitor disappears from
  * the system entirely, and re-enabled at the next session start.
  *
- * The virtual display is attached to the desktop only while a TwinView
+ * The virtual display is attached to the desktop only while a Mivara
  * extend-mode session runs. EVERY exit path must reach vddShutdown():
  * normal end, send failure, Ctrl+C, console-window close, GUI stop.
  * The GUI additionally calls vddForceDetach() if the sender had to be

@@ -1,10 +1,10 @@
 /**
- * HISTORY.H - TwinView connection history (history.ini next to config.ini)
+ * HISTORY.H - Mivara connection history (history.ini next to config.ini)
  *
  * Lines: ip|port|name|mode|last_used_unix|use_count   (newest first, cap 20)
  */
-#ifndef TWINVIEW_HISTORY_H
-#define TWINVIEW_HISTORY_H
+#ifndef MIVARA_HISTORY_H
+#define MIVARA_HISTORY_H
 
 #include <string>
 #include <vector>

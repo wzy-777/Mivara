@@ -1,5 +1,5 @@
 /**
- * APP.CPP – TwinView GUI LAUNCHER (SDL2 + SDL2_ttf)
+ * APP.CPP – Mivara GUI LAUNCHER (SDL2 + SDL2_ttf)
  *
  * Layout: fixed left nav sidebar (主页 / 设置 + 退出) with the active
  * tab's content to its right. Session flows (search / stream / receive) and
@@ -18,7 +18,7 @@
  *
  * Children run either with their own console (show_status_console=1) or
  * hidden with stdout+stderr captured into a log ring that feeds a second
- * "TwinView 日志" window; STAT| lines feed the in-app status panel.
+ * "Mivara 日志" window; STAT| lines feed the in-app status panel.
  *
  * Stopping the sender is always graceful (Ctrl+C / SIGINT) so vddShutdown()
  * detaches the virtual display – never TerminateProcess as the first resort.
@@ -477,7 +477,7 @@ static std::string logStamp()
     return buf;
 }
 
-/* Persistent child/GUI diagnostics: %LOCALAPPDATA%\TwinView\app.log. */
+/* Persistent child/GUI diagnostics: %LOCALAPPDATA%\Mivara\app.log. */
 static void persistLogLine(const std::string &line)
 {
 #ifdef _WIN32
@@ -627,7 +627,7 @@ static std::string buildSetpLine(const AppConfig &want, const AppConfig &have)
 static void openLogWindow()
 {
     if (g_log_open) return;
-    g_log_win = SDL_CreateWindow("TwinView 日志",
+    g_log_win = SDL_CreateWindow("Mivara 日志",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  LOG_WIN_W, LOG_WIN_H, 0);
     if (!g_log_win) return;
@@ -998,19 +998,19 @@ static bool runHiddenW(const std::wstring &cmd)
 }
 #endif
 
-/* Task name must match the [UninstallRun] cleanup in installer/TwinView.iss. */
+/* Task name must match the [UninstallRun] cleanup in installer/Mivara.iss. */
 static bool applyAutoStart(int enable)
 {
 #ifdef _WIN32
     if (enable) {
         /* /tr value must contain an embedded quoted path (spaces in
          * "Program Files"), and /rl highest avoids a UAC prompt at logon. */
-        std::wstring cmd = L"schtasks.exe /create /tn \"TwinView\" /tr \"\\\"" +
+        std::wstring cmd = L"schtasks.exe /create /tn \"Mivara\" /tr \"\\\"" +
                            selfExePathW() +
                            L"\\\"\" /sc onlogon /rl highest /f";
         return runHiddenW(cmd);
     }
-    return runHiddenW(L"schtasks.exe /delete /tn \"TwinView\" /f");
+    return runHiddenW(L"schtasks.exe /delete /tn \"Mivara\" /f");
 #else
     (void)enable;
     return true; /* no-op outside Windows */
@@ -1375,7 +1375,7 @@ static void renderScreen(int mousex, int mousey)
     SDL_SetRenderDrawColor(g_ren, THEME.surface.r, THEME.surface.g,
                            THEME.surface.b, 255);
     SDL_RenderFillRect(g_ren, &hdr);
-    drawText(g_ren, "TwinView  幻屏", WIN_W / 2, 18, THEME.text, g_fontL, true);
+    drawText(g_ren, "Mivara  幻屏", WIN_W / 2, 18, THEME.text, g_fontL, true);
 
     /* left nav sidebar */
     SDL_Rect nav{0, HEADER_H, NAV_W, WIN_H - HEADER_H};
@@ -1851,7 +1851,7 @@ int main(int argc, char *argv[])
     configLoad(g_cfg);
     g_hist = historyLoad();
 
-    g_win = SDL_CreateWindow("TwinView", SDL_WINDOWPOS_CENTERED,
+    g_win = SDL_CreateWindow("Mivara", SDL_WINDOWPOS_CENTERED,
                              SDL_WINDOWPOS_CENTERED, WIN_W, WIN_H, 0);
     g_ren = SDL_CreateRenderer(g_win, -1,
                                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);

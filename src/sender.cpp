@@ -806,11 +806,11 @@ static const char *hsStatusMsg(uint32_t st)
 {
     switch (st) {
     case HS_OK:          return "OK";
-    case HS_ERR_VERSION: return "protocol version mismatch — please update both TwinView ends";
+    case HS_ERR_VERSION: return "protocol version mismatch — please update both Mivara ends";
     case HS_ERR_CODEC:   return "receiver rejected the codec";
     case HS_ERR_DIMS:    return "receiver rejected the stream dimensions";
     case HS_ERR_DECODER: return "receiver has no decoder for this codec";
-    case HS_ERR_LEGACY:  return "peer is a legacy TwinView build — please update both TwinView ends";
+    case HS_ERR_LEGACY:  return "peer is a legacy Mivara build — please update both Mivara ends";
     default:             return "unknown handshake error";
     }
 }
@@ -1000,7 +1000,7 @@ int main(int argc, char* argv[])
 
     std::cout << COL_CYAN << COL_BOLD
               << "========================================\n"
-                 "  TwinView SENDER v0.9.0\n"
+                 "  Mivara SENDER v0.9.1\n"
                  "========================================\n" << COL_RESET
               << "  Source: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
               << "  @ " << TARGET_FPS << " FPS\n"
@@ -1185,7 +1185,7 @@ int main(int argc, char* argv[])
     if (!conn.recvAll(&hs_in, sizeof(hs_in))) {
         std::cerr << COL_RED
                   << "No handshake response – the peer is probably a legacy "
-                     "TwinView build; please update both TwinView ends\n"
+                     "Mivara build; please update both Mivara ends\n"
                   << COL_RESET;
         emitStatError("legacy_peer");
         if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
@@ -1200,8 +1200,8 @@ int main(int argc, char* argv[])
     if (hs_magic != TVHS_MAGIC) {
         std::cerr << COL_RED
                   << "Bad handshake response (no TVHS magic) – peer is "
-                     "probably a legacy TwinView build; please update both "
-                     "TwinView ends\n"
+                     "probably a legacy Mivara build; please update both "
+                     "Mivara ends\n"
                   << COL_RESET;
         emitStatError("legacy_peer");
         if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);

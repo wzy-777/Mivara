@@ -1,10 +1,10 @@
-; TwinView (幻屏) Inno Setup script
-; Build:  "D:\Program Files\Inno Setup 6\ISCC.exe" installer\TwinView.iss
-; Output: dist\TwinView-Setup-<version>.exe
+; Mivara (幻屏) Inno Setup script
+; Build:  "D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss
+; Output: dist\Mivara-Setup-<version>.exe
 
-#define AppName "TwinView"
-#define AppVersion "0.9.0"
-#define AppPublisher "TwinView"
+#define AppName "Mivara"
+#define AppVersion "0.9.1"
+#define AppPublisher "Mivara"
 #define AppExeName "app.exe"
 
 [Setup]
@@ -16,7 +16,7 @@ DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=TwinView-Setup-{#AppVersion}
+OutputBaseFilename=Mivara-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -59,4 +59,4 @@ Filename: "{app}\bin\{#AppExeName}"; Description: "启动 {#AppName}"; WorkingDi
 
 [UninstallRun]
 ; remove the auto-start scheduled task registered by app.exe (task name must match app.cpp)
-Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""TwinView"" /f"; Flags: runhidden; RunOnceId: "DelAutoStartTask"
+Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""Mivara"" /f"; Flags: runhidden; RunOnceId: "DelAutoStartTask"

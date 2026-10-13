@@ -6,8 +6,8 @@
  *
  * Raw/RLE streams do NOT go through Encoder/Decoder (passthrough).
  */
-#ifndef TWINVIEW_CODEC_H
-#define TWINVIEW_CODEC_H
+#ifndef MIVARA_CODEC_H
+#define MIVARA_CODEC_H
 
 #include <cstdint>
 #include <memory>
@@ -122,4 +122,4 @@ std::string frameToRGB24(const DecodedFrame &f, uint8_t *dst, int dst_stride);
 const char *codecToString(CodecId c);              /* "h264", "raw", ... */
 CodecId codecFromString(const std::string &s);     /* "auto" → CODEC_H264 */
 
-#endif /* TWINVIEW_CODEC_H */
+#endif /* MIVARA_CODEC_H */

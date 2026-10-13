@@ -1,5 +1,5 @@
 /**
- * PROTO.H – TwinView handshake & control protocol v2 (shared sender/receiver)
+ * PROTO.H – Mivara handshake & control protocol v2 (shared sender/receiver)
  *
  * Handshake over TCP 8081, ALL uint32 fields in network byte order.
  *
@@ -19,8 +19,8 @@
  * Both ends must run the same protocol version – a version mismatch is
  * reported explicitly on both sides (no black screen).
  */
-#ifndef TWINVIEW_PROTO_H
-#define TWINVIEW_PROTO_H
+#ifndef MIVARA_PROTO_H
+#define MIVARA_PROTO_H
 
 #include <cstdint>
 
@@ -96,4 +96,4 @@ struct HsResponseV2 {
 static_assert(sizeof(HsRequestV2) == 48, "HsRequestV2 must be 48 bytes");
 static_assert(sizeof(HsResponseV2) == 36, "HsResponseV2 must be 36 bytes");
 
-#endif /* TWINVIEW_PROTO_H */
+#endif /* MIVARA_PROTO_H */

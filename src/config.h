@@ -1,11 +1,11 @@
 /**
- * CONFIG.H - TwinView app settings (key=value ini, held by the GUI app)
+ * CONFIG.H - Mivara app settings (key=value ini, held by the GUI app)
  *
  * The GUI (app) owns the config file and passes values to sender/receiver
  * via command line; children are stateless.
  */
-#ifndef TWINVIEW_CONFIG_H
-#define TWINVIEW_CONFIG_H
+#ifndef MIVARA_CONFIG_H
+#define MIVARA_CONFIG_H
 
 #include <string>
 
