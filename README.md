@@ -593,6 +593,8 @@ make check                                        # 环境自检
 
 虚拟显示器驱动来自 **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**。
 
+Windows 安装包代码签名（申请中）：由 [SignPath.io](https://signpath.io) 免费提供、证书由 [SignPath Foundation](https://signpath.org) 持有——详见 [Code signing policy](CODE_SIGNING_POLICY.md)。
+
 ## 许可证
 
 [MIT](LICENSE) © 2026 wzy-777
