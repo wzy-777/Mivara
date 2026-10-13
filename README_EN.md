@@ -54,6 +54,7 @@ A cross-platform C++ project: turn any computer on your LAN into a second monito
     - [Bandwidth (uncompressed RGB24)](#bandwidth-uncompressed-rgb24)
     - [Latency](#latency)
   - [Troubleshooting](#troubleshooting)
+    - [Windows SmartScreen Notice](#windows-smartscreen-notice)
     - [Diagnostic Commands](#diagnostic-commands)
   - [Roadmap](#roadmap)
   - [Acknowledgements](#acknowledgements)
@@ -118,6 +119,7 @@ Mivara/
 ├── scripts/                  # Windows convenience launch scripts
 ├── installer/                # Inno Setup packaging script (Mivara.iss)
 ├── vdd/                      # Virtual display driver (signed MttVDD + install scripts)
+├── winget/                   # winget-pkgs submission manifests (updated per release)
 ├── test/                     # Local tests / diagnostics (not committed)
 └── build/                    # Object files
 ```
@@ -530,6 +532,32 @@ The receiver writes statistics to `gpu_stats.json` every 60 seconds and prints a
 | "Virtual display did not come up" | Driver installed but activation failed | Check device status with `pnputil /enum-devices /class Monitor`, reboot and retry |
 | Extend mode black screen / no video | Handshake mismatch between the two ends (mode 0=mirror 1=extend) | Use the same binary version on both ends |
 | Virtual display stays in Settings > Display after disconnect | Older builds only did a CCD detach, or sender/app not run as admin | Fixed: the Root\MttVDD device is disabled at exit (sender/app must run elevated). If the log shows a disable failure, manually disable "Virtual Display Driver" in Device Manager |
+| SmartScreen prompts on download/run ("isn't commonly downloaded" / "Unknown publisher") | Installer is not code-signed and the new file has no download reputation (a normal reputation prompt, not a malware verdict) | Verify the SHA-256, then continue per the prompt — see [Windows SmartScreen Notice](#windows-smartscreen-notice) |
+
+### Windows SmartScreen Notice
+
+Installing straight from GitHub may show the following prompts on some Windows 10/11 machines — these are **SmartScreen reputation prompts (unsigned file, newly released, low download count), not malware verdicts**:
+
+| Prompt | Where | Cause |
+|--------|-------|-------|
+| "Mivara-Setup.exe isn't commonly downloaded. Make sure you trust…" | Browser download bar | The file has no download reputation yet (standard Microsoft Defender SmartScreen check) |
+| "Windows protected your PC" | On launch (may appear) | The installer is not code-signed |
+| "Publisher: Unknown" | UAC elevation prompt | Same (unsigned) |
+
+Verify the file first (must match the SHA-256 in the corresponding release notes):
+
+```powershell
+Get-FileHash "$HOME\Downloads\Mivara-Setup.exe" -Algorithm SHA256
+```
+
+If it matches, continue per the normal flow:
+
+1. Browser download bar → "…" → "Keep";
+2. Double-click the installer → "More info" → "Run anyway".
+
+> If in doubt: Properties → General → "Unblock" (or PowerShell `Unblock-File`) is Windows' official "I trust this file" action — run it after the hash check.
+
+(The installer is currently not code-signed — common for open-source projects.)
 
 ### Diagnostic Commands
 

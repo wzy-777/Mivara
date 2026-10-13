@@ -54,6 +54,7 @@
     - [带宽（未压缩 RGB24）](#带宽未压缩-rgb24)
     - [延迟](#延迟)
   - [故障排除](#故障排除)
+    - [Windows SmartScreen 提示说明](#windows-smartscreen-提示说明)
     - [诊断命令](#诊断命令)
   - [路线图](#路线图)
   - [致谢](#致谢)
@@ -118,6 +119,7 @@ Mivara/
 ├── scripts/                  # Windows 便捷启动脚本
 ├── installer/                # Inno Setup 打包脚本（Mivara.iss）
 ├── vdd/                      # 虚拟显示器驱动（MttVDD 签名驱动 + 安装脚本）
+├── winget/                   # winget-pkgs 上架清单（每次发布更新）
 ├── test/                     # 本地测试 / 诊断代码（不入库）
 └── build/                    # 目标文件
 ```
@@ -523,6 +525,32 @@ sudo ufw allow 8083/tcp comment 'Mivara Port Inspector'
 | "Virtual display did not come up" | 驱动安装但激活失败 | `pnputil /enum-devices /class Monitor` 检查设备状态，重启后再试 |
 | 扩展模式黑屏 / 无画面 | 两端握手不一致（模式值 0=镜像 1=扩展） | 接收端与发送端使用同版本二进制 |
 | 断开后虚拟屏仍在「设置 → 屏幕」 | 旧版本只做 CCD 分离，或未以管理员运行 | 已修复：退出时禁用 Root\MttVDD 设备（需管理员权限运行 sender/app）。若日志出现 disable 失败，可在设备管理器手动禁用「Virtual Display Driver」 |
+| 下载/运行时 SmartScreen 提示（「通常不会下载」「未知发布者」） | 安装包未做代码签名 + 新文件无下载信誉（正常信誉提示，非报毒） | 校验 SHA-256 后按提示继续，详见 [Windows SmartScreen 提示说明](#windows-smartscreen-提示说明) |
+
+### Windows SmartScreen 提示说明
+
+从 GitHub 直接下载的安装包，在部分 Windows 10/11 上会遇到以下提示——都是 **SmartScreen 的信誉提示（文件未签名 + 新发布、下载量少），不是报毒**：
+
+| 提示 | 出现位置 | 原因 |
+|------|----------|------|
+| 「Mivara-Setup.exe 通常不会下载。打开前请确保信任…」 | 浏览器下载栏 | 该文件尚无下载信誉（Microsoft Defender SmartScreen 常规检查） |
+| 「Windows 已保护你的电脑」 | 双击运行时（可能） | 安装包未做代码签名 |
+| 「发布者：未知」 | UAC 提权窗口 | 同上（未签名） |
+
+先校验文件完整性（结果应与对应 Release 说明中的 SHA-256 一致）：
+
+```powershell
+Get-FileHash "$HOME\Downloads\Mivara-Setup.exe" -Algorithm SHA256
+```
+
+校验一致后按正常流程继续：
+
+1. 浏览器下载条目旁「…」→「保留」；
+2. 双击安装包 →「更多信息」→「仍要运行」。
+
+> 若仍有顾虑：`属性 → 常规 → 解除锁定`（或 PowerShell `Unblock-File`）是 Windows 官方的「我已确认信任此文件」操作，可先校验哈希再执行。
+
+（本安装包目前未做代码签名，这是开源项目的常见现状。）
 
 ### 诊断命令
 
