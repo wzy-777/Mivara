@@ -1,9 +1,9 @@
 /**
- * CONFIG.CPP - TwinView app settings persistence
+ * CONFIG.CPP - Mivara app settings persistence
  *
  * key=value ini with '#' comments. Written atomically (tmp + rename).
- * Location: %LOCALAPPDATA%\TwinView\config.ini (Windows)
- *           $XDG_CONFIG_HOME/twinview/ or ~/.config/twinview/ (POSIX)
+ * Location: %LOCALAPPDATA%\Mivara\config.ini (Windows)
+ *           $XDG_CONFIG_HOME/mivara/ or ~/.config/mivara/ (POSIX)
  */
 #include "config.h"
 
@@ -44,7 +44,7 @@ bool makeDirs(const std::string &p)
 {
     if (p.empty() || dirExists(p))
         return true;
-    /* create parents first (LOCALAPPDATA\TwinView is one level, but be safe) */
+    /* create parents first (LOCALAPPDATA\Mivara is one level, but be safe) */
     size_t start = 0;
 #ifdef _WIN32
     if (p.size() >= 2 && p[1] == ':')
@@ -140,15 +140,15 @@ std::string configDir()
         else
             base = ".";
     }
-    return base + "\\TwinView";
+    return base + "\\Mivara";
 #else
     const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && *xdg)
-        return std::string(xdg) + "/twinview";
+        return std::string(xdg) + "/mivara";
     const char *home = getenv("HOME");
     if (home && *home)
-        return std::string(home) + "/.config/twinview";
-    return "./twinview";
+        return std::string(home) + "/.config/mivara";
+    return "./mivara";
 #endif
 }
 
@@ -192,7 +192,7 @@ bool configSave(const AppConfig &cfg)
     if (!f)
         return false;
 
-    fputs("# TwinView settings\n", f);
+    fputs("# Mivara settings\n", f);
     fprintf(f, "codec=%s\n", cfg.codec.c_str());
     fprintf(f, "hw_accel=%d\n", cfg.hw_accel ? 1 : 0);
     fprintf(f, "bitrate_kbps=%d\n", cfg.bitrate_kbps);

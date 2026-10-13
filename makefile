@@ -1,5 +1,5 @@
 # ============================================================================
-# TwinView PROJECT MAKEFILE  –  Screen Extender / Screen Share Application
+# Mivara PROJECT MAKEFILE  –  Screen Extender / Screen Share Application
 # ============================================================================
 #
 # Platforms  : Linux · macOS · Windows (MinGW / MSYS2)
@@ -363,7 +363,7 @@ install-deps:
 
 help:
 	@echo ""
-	@echo "  TwinView (幻屏)"
+	@echo "  Mivara (幻屏)"
 	@echo ""
 	@echo "BUILD:"
 	@echo "  make              Build all (bin/sender, bin/receiver, bin/app)"

@@ -406,12 +406,12 @@ static void emitRxStat(const char *event, const std::string &extra)
     std::cout << "\n" << std::flush;
 }
 
-/* SSDP friendly name: this machine's hostname (fallback "TwinView"). */
+/* SSDP friendly name: this machine's hostname (fallback "Mivara"). */
 static std::string localHostName()
 {
     char host[256] = {0};
     if (gethostname(host, sizeof(host) - 1) != 0 || host[0] == '\0')
-        return "TwinView";
+        return "Mivara";
     host[sizeof(host) - 1] = '\0';
     return std::string(host);
 }
@@ -438,7 +438,7 @@ static void hsReqFromWire(HsRequestV2 &r)
 static void showLegacyPeerError()
 {
     const char *msg =
-        "Handshake from legacy TwinView build \xe2\x80\x94 please update both ends";
+        "Handshake from legacy Mivara build \xe2\x80\x94 please update both ends";
     std::cerr << COLOR_RED << msg << COLOR_RESET << "\n";
     emitRxStat("error", "msg=legacy_peer");
 
@@ -692,7 +692,7 @@ static bool handleClientConnection(plat_sock_t client)
 
     /* ── Handshake v2 (proto.h) ──
      * The first u32 must be TVHS_MAGIC. Anything else is a legacy
-     * (pre-v2) TwinView build: report it visibly and close – no silence. */
+     * (pre-v2) Mivara build: report it visibly and close – no silence. */
     Decoder decoder; /* opened below for coded streams */
     CodecId sess_codec = CODEC_RAW;
     HsRequestV2 req = {};
@@ -806,7 +806,7 @@ static bool handleClientConnection(plat_sock_t client)
     {
         /* Borderless fullscreen — looks like a real second monitor */
         win = SDL_CreateWindow(
-            "TwinView Extended Display",
+            "Mivara Extended Display",
             SDL_WINDOWPOS_UNDEFINED_DISPLAY(0),
             SDL_WINDOWPOS_UNDEFINED_DISPLAY(0),
             MY_DISPLAY_WIDTH, MY_DISPLAY_HEIGHT,
@@ -826,7 +826,7 @@ static bool handleClientConnection(plat_sock_t client)
             wh = (int)(wh * sc);
         }
         win = SDL_CreateWindow(
-            "TwinView Mirror",
+            "Mivara Mirror",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             ww, wh,
             SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -1253,7 +1253,7 @@ int main(int argc, char* argv[])
     queryMyDisplaySize();
 
     std::cout << "========================================\n"
-              << "         TwinView RECEIVER v0.9.0     \n"
+              << "         Mivara RECEIVER v0.9.1     \n"
               << "========================================\n"
               << "  Local IP   : " << getLocalIPAddress() << "\n"
               << "  My display : " << MY_DISPLAY_WIDTH

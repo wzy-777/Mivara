@@ -1,4 +1,4 @@
-# TwinView
+# Mivara
 
 [中文](README.md) | English
 
@@ -6,17 +6,19 @@
 
 A cross-platform C++ project: turn any computer on your LAN into a second monitor.
 
-[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/wzy-777/TwinView)
-[![Download Latest Installer](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/TwinView/releases/latest/download/TwinView-Setup.exe)
+[![Version](https://img.shields.io/badge/version-0.9.1-blue)](https://github.com/wzy-777/Mivara)
+[![Download Latest Installer](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#requirements)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> Renamed: formerly **TwinView**, now **Mivara** (幻屏) as of v0.9.1; old GitHub links redirect automatically.
 
 ---
 
 ## Table of Contents
 
-- [TwinView](#twinview)
+- [Mivara](#mivara)
   - [Table of Contents](#table-of-contents)
   - [Introduction](#introduction)
   - [Features](#features)
@@ -61,7 +63,7 @@ A cross-platform C++ project: turn any computer on your LAN into a second monito
 
 ## Introduction
 
-TwinView is a lightweight, cross-platform **screen extension / casting** tool. The sender captures the local screen and streams it over the network to the receiver, which displays it fullscreen.
+Mivara is a lightweight, cross-platform **screen extension / casting** tool. The sender captures the local screen and streams it over the network to the receiver, which displays it fullscreen.
 
 Two modes are provided:
 
@@ -98,7 +100,7 @@ Extend mode requires a Windows indirect display driver (IddCx); see [installatio
 ### Directory Layout
 
 ```
-TwinView/
+Mivara/
 ├── makefile                  # Cross-platform build (Linux/macOS/Windows MinGW)
 ├── src/
 │   ├── app.cpp               # GUI launcher (SDL2 + SDL2_ttf): left nav + Home/Settings (history embedded in Home)
@@ -114,7 +116,7 @@ TwinView/
 │   └── vdd.cpp/.h            # Windows virtual-display lifecycle (shared by sender + GUI)
 ├── bin/                      # Executables + runtime DLLs (build output)
 ├── scripts/                  # Windows convenience launch scripts
-├── installer/                # Inno Setup packaging script (TwinView.iss)
+├── installer/                # Inno Setup packaging script (Mivara.iss)
 ├── vdd/                      # Virtual display driver (signed MttVDD + install scripts)
 ├── test/                     # Local tests / diagnostics (not committed)
 └── build/                    # Object files
@@ -269,7 +271,7 @@ Low-latency tuning: no B-frames, `zerolatency`, GOP = 2×fps, immediate IDR afte
 
 ## Settings & History
 
-The GUI Settings screen (persisted to `%LOCALAPPDATA%\TwinView\config.ini`):
+The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -353,8 +355,8 @@ make install-deps          # Linux/macOS/MSYS2 automatic install
 Build from source in three steps: install dependencies → make → run the binaries in `bin/`.
 
 ```bash
-git clone https://github.com/wzy-777/TwinView.git
-cd TwinView
+git clone https://github.com/wzy-777/Mivara.git
+cd Mivara
 make install-deps    # 1. install system dependencies (auto-detects the package manager)
 make                 # 2. build everything (output goes to bin/)
 ./bin/app            # 3. run the GUI (or bin/sender, bin/receiver)
@@ -387,11 +389,11 @@ Builds use `-O3 -march=native -flto`; output goes to `bin/`.
 Build the installer with Inno Setup:
 
 ```powershell
-& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\TwinView.iss
-# Output: dist\TwinView-Setup-<version>.exe
+& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss
+# Output: dist\Mivara-Setup-<version>.exe
 ```
 
-The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and creates Start-menu/desktop shortcuts. The "Launch TwinView" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).
+The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and creates Start-menu/desktop shortcuts. The "Launch Mivara" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).
 
 ---
 
@@ -470,18 +472,18 @@ Once activated, the virtual display is automatically configured to **1920x1080@6
 
 ```powershell
 # Windows (Administrator PowerShell)
-New-NetFirewallRule -DisplayName "TwinView SSDP"    -Direction Inbound -Protocol UDP -LocalPort 1900 -Action Allow
-New-NetFirewallRule -DisplayName "TwinView Stream"  -Direction Inbound -Protocol TCP -LocalPort 8081 -Action Allow
-New-NetFirewallRule -DisplayName "TwinView Compute" -Direction Inbound -Protocol TCP -LocalPort 8082 -Action Allow
-New-NetFirewallRule -DisplayName "TwinView Ports"   -Direction Inbound -Protocol TCP -LocalPort 8083 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara SSDP"    -Direction Inbound -Protocol UDP -LocalPort 1900 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara Stream"  -Direction Inbound -Protocol TCP -LocalPort 8081 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara Compute" -Direction Inbound -Protocol TCP -LocalPort 8082 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara Ports"   -Direction Inbound -Protocol TCP -LocalPort 8083 -Action Allow
 ```
 
 ```bash
 # Linux (UFW)
-sudo ufw allow 1900/udp comment 'TwinView SSDP'
-sudo ufw allow 8081/tcp comment 'TwinView Video Stream'
-sudo ufw allow 8082/tcp comment 'TwinView Compute Offload'
-sudo ufw allow 8083/tcp comment 'TwinView Port Inspector'
+sudo ufw allow 1900/udp comment 'Mivara SSDP'
+sudo ufw allow 8081/tcp comment 'Mivara Video Stream'
+sudo ufw allow 8082/tcp comment 'Mivara Compute Offload'
+sudo ufw allow 8083/tcp comment 'Mivara Port Inspector'
 ```
 
 ### Network Requirements

@@ -1,5 +1,5 @@
 /**
- * HISTORY.CPP - TwinView connection history persistence
+ * HISTORY.CPP - Mivara connection history persistence
  *
  * history.ini sits next to config.ini (configDir()). Line format:
  *   ip|port|name|mode|last_used_unix|use_count

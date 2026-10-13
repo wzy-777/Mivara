@@ -1,4 +1,4 @@
-# TwinView (幻屏)
+# Mivara (幻屏)
 
 中文 | [English](README_EN.md)
 
@@ -6,17 +6,19 @@
 
 一个跨平台的 C++ 项目：把局域网内的任何一台电脑变成你的第二台显示器。
 
-[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/wzy-777/TwinView)
-[![下载最新安装包](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/TwinView/releases/latest/download/TwinView-Setup.exe)
+[![Version](https://img.shields.io/badge/version-0.9.1-blue)](https://github.com/wzy-777/Mivara)
+[![下载最新安装包](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#环境要求)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#环境要求)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> 更名说明：本项目原名 **TwinView**，自 v0.9.1 起更名为 **Mivara**（幻屏）；旧的 GitHub 链接会自动跳转到新地址。
 
 ---
 
 ## 目录
 
-- [TwinView (幻屏)](#twinview-幻屏)
+- [Mivara (幻屏)](#mivara-幻屏)
   - [目录](#目录)
   - [项目简介](#项目简介)
   - [功能特性](#功能特性)
@@ -61,7 +63,7 @@
 
 ## 项目简介
 
-TwinView（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工具。发送端（sender）采集本机画面，通过网络推流到接收端（receiver），接收端全屏显示。
+Mivara（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工具。发送端（sender）采集本机画面，通过网络推流到接收端（receiver），接收端全屏显示。
 
 项目提供两种模式：
 
@@ -98,7 +100,7 @@ TwinView（幻屏）是一个轻量级、跨平台的**屏幕扩展/投屏**工�
 ### 目录结构
 
 ```
-TwinView/
+Mivara/
 ├── makefile                  # 跨平台构建（Linux/macOS/Windows MinGW）
 ├── src/
 │   ├── app.cpp               # 图形启动器（SDL2 + SDL2_ttf）：左侧导航 + 主页/设置（历史内嵌主页）
@@ -114,7 +116,7 @@ TwinView/
 │   └── vdd.cpp/.h            # Windows 虚拟显示器生命周期（sender + GUI 共用）
 ├── bin/                      # 可执行程序 + 运行时 DLL（构建输出）
 ├── scripts/                  # Windows 便捷启动脚本
-├── installer/                # Inno Setup 打包脚本（TwinView.iss）
+├── installer/                # Inno Setup 打包脚本（Mivara.iss）
 ├── vdd/                      # 虚拟显示器驱动（MttVDD 签名驱动 + 安装脚本）
 ├── test/                     # 本地测试 / 诊断代码（不入库）
 └── build/                    # 目标文件
@@ -263,7 +265,7 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 
 ## 设置与历史
 
-GUI「设置」页可配置（保存在 `%LOCALAPPDATA%\TwinView\config.ini`）：
+GUI「设置」页可配置（保存在 `%LOCALAPPDATA%\Mivara\config.ini`）：
 
 | 设置 | 默认 | 说明 |
 |------|------|------|
@@ -346,8 +348,8 @@ make install-deps          # Linux/macOS/MSYS2 自动安装
 从源码编译三步：装依赖 → make → 运行 `bin/` 下的产物。
 
 ```bash
-git clone https://github.com/wzy-777/TwinView.git
-cd TwinView
+git clone https://github.com/wzy-777/Mivara.git
+cd Mivara
 make install-deps    # 1. 安装系统依赖（Linux/macOS/MSYS2 自动识别包管理器）
 make                 # 2. 编译全部程序（产物输出到 bin/）
 ./bin/app            # 3. 运行图形界面（或 bin/sender、bin/receiver）
@@ -380,11 +382,11 @@ make run          # 构建并启动图形启动器（另有 run-sender / run-rec
 用 Inno Setup 编译安装包：
 
 ```powershell
-& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\TwinView.iss
-# 产物：dist\TwinView-Setup-<版本>.exe
+& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss
+# 产物：dist\Mivara-Setup-<版本>.exe
 ```
 
-安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（不含体积超限的厂商 GUI），安装后在开始菜单/桌面创建快捷方式。完成页的「启动 TwinView」勾选项直接拉起管理员权限的 GUI（安装器以提权令牌启动，无二次 UAC 弹窗）。
+安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（不含体积超限的厂商 GUI），安装后在开始菜单/桌面创建快捷方式。完成页的「启动 Mivara」勾选项直接拉起管理员权限的 GUI（安装器以提权令牌启动，无二次 UAC 弹窗）。
 
 ---
 
@@ -463,18 +465,18 @@ pnputil /scan-devices
 
 ```powershell
 # Windows（管理员 PowerShell）
-New-NetFirewallRule -DisplayName "TwinView SSDP"    -Direction Inbound -Protocol UDP -LocalPort 1900 -Action Allow
-New-NetFirewallRule -DisplayName "TwinView Stream"  -Direction Inbound -Protocol TCP -LocalPort 8081 -Action Allow
-New-NetFirewallRule -DisplayName "TwinView Compute" -Direction Inbound -Protocol TCP -LocalPort 8082 -Action Allow
-New-NetFirewallRule -DisplayName "TwinView Ports"   -Direction Inbound -Protocol TCP -LocalPort 8083 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara SSDP"    -Direction Inbound -Protocol UDP -LocalPort 1900 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara Stream"  -Direction Inbound -Protocol TCP -LocalPort 8081 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara Compute" -Direction Inbound -Protocol TCP -LocalPort 8082 -Action Allow
+New-NetFirewallRule -DisplayName "Mivara Ports"   -Direction Inbound -Protocol TCP -LocalPort 8083 -Action Allow
 ```
 
 ```bash
 # Linux (UFW)
-sudo ufw allow 1900/udp comment 'TwinView SSDP'
-sudo ufw allow 8081/tcp comment 'TwinView Video Stream'
-sudo ufw allow 8082/tcp comment 'TwinView Compute Offload'
-sudo ufw allow 8083/tcp comment 'TwinView Port Inspector'
+sudo ufw allow 1900/udp comment 'Mivara SSDP'
+sudo ufw allow 8081/tcp comment 'Mivara Video Stream'
+sudo ufw allow 8082/tcp comment 'Mivara Compute Offload'
+sudo ufw allow 8083/tcp comment 'Mivara Port Inspector'
 ```
 
 ### 网络要求
