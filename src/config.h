@@ -22,6 +22,10 @@ struct AppConfig
     int show_log_window = 0;         /* 1 = auto-open the log window */
     int auto_start = 0;              /* 1 = launch at logon (Task Scheduler) */
     int auto_receive = 0;            /* 1 = enter receive mode on app open */
+    int auto_check_update = 1;       /* 1 = check for updates on app open */
+    std::string theme = "system";    /* light|dark|system (GUI appearance) */
+    long long last_update_check = 0; /* unix seconds of the last attempt (runtime metadata) */
+    std::string ignored_version;     /* e.g. "v0.9.2"; runtime metadata */
 };
 
 /** Directory holding config.ini / history.ini (created on demand). */

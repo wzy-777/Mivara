@@ -10,9 +10,11 @@
 #     locally built installers cannot be signed. See CODE_SIGNING_POLICY.md.
 #
 # What it does: MSYS2 (MinGW64) build → Inno Setup packaging →
-#   dist/Mivara-Setup-<version>.exe uploaded as a workflow artifact.
-#   Publishing to a GitHub Release stays a manual step (download the
-#   artifact, verify its SHA-256, then create the release).
+#   dist/Mivara-Setup-<version>.exe, its fixed-name copy dist/Mivara-Setup.exe
+#   and dist/SHA256SUMS.txt uploaded as one workflow artifact.
+#   Publishing to a GitHub Release stays a manual step: download the artifact,
+#   upload ALL THREE files to the release (the updater's in-app install is
+#   fail-closed without SHA256SUMS.txt), then create the release.
 #
 # Enabling SignPath signing — only after the SignPath Foundation project is
 # approved (the steps below the "SignPath" marker are inert until then):
@@ -77,14 +79,39 @@ jobs:
           $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" |
                   Select-Object -First 1 -ExpandProperty FullName
           & $iscc "installer\Mivara.iss"
+          # The fixed-name copy is what the in-app updater downloads and what
+          # the README "latest installer" badge points at; produce it here so a
+          # maintainer never has to remember to make it by hand.
+          $setup = Get-ChildItem dist -Filter "Mivara-Setup-*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "no installer found in dist/" }
+          Copy-Item $setup.FullName "dist/Mivara-Setup.exe" -Force
           Get-ChildItem dist -Filter *.exe | Format-Table Name, Length
+
+      - name: Generate SHA256SUMS for the in-app updater
+        shell: pwsh
+        run: |
+          # The GUI updater downloads Mivara-Setup.exe and refuses to run it
+          # in-app unless SHA256SUMS.txt in the same release carries a matching
+          # sha256sum-style line for that file name. ATTACH THIS FILE TO EVERY
+          # RELEASE (see the release checklist in AGENTS.md).
+          # If SignPath signing goes live the bytes change: regenerate this
+          # file from the SIGNED installer before publishing.
+          $setup = Get-ChildItem dist -Filter "Mivara-Setup-*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "no installer found in dist/" }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          $lines = @("$hash  $($setup.Name)", "$hash  Mivara-Setup.exe")
+          [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", ($lines -join "`n") + "`n")
+          Get-Content dist/SHA256SUMS.txt
 
       - name: Upload unsigned installer
         id: upload-unsigned-artifact
         uses: actions/upload-artifact@v7
         with:
           name: installer-unsigned
-          path: dist/Mivara-Setup-*.exe
+          path: |
+            dist/Mivara-Setup-*.exe
+            dist/Mivara-Setup.exe
+            dist/SHA256SUMS.txt
 
       # ---------------------- SignPath (inert until enabled) ----------------
       - name: Submit signing request

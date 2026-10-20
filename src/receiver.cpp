@@ -54,6 +54,7 @@
 #include "ports.h"
 #include "proto.h"
 #include "codec.h"
+#include "version.h"
 
 /* ── Platform headers ───────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -1253,7 +1254,7 @@ int main(int argc, char* argv[])
     queryMyDisplaySize();
 
     std::cout << "========================================\n"
-              << "         Mivara RECEIVER v0.9.1     \n"
+              << "         Mivara RECEIVER v" MIVARA_VERSION "     \n"
               << "========================================\n"
               << "  Local IP   : " << getLocalIPAddress() << "\n"
               << "  My display : " << MY_DISPLAY_WIDTH

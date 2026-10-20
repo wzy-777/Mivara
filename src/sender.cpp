@@ -54,6 +54,7 @@
 #include "vdd.h"
 #include "proto.h"
 #include "codec.h"
+#include "version.h"
 
 /* ── Platform headers ───────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -1000,7 +1001,7 @@ int main(int argc, char* argv[])
 
     std::cout << COL_CYAN << COL_BOLD
               << "========================================\n"
-                 "  Mivara SENDER v0.9.1\n"
+                 "  Mivara SENDER v" MIVARA_VERSION "\n"
                  "========================================\n" << COL_RESET
               << "  Source: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
               << "  @ " << TARGET_FPS << " FPS\n"

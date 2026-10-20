@@ -89,6 +89,7 @@ Extend mode requires a Windows indirect display driver (IddCx); see [installatio
 | **Connection history** | Last 20 connections embedded on the Home screen — one-click direct connect, no search needed |
 | **GUI** | SDL2_ttf interface: left nav (Home / Settings), receive/send, connection history, automatic search, device list (cast/extend), manual IP entry, live status panel, independent log window |
 | **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt); auto-receive opens the app directly in receive mode when enabled (off by default) |
+| **Update check** | A "Check for updates" button in Settings plus an automatic check at launch (on by default, at most once per 24 h per machine, can be turned off). A new release can be downloaded in-app (size + SHA-256 verified) and installed with one click, or opened on the release page for a manual download. Only the GitHub release source is contacted; no local data is uploaded |
 | **Performance** | Up to 120 FPS streaming, 4 MB socket buffers, TCP_NODELAY |
 | **CPU offload** | RLE frame compression and color conversion offloaded to the receiver's CPU (TCP 8082, RLE mode only) |
 | **Port inspector** | Remotely list/query/kill processes on any port of the receiver (TCP 8083) |
@@ -110,6 +111,8 @@ Mivara/
 │   ├── proto.h               # Protocol v2 (handshake / control packets / codec enum)
 │   ├── codec.cpp/.h          # FFmpeg encode/decode (H.264/H.265/AV1, sender + receiver)
 │   ├── config.cpp/.h         # GUI settings persistence (config.ini)
+│   ├── update.cpp/.h         # Update check + in-app download/install (GUI only)
+│   ├── version.h             # Single version source (shared by C++ and Inno Setup)
 │   ├── history.cpp/.h        # Connection history (history.ini)
 │   ├── discover.cpp/.h       # SSDP discovery engine
 │   ├── gpu_accelerate.c/.h   # Remote CPU offload (RLE compress / color convert)
@@ -277,6 +280,7 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| Appearance | follow system | Light / Dark / Follow system; the header switcher applies instantly and writes `theme` to `config.ini`, so it needs no OK |
 | Codec | H.264 | auto/H.264/H.265/AV1/raw/RLE |
 | Hardware accel | on | Prefer GPU encoding |
 | Quality / Bitrate | 23 / 0 | Bitrate > 0 uses bitrate mode, otherwise CRF |
@@ -286,6 +290,9 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 | Log window | off | Auto-open the independent log window |
 | Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); cleaned up on uninstall |
 | Auto-receive | off | Enter receive mode as soon as the app opens |
+| Auto update check | on | Checks for a new release ~3 s after launch (at most once per 24 h per machine); when off, only the manual button goes online |
+
+> "Follow system" reads the OS light/dark preference. Windows reads the `AppsUseLightTheme` registry value and re-checks it every 2 s, so flipping the OS theme is followed immediately; macOS (`AppleInterfaceStyle`) and Linux (GNOME `color-scheme`) are sampled once at startup, so an OS theme change needs a restart of the app there. A failed probe always falls back to light.
 
 **Live reconfigure**: while streaming, change any transfer parameter in Settings and press OK — it takes effect within seconds without dropping the connection (codec/scale switches blip for a frame or two). In classic console mode there is no stdin channel, so the session is restarted with the new parameters instead.
 
@@ -395,6 +402,8 @@ Build the installer with Inno Setup:
 # Output: dist\Mivara-Setup-<version>.exe
 ```
 
+A release must also carry the fixed-name copy `dist/Mivara-Setup.exe` (the in-app "Download update" and the README download badge both use that fixed URL) **and** `SHA256SUMS.txt` (the checksum anchor the in-app install verifies; without it only the browser download is offered). CI produces all three; for a local build copy it by hand: `copy dist\Mivara-Setup-<version>.exe dist\Mivara-Setup.exe`.
+
 The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and creates Start-menu/desktop shortcuts. The "Launch Mivara" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).
 
 ---
@@ -407,13 +416,15 @@ The installer bundles `bin/` (exes + DLLs), `scripts/`, and the `vdd/` virtual d
 bin/app
 ```
 
-The left side holds the nav bar: **Home** (receive/send + connection history), **Settings**, and "Quit" at the bottom:
+The top-right of the header holds the **appearance switcher** — three icons: sun = Light, moon = Dark, monitor = Follow system. The left side holds the nav bar: **Home** (receive/send + connection history), **Settings**, and "Quit" at the bottom:
 
+- **Appearance**: three icons in the header (sun = Light, moon = Dark, monitor = Follow system); one click recolours the window and writes `theme` to `config.ini`, with no OK needed. The same setting appears as a labelled three-way switch under Settings · Appearance, for anyone who does not read the icons. See the platform note above for "Follow system"
 - **Home · Receive**: shows the local IP, ports and a "receiving" status while launching the receiver to wait for connections; "Stop" ends it
 - **Home · Send**: shows "searching"; once devices are found (with hostnames), each row offers "Cast" (mirror) or "Extend"; streaming can be stopped at any time
 - **Home · Connection history**: the last 20 connections are listed under the receive/send cards — click to connect directly (no search); delete single entries or clear all; mouse wheel scrolls
 - **Home · In session**: while casting/receiving you can switch to Settings (the session keeps running); "Back to session" or ESC in Settings returns to the live status, while "Home" goes to the Home screen (shows the session running, with Stop)
-- **Settings**: codec (auto/H.264/H.265/AV1/raw/RLE), hardware accel, quality/bitrate/FPS/scale/chroma, status panel / log window / classic console, auto-start / auto-receive. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
+- **Settings**: the left column is "Quality & codec" (codec auto/H.264/H.265/AV1/raw/RLE, quality/FPS/bitrate/scale/chroma); the right column is "Connection & startup" (hardware accel / status console / log window / auto-start / auto-receive / auto update check) and "Appearance"; the "Software update" card sits below. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
+- **Settings · Update**: the bottom "Update" row shows the current version and the check result; a new release offers "Download update" (with progress) → "Install now" (Windows: after verification the app quits and starts the installer; Linux/macOS: opens the release page). You can "Ignore this version"; a new release also shows a banner at the top of Home and a dot on the Settings tab
 - **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same cast/extend choice
 - **Streaming status**: live FPS / bitrate / encoder in the GUI status panel; the "Log" button opens the independent log window (child-process output). The cmd console is hidden by default — re-enable it in Settings
 - **ESC**: discard Settings edits and return to the session; back from the manual-IP page; stop the session on cast/receive screens and go home; quits from home
@@ -532,6 +543,8 @@ The receiver writes statistics to `gpu_stats.json` every 60 seconds and prints a
 | "Virtual display did not come up" | Driver installed but activation failed | Check device status with `pnputil /enum-devices /class Monitor`, reboot and retry |
 | Extend mode black screen / no video | Handshake mismatch between the two ends (mode 0=mirror 1=extend) | Use the same binary version on both ends |
 | Virtual display stays in Settings > Display after disconnect | Older builds only did a CCD detach, or sender/app not run as admin | Fixed: the Root\MttVDD device is disabled at exit (sender/app must run elevated). If the log shows a disable failure, manually disable "Virtual Display Driver" in Device Manager |
+| "Check for updates" fails (DNS / timeout / secure connection failed) | The check only contacts `github.com`; a flaky direct connection (corporate or mainland-China networks) makes it fail — expected degradation | Use "Open download page" and download in your browser (system proxy/VPN); quit Mivara in-app before running the new installer so the virtual display is detached cleanly |
+| "Download update" reports a missing checksum file | That release has no `SHA256SUMS.txt` (in-app install requires a hash anchor, so it is not offered without one) | Use "Open download page" and install manually |
 | SmartScreen prompts on download/run ("isn't commonly downloaded" / "Unknown publisher") | Installer is not code-signed and the new file has no download reputation (a normal reputation prompt, not a malware verdict) | Verify the SHA-256, then continue per the prompt — see [Windows SmartScreen Notice](#windows-smartscreen-notice) |
 
 ### Windows SmartScreen Notice
@@ -583,6 +596,7 @@ make check                                          # environment self-check
 - [ ] Receiver input back-channel (real keyboard/mouse control from the receiver side)
 - [x] Optional encoders: RLE / H.264 / H.265 / AV1 as a selectable option
 - [x] GUI advanced settings (encoder picker, connection history)
+- [x] In-app update check + one-click download/install (Windows, SHA-256 verified, admin-only staging directory)
 - [ ] GUI advanced settings: extend-resolution choice (currently fixed at the 1920x1080 default in the GUI)
 - [ ] Audio capture and streaming
 - [ ] TLS encryption

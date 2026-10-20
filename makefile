@@ -122,7 +122,10 @@ ifeq ($(OS),Windows_NT)
     # -lsetupapi: enable/disable the Root\MttVDD device (vdd.cpp)
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
-    APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -lsetupapi
+    # app: -lwinhttp (update check/download), -lbcrypt (SHA-256 via CNG),
+    #      -ladvapi32 (SetNamedSecurityInfo + SDDL on the update directory)
+    APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -lsetupapi \
+                     -lwinhttp -lbcrypt -ladvapi32
     # requireAdministrator manifest resource for sender + app
     RES_ADMIN := $(BUILDDIR)/admin_rc.o
 endif
@@ -168,6 +171,8 @@ OBJ_HISTORY  := $(BUILDDIR)/history.o
 OBJ_APP      := $(BUILDDIR)/app.o
 OBJ_SENDER   := $(BUILDDIR)/sender.o
 OBJ_RECEIVER := $(BUILDDIR)/receiver.o
+OBJ_UPDATE   := $(BUILDDIR)/update.o
+OBJ_THEME    := $(BUILDDIR)/theme.o
 
 # ============================================================================
 # PHONY TARGET DECLARATIONS
@@ -204,7 +209,9 @@ endif
 
 # SDL headers/flags only for the two SDL binaries – sender must NOT get
 # -Dmain=SDL_main (pkg-config sdl2 cflags) since it links without SDL2main.
-$(OBJ_APP) $(OBJ_RECEIVER): CXXFLAGS += $(SDL_CFLAGS)
+# theme.o carries SDL_Color, so it needs the SDL headers too (it has no main,
+# so the -Dmain=SDL_main that comes with the cflags is harmless there).
+$(OBJ_APP) $(OBJ_RECEIVER) $(OBJ_THEME): CXXFLAGS += $(SDL_CFLAGS)
 
 # codec.o needs FFmpeg headers
 $(OBJ_CODEC): CXXFLAGS += $(FFMPEG_CFLAGS)
@@ -217,9 +224,11 @@ $(OBJ_VDD): $(SRCDIR)/vdd.h
 $(OBJ_CODEC): $(SRCDIR)/codec.h $(SRCDIR)/proto.h
 $(OBJ_CONFIG): $(SRCDIR)/config.h
 $(OBJ_HISTORY): $(SRCDIR)/history.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h
-$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/config.h $(SRCDIR)/history.h
+$(OBJ_UPDATE): $(SRCDIR)/update.h $(SRCDIR)/version.h
+$(OBJ_THEME): $(SRCDIR)/theme.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
+$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h
 
 # ============================================================================
 # TARGET LINKING
@@ -233,7 +242,7 @@ $(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_C
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
-$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(RES_ADMIN) | $(BINDIR)
+$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
 	@echo "Built $(APP_BIN)"
 
@@ -297,7 +306,8 @@ check:
 	@for f in app.cpp sender.cpp receiver.cpp discover.cpp discover.h \
                gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
-               config.cpp config.h history.cpp history.h; do \
+               config.cpp config.h history.cpp history.h \
+	               update.cpp update.h version.h theme.cpp theme.h; do \
         if [ -f $(SRCDIR)/$$f ]; then \
             echo "    OK  $$f"; \
         else \

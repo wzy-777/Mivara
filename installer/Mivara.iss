@@ -3,7 +3,11 @@
 ; Output: dist\Mivara-Setup-<version>.exe
 
 #define AppName "Mivara"
-#define AppVersion "0.9.1"
+; Single version source: src/version.h. That file must stay comment-free —
+; an inline comment after a directive aborts ISCC. Bump it, then the README
+; badges + winget manifests by hand (release checklist in AGENTS.md).
+#include "..\src\version.h"
+#define AppVersion MIVARA_VERSION
 #define AppPublisher "Mivara"
 #define AppExeName "app.exe"
 
@@ -60,3 +64,8 @@ Filename: "{app}\bin\{#AppExeName}"; Description: "启动 {#AppName}"; WorkingDi
 [UninstallRun]
 ; remove the auto-start scheduled task registered by app.exe (task name must match app.cpp)
 Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""Mivara"" /f"; Flags: runhidden; RunOnceId: "DelAutoStartTask"
+
+[UninstallDelete]
+; update staging directory (created by app.exe with an admin-only DACL, so it
+; must be removed from an elevated context)
+Type: filesandordirs; Name: "{commonappdata}\Mivara"

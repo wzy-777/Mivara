@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -121,6 +122,24 @@ void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
         cfg.auto_start = (val == "1") ? 1 : 0;
     } else if (key == "auto_receive") {
         cfg.auto_receive = (val == "1") ? 1 : 0;
+    } else if (key == "auto_check_update") {
+        cfg.auto_check_update = (val == "1") ? 1 : 0;
+    } else if (key == "theme") {
+        /* unknown value → keep the default (system) rather than a broken mode */
+        if (val == "light" || val == "dark" || val == "system")
+            cfg.theme = val;
+    } else if (key == "last_update_check") {
+        /* runtime metadata: reject garbage and future clock skew */
+        long long v = strtoll(val.c_str(), nullptr, 10);
+        long long now = (long long)time(nullptr);
+        if (v < 0 || v > now) v = 0;
+        cfg.last_update_check = v;
+    } else if (key == "ignored_version") {
+        if (!val.empty() && val.size() <= 32 &&
+            val.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                  "abcdefghijklmnopqrstuvwxyz0123456789._-") ==
+                std::string::npos)
+            cfg.ignored_version = val;
     }
 }
 
@@ -204,6 +223,10 @@ bool configSave(const AppConfig &cfg)
     fprintf(f, "show_log_window=%d\n", cfg.show_log_window ? 1 : 0);
     fprintf(f, "auto_start=%d\n", cfg.auto_start ? 1 : 0);
     fprintf(f, "auto_receive=%d\n", cfg.auto_receive ? 1 : 0);
+    fprintf(f, "auto_check_update=%d\n", cfg.auto_check_update ? 1 : 0);
+    fprintf(f, "theme=%s\n", cfg.theme.c_str());
+    fprintf(f, "last_update_check=%lld\n", cfg.last_update_check);
+    fprintf(f, "ignored_version=%s\n", cfg.ignored_version.c_str());
     fclose(f);
 
 #ifdef _WIN32

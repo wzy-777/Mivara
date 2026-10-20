@@ -46,7 +46,10 @@
 #include "config.h"
 #include "discover.h"
 #include "history.h"
+#include "theme.h"
+#include "update.h"
 #include "vdd.h"
+#include "version.h"
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -63,39 +66,190 @@
 #  include <limits.h>
 #endif
 
-#define WIN_W 820
+/* ── metrics ───────────────────────────────────────────────────────────────
+ * One fixed canvas: there is no reflow, so every position below is a
+ * compile-time integer. Width grew from 820 to fit the settings screen's
+ * two-column card layout; height stayed at 700 so the window still fits a
+ * 768-px-tall laptop screen together with its title bar and the taskbar.
+ */
+#define WIN_W 880
 #define WIN_H 700
-#define LOG_WIN_W 420
-#define LOG_WIN_H 520
+#define LOG_WIN_W 460
+#define LOG_WIN_H 540
 #define LOG_CAP 2000
 #define HIST_VISIBLE 5
-#define HEADER_H 64
-#define NAV_W 140
+
+/* App shell: a full-width header strip with the nav rail below it. The rest
+ * of the geometry — including NAV_W and HEADER_H — is in the shared layout
+ * block below, next to the rects that depend on it. */
 #define CONTENT_X NAV_W
 #define CONTENT_W (WIN_W - NAV_W)
 #define CONTENT_CX (CONTENT_X + CONTENT_W / 2)
 
-/* ── theme ───────────────────────────────────────────────────────────────── */
-struct Theme {
-    SDL_Color bg, surface, hover, press, primary, success, danger;
-    SDL_Color text, textDim, inputBg, border;
-    int gap, rowH, radius;
-};
+/* Content padding. */
+#define PAD 24
 
-static const Theme THEME = {
-    /* bg      */ {22, 22, 34, 255},
-    /* surface */ {32, 34, 52, 255},
-    /* hover   */ {48, 52, 76, 255},
-    /* press   */ {36, 40, 60, 255},
-    /* primary */ {46, 91, 171, 255},
-    /* success */ {34, 139, 84, 255},
-    /* danger  */ {160, 54, 60, 255},
-    /* text    */ {230, 232, 240, 255},
-    /* textDim */ {150, 155, 175, 255},
-    /* inputBg */ {18, 18, 28, 255},
-    /* border  */ {58, 62, 88, 255},
-    /* gap/rowH/radius */ 12, 52, 8
-};
+/* Spacing scale (4px base). */
+#define SP1 4
+#define SP2 8
+#define SP3 12
+#define SP4 16
+#define SP5 20
+#define SP6 24
+
+/* Type scale. Bold faces degrade to the regular one when unavailable. */
+#define FONT_DISPLAY 30                 /* screen titles                       */
+#define FONT_TITLE   22                 /* card titles, nav wordmark           */
+#define FONT_BODY    16                 /* row labels, section headers         */
+#define FONT_SMALL   13                 /* captions, buttons, chips            */
+
+/* ── shared layout ─────────────────────────────────────────────────────────
+ * buildButtons() (hit rects) and renderScreen() (painted rects) both read
+ * these. They used to be written out twice as separate literals, which is how
+ * the home status text ended up painted underneath the action cards and the
+ * settings 编码 label ended up under the codec control. Anything positional
+ * belongs here, never inline in either function.
+ */
+#define HEADER_H 56
+#define NAV_W 136
+#define NAV_ITEM_X 12
+#define NAV_ITEM_W 112
+#define NAV_ITEM_H 44
+#define NAV_HOME_Y 76
+#define NAV_SET_Y 128
+#define NAV_QUIT_Y 644
+
+#define HDR_GLYPH_CX 36
+#define HDR_WORD_X 58
+
+/* Header appearance switcher: three icon cells on a track, right-aligned with
+ * the content column. The cells carry sun / moon / monitor glyphs, not text —
+ * the labelled version of the same control is the 外观 card on the settings
+ * screen, which is where a user who does not read the icons will look. */
+#define SEG_Y 13
+#define SEG_H 30
+#define SEG_PAD 2                       /* track inset around the cells         */
+#define SEG_CELL_W 40
+#define SEG_CELL_GAP 2
+#define SEG_CELL_H (SEG_H - SEG_PAD * 2)
+#define SEG_W (SEG_PAD * 2 + SEG_CELL_W * 3 + SEG_CELL_GAP * 2)     /* 128       */
+#define SEG_X (BODY_R - SEG_W)          /* flush with the content's right edge  */
+#define SEG_CELL_X(i) (SEG_X + SEG_PAD + (i) * (SEG_CELL_W + SEG_CELL_GAP))
+
+/* Header update button: present only while a release is waiting, immediately to
+ * the left of the appearance switcher and the same height, so the two read as
+ * one row of header controls. It is a ghost hit area — drawHeader() paints it,
+ * because its fill depends on the update state (see updateBadgeVisible). */
+#define UPD_BTN_W 30
+#define UPD_BTN_H SEG_H
+#define UPD_BTN_X (SEG_X - 10 - UPD_BTN_W)
+#define UPD_BTN_Y SEG_Y
+
+#define BODY_X (CONTENT_X + PAD)        /* 160                                  */
+#define BODY_W (CONTENT_W - PAD * 2)    /* 696                                  */
+#define BODY_R (BODY_X + BODY_W)        /* 856                                  */
+
+#define CARD_R THEME.radiusCard
+
+/* home */
+#define HOME_TITLE_Y 76                 /* tagline under the header             */
+#define HOME_BAND_Y 108                 /* update notice band                   */
+#define HOME_CAPTION_Y 160
+#define HOME_CARD_Y 184
+#define HOME_CARD_W 336
+#define HOME_CARD_H 156
+#define HOME_CARD_X(i) (BODY_X + (i) * (HOME_CARD_W + 24))
+
+#define HIST_CARD_Y 372
+#define HIST_CARD_H 288
+#define HIST_ROW_X (BODY_X + 16)
+#define HIST_ROW_W (BODY_W - 32)
+#define HIST_ROW_H 44
+#define HIST_ROW_Y(i) (HIST_CARD_Y + 42 + (i) * 48)
+#define HIST_BTN_X 636                  /* 投屏 / 扩展 / 删除, right-aligned      */
+#define HIST_BTN_W 72
+#define HIST_DEL_X (HIST_ROW_X + HIST_ROW_W - 44)
+#define HIST_PAGER_Y 674                /* footer caption, clear of the card's
+                                         * bottom edge at 660 and its shadow */
+#define HIST_CARD_H_EMPTY 132
+
+/* found-devices list: the rows are laid out from the top, so the action row
+ * follows the last one instead of floating at a fixed y with a hole above it */
+#define FOUND_ROW_Y0 120
+#define FOUND_ROW_PITCH 60
+#define FOUND_ROW_H 52
+#define FOUND_ACTIONS_MAX_Y 512
+
+static int foundActionsY(int n)
+{
+    if (n > 6) n = 6;
+    const int y = FOUND_ROW_Y0 + n * FOUND_ROW_PITCH + 20;
+    return y > FOUND_ACTIONS_MAX_Y ? FOUND_ACTIONS_MAX_Y : y;
+}
+
+/* These build compound literals, so they must be functions, not macros —
+ * SDL_Rect{...}.x does not parse as a macro expansion in an argument list. */
+static SDL_Rect rcHomeCard(int i)
+{
+    return SDL_Rect{HOME_CARD_X(i), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H};
+}
+static SDL_Rect rcHomeStop(int i)
+{
+    return SDL_Rect{HOME_CARD_X(i) + 220, HOME_CARD_Y + 76, 96, 34};
+}
+static SDL_Rect rcHomeChip(int i)
+{
+    return SDL_Rect{HOME_CARD_X(i) + 16, HOME_CARD_Y + 98, 96, 24};
+}
+static SDL_Rect rcHistRow(int i)
+{
+    return SDL_Rect{HIST_ROW_X, HIST_ROW_Y(i), HIST_ROW_W, HIST_ROW_H};
+}
+static SDL_Rect rcHistBtn(int i, int which)   /* 0 投屏 / 1 扩展 / 2 删除 */
+{
+    static const int w[3] = {HIST_BTN_W, HIST_BTN_W, 44};
+    int x = (which == 2) ? HIST_DEL_X
+                         : HIST_BTN_X + (which == 0 ? 0 : HIST_BTN_W + 8);
+    return SDL_Rect{x, HIST_ROW_Y(i) + 6, w[which], 32};
+}
+
+/* settings: two columns of cards */
+#define SET_COL_L 160
+#define SET_COL_R 520
+#define SET_COL_W 336
+#define SET_CARD_Y 108
+#define SET_PAD 20
+#define SET_LC_X (SET_COL_L + SET_PAD)  /* 180 */
+#define SET_LC_W (SET_COL_W - SET_PAD * 2)  /* 296 */
+#define SET_RC_X (SET_COL_R + SET_PAD)  /* 540 */
+#define SET_L_H 424
+#define SET_R_H 296                     /* 连接与启动                            */
+#define SET_APPEAR_Y 420                /* 外观                                  */
+#define SET_APPEAR_H 112
+#define SET_UPD_Y 548                   /* 更新 (full width)                     */
+#define SET_UPD_H 88
+#define SET_ACT_Y 648                   /* 确定 / 恢复默认 / 返回会话             */
+#define SET_ACT_H 44
+
+#define SET_CODEC_LABEL_Y 168
+#define SET_GRID_Y0 196                 /* codec 3x2 grid                        */
+#define SET_ROW_Y(i) (288 + (i) * 44)   /* 画质 / 帧率 / 码率 / 缩放 / 色度      */
+#define SET_TOGGLE_Y0 158               /* first 连接与启动 toggle row           */
+#define SET_STEP_W 36                   /* − / value / + stepper                 */
+#define SET_VAL_W 110
+#define SET_ROW_R (SET_LC_X + SET_LC_W) /* 476                                   */
+#define SET_MINUS_X (SET_ROW_R - 36 - 8 - SET_VAL_W - 8 - SET_STEP_W)  /* 278 */
+#define SET_VAL_X   (SET_MINUS_X + SET_STEP_W + 8)                     /* 322 */
+#define SET_PLUS_X  (SET_ROW_R - SET_STEP_W)                           /* 440 */
+
+#define TITLE_Y 72
+
+/* ── theme ─────────────────────────────────────────────────────────────────
+ * The palette lives in theme.cpp (light / dark / follow-system). THEME is an
+ * alias for the live instance so call sites read the same as before, but it is
+ * re-read every frame — never cache a Theme:: field across a frame boundary.
+ */
+#define THEME (theme())
 
 /* ── screens ─────────────────────────────────────────────────────────────── */
 enum Screen {
@@ -156,6 +310,16 @@ enum BtnId {
     BTN_SET_RESET,
     BTN_SET_AUTOSTART = 7053,
     BTN_SET_AUTORECV,
+    /* update row: one id per ACTION, never per slot - a press and its release
+     * must not be dispatched against a state that changed in between */
+    BTN_SET_AUTOCHECK = 7055,           /* 自动检查更新 toggle */
+    BTN_SET_UPD_CHECK,                  /* 检查更新 (and 重试 after a failed check) */
+    BTN_SET_UPD_DL,                     /* 下载更新 (and 重试 after a failed download) */
+    BTN_SET_UPD_CANCEL,                 /* 取消下载 */
+    BTN_SET_UPD_INSTALL,                /* 立即安装 */
+    BTN_SET_UPD_PAGE,                   /* 打开下载页 */
+    BTN_SET_UPD_IGNORE,                 /* 忽略此版本 / 取消忽略 */
+    BTN_UPD_NOTICE,                     /* home-screen update banner */
     /* history rows (drawn on the home screen under 接收/发送) */
     BTN_HIST_BASE = 5000,               /* row i: +i*10 +0 row / +1 投屏 / +2 扩展 / +3 删除 */
     BTN_HIST_CLEAR = 5300,
@@ -166,13 +330,101 @@ enum BtnId {
     BTN_NAV_SETTINGS,
     BTN_NAV_QUIT,
     BTN_RETURN_SESSION = 8010,
+    /* Header appearance switcher. It shares the 8000 block with the nav ids
+     * (8000..8010) — keep any new nav item below BTN_THEME_LIGHT — and it needs
+     * its own ids because the 外观 card on the settings screen is a second
+     * control for the same setting. See kThemeIds for how they are dispatched. */
+    BTN_THEME_LIGHT = 8020,
+    BTN_THEME_DARK,
+    BTN_THEME_SYSTEM,
+    BTN_HDR_UPDATE,                     /* header 更新 button (only while a
+                                         * release is waiting); matches against
+                                         * nothing else, so it may sit outside
+                                         * the kThemeIds table */
+    /* The settings-screen appearance cells must sit in the GAP between the
+     * settings block (7000..7062, where the update ids are an implicit +1 run
+     * from BTN_SET_AUTOCHECK) and the nav block (8000+). Anything inside that
+     * run would be swallowed by the theme branch in onButton(), which runs
+     * before the switch — that silently turned 「打开下载页」 into "switch to
+     * light" once. The assert below keeps the range pinned to the gap. */
+    BTN_SET_THEME_BASE = 7070,          /* +0 light / +1 dark / +2 system */
+};
+
+static_assert(BTN_SET_THEME_BASE > BTN_UPD_NOTICE && BTN_SET_THEME_BASE + 2 < BTN_NAV_HOME,
+              "appearance ids must stay in the gap between the settings and nav ranges");
+
+/* Appearance is the only setting reachable from two places at once — the header
+ * switcher (8020..8022) and the 外观 card (7070..7072) — so its ids are matched
+ * against a table rather than derived by subtracting a base. The derived form
+ * was
+ *     (id >= BTN_SET_THEME_BASE) ? id - BTN_SET_THEME_BASE : id - BTN_THEME_LIGHT
+ * and that test is true for BOTH ranges (8020 >= 7070), so every header click
+ * took the first branch and indexed modes[950] out of bounds. The live mode
+ * became garbage, so resolve() fell through to the light palette, no cell drew
+ * as selected, and themeModeKey()'s default wrote theme=system to config.ini —
+ * i.e. the switcher looked like it always jumped to 亮色 whatever you picked,
+ * and a restart then followed the system instead. */
+struct ThemeIdEntry { int id; ThemeMode mode; };
+static constexpr ThemeIdEntry kThemeIds[] = {
+    {BTN_THEME_LIGHT,        ThemeMode::Light},
+    {BTN_THEME_DARK,         ThemeMode::Dark},
+    {BTN_THEME_SYSTEM,       ThemeMode::System},
+    {BTN_SET_THEME_BASE + 0, ThemeMode::Light},
+    {BTN_SET_THEME_BASE + 1, ThemeMode::Dark},
+    {BTN_SET_THEME_BASE + 2, ThemeMode::System},
+};
+static constexpr int kThemeIdCount = (int)(sizeof(kThemeIds) / sizeof(kThemeIds[0]));
+
+/* Two ids for the same mode is harmless (there are, deliberately, six entries
+ * for three modes); two entries sharing an id is not — that is exactly the
+ * collision that once turned 「打开下载页」 into "switch to light". */
+constexpr bool themeIdsAreDistinct()
+{
+    for (int i = 0; i < kThemeIdCount; i++)
+        for (int j = i + 1; j < kThemeIdCount; j++)
+            if (kThemeIds[i].id == kThemeIds[j].id) return false;
+    return true;
+}
+static_assert(themeIdsAreDistinct(), "two appearance entries claim the same button id");
+
+/* Visual variant. The fill/hover/press colours are resolved from the live
+ * palette at draw time, so no colour literal is ever baked into a Button and
+ * the old +/-22-channel hover arithmetic (which only looked right on the one
+ * dark palette) is gone. */
+enum BtnVariant {
+    BTN_V_PRIMARY,     /* filled accent, onPrimary label                  */
+    BTN_V_SECONDARY,   /* surfaceAlt fill + border, text label            */
+    BTN_V_DANGER,      /* solid red, white label (DANGER_SOLID)           */
+    BTN_V_LINK,        /* no fill; danger label, tinted wash on hover     */
+    BTN_V_CHOICE,      /* selectable cell; .on fills it with the accent   */
+    BTN_V_CHIP_OK,     /* successTint chip (投屏)                          */
+    BTN_V_CHIP_ACC,    /* primaryTint chip (扩展)                          */
+    BTN_V_NAV,         /* nav-rail item; .on marks the active tab         */
+    BTN_V_GHOST,       /* hit area only — the caller paints it            */
+};
+
+/* Tiny geometric glyphs drawn from the primitive set (see the icon helpers). */
+enum GlyphId {
+    GLYPH_NONE = 0,
+    GLYPH_MONITOR,
+    GLYPH_ARROW_UP,
+    GLYPH_ARROW_DOWN,
+    GLYPH_SLIDERS,
+    GLYPH_POWER,
+    GLYPH_SUN,          /* appearance: 亮色                       */
+    GLYPH_MOON,         /* appearance: 暗色                       */
+    GLYPH_UPDATE,       /* header: 有可用更新                     */
 };
 
 struct Button {
-    SDL_Rect rect;
+    SDL_Rect    rect;
     std::string label;
-    int id;
-    SDL_Color color;
+    int         id;
+    int         variant = BTN_V_SECONDARY;
+    int         glyph   = GLYPH_NONE;
+    bool        on      = false;      /* BTN_V_CHOICE: this cell is selected */
+    bool        framed  = true;       /* BTN_V_CHOICE: draw the cell's own border */
+    TTF_Font   *font    = nullptr;    /* null = the variant's default size   */
 };
 
 struct ChildProc {
@@ -199,9 +451,16 @@ struct LiveStats {
 /* ── globals ─────────────────────────────────────────────────────────────── */
 static SDL_Window   *g_win   = nullptr;
 static SDL_Renderer *g_ren   = nullptr;
-static TTF_Font     *g_font  = nullptr;   /* body / buttons */
-static TTF_Font     *g_fontL = nullptr;   /* headings */
-static TTF_Font     *g_fontS = nullptr;   /* log lines / stat panel */
+static TTF_Font     *g_font  = nullptr;   /* FONT_BODY                     */
+static TTF_Font     *g_fontL = nullptr;   /* FONT_DISPLAY                  */
+static TTF_Font     *g_fontS = nullptr;   /* FONT_SMALL (log / captions)   */
+static TTF_Font     *g_fontB = nullptr;   /* FONT_TITLE,  bold             */
+static TTF_Font     *g_fontBS = nullptr;  /* FONT_SMALL,  bold (section hd) */
+
+/* Display scale — see the "display scale" block further down. 1.0 until main()
+ * resolves it, which is also what keeps the off-screen screenshot harness (it
+ * never runs main) rendering at the raw 880x700 layout. */
+static float         g_uiScale = 1.0f;
 
 static SDL_Window   *g_log_win = nullptr;
 static SDL_Renderer *g_log_ren = nullptr;
@@ -223,6 +482,13 @@ static std::atomic<bool>           g_search_done{false};
 static std::atomic<int>            g_found_count{0};
 static std::atomic<unsigned long>  g_search_generation{0};
 static std::thread                  g_search_thread;
+
+/* update check (the worker + state live in update.cpp; the UI polls) */
+static bool   g_upd_auto_checked = false;   /* at most one auto check per launch */
+static Uint32 g_upd_auto_at = 0;            /* SDL_GetTicks() deadline for it */
+static bool   g_upd_installing = false;     /* installer hand-over already begun */
+static bool   g_upd_auto_install = false;   /* header button asked for the whole
+                                             * download→install run */
 
 static AppConfig g_cfg;                 /* live config */
 static AppConfig g_cfg_edit;            /* SCR_SETTINGS working copy */
@@ -288,23 +554,146 @@ static TTF_Font *openFont(int size)
     return nullptr;
 }
 
+/* Bold face for titles / selected nav / button labels. Falls back to the
+ * regular face, so hierarchy degrades to size+colour but never breaks. */
+static TTF_Font *openFontBold(int size)
+{
+    static const char *candidates[] = {
+        "C:/Windows/Fonts/msyhbd.ttc",     /* Microsoft YaHei Bold  */
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",     /* SimHei is already bold-ish */
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        nullptr
+    };
+    for (int i = 0; candidates[i]; i++) {
+        TTF_Font *f = TTF_OpenFont(candidates[i], size);
+        if (f) return f;
+    }
+    return openFont(size);
+}
+
 /* ── text / shape drawing ────────────────────────────────────────────────── */
-static void drawText(SDL_Renderer *ren, const std::string &s, int x, int y,
-                     SDL_Color c, TTF_Font *font, bool center = false)
+static const double UI_PI = 3.14159265358979323846;
+
+enum TextAlign { ALIGN_LEFT = 0, ALIGN_CENTER, ALIGN_RIGHT };
+
+/* ── display scale ─────────────────────────────────────────────────────────
+ * The layout below is authored in a fixed 880x700 grid and every constant in
+ * this file is in those LOGICAL units. On a scaled display SDL makes the
+ * process per-monitor DPI aware by default, so the OS never bitmap-stretches
+ * the window — which is exactly why the raw layout lands 1:1 in physical
+ * pixels and, at 125%, draws the whole UI a quarter smaller than every other
+ * window on screen. At that size a 13 px CJK glyph gets one pixel per stroke
+ * and almost no room to antialias, which is what reads as "jagged".
+ *
+ * So the UI is drawn through one scale factor:
+ *   - the window is created at WIN_* x scale physical pixels;
+ *   - SDL_RenderSetScale scales every shape primitive, so the layout constants
+ *     above stay untouched;
+ *   - fonts are opened at size x scale and text blits itself 1:1 in device
+ *     pixels (drawTextPx), because scaling a finished glyph texture — what
+ *     SDL's own DPI scaling would do — is precisely what makes text blurry;
+ *   - pointer coordinates are divided back into logical units at the event
+ *     boundary, so hit rects keep matching what was painted.
+ * Resolved once at startup; a window dragged to a monitor with a different
+ * scale keeps the scale it was created with (cf. the theme's system poll).
+ */
+static int uiPx(int v) { return (int)std::lround((double)v * g_uiScale); }
+
+/** Device pixel -> logical UI coordinate (pointer input).
+ *
+ * floor, not lround: the renderer paints a scaled rect as
+ * [floor(x*s), ceil((x+w)*s)), so a device pixel p belongs to the logical unit
+ * it is AT or past. Rounding to nearest instead over-rounds every odd device
+ * pixel at s = 2 — p = x+w-1 maps to x+w — which shifts the whole hit region a
+ * pixel left of the painted one, and on a row of edge-sharing cells (the 缩放 /
+ * 色度 chips) that means clicking a cell's rightmost painted column selects its
+ * neighbour. Measured over every button on every screen (test/uiprobe
+ * `hitcover`): lround misses 1.5 % of painted pixels at 2x and 0.9 % at 1.25x,
+ * floor misses 0 % at every integer scale and ~0.7 % at 1.25x. The residue is
+ * inherent — at a fractional scale the painted rect spills up to one pixel left
+ * of its logical cell, so that pixel is claimed by two controls and no scalar
+ * mapping can resolve it. */
+static int uiCoord(int px) { return (int)std::floor((double)px / g_uiScale); }
+
+static void setColor(SDL_Renderer *ren, SDL_Color c)
+{
+    SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, c.a);
+}
+
+static SDL_Color withAlpha(SDL_Color c, Uint8 a)
+{
+    c.a = a;
+    return c;
+}
+
+/* The only two literal colours the UI may use: a toggle knob, and the wash that
+ * shows hover (white over a dark label, black over a light one). Everything
+ * else comes from THEME — see AGENTS.md. */
+static const SDL_Color WHITE{0xFF, 0xFF, 0xFF, 0xFF};
+static const SDL_Color BLACK{0x00, 0x00, 0x00, 0xFF};
+
+/** Physical-pixel blit. The font is already rasterised at the display scale, so
+ * the render scale is dropped for the copy — a glyph texture that gets scaled
+ * again is exactly the blurry text this whole path exists to avoid. The caller
+ * passes device pixels; every other helper in this file takes logical units. */
+static void drawTextPx(SDL_Renderer *ren, const std::string &s, int px, int py,
+                       SDL_Color c, TTF_Font *font, bool center)
 {
     if (!ren || !font || s.empty()) return;
     SDL_Surface *surf = TTF_RenderUTF8_Blended(font, s.c_str(), c);
     if (!surf) return;
     SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, surf);
-    SDL_Rect dst{x, y, surf->w, surf->h};
-    if (center) dst.x = x - surf->w / 2;
+    SDL_Rect dst{center ? px - surf->w / 2 : px, py, surf->w, surf->h};
     SDL_FreeSurface(surf);
-    if (tex) {
-        SDL_RenderCopy(ren, tex, nullptr, &dst);
-        SDL_DestroyTexture(tex);
-    }
+    if (!tex) return;
+    float sx = 1.0f, sy = 1.0f;
+    SDL_RenderGetScale(ren, &sx, &sy);
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    SDL_RenderCopy(ren, tex, nullptr, &dst);
+    SDL_RenderSetScale(ren, sx, sy);
+    SDL_DestroyTexture(tex);
 }
 
+/** (x,y) is the TOP-LEFT of the rendered surface, in LOGICAL units. */
+static void drawText(SDL_Renderer *ren, const std::string &s, int x, int y,
+                     SDL_Color c, TTF_Font *font, bool center = false)
+{
+    drawTextPx(ren, s, uiPx(x), uiPx(y), c, font, center);
+}
+
+/** Vertically centred on cy, anchored horizontally by 'align'. LOGICAL units:
+ * the metrics come back in device pixels (the font is scaled), so the anchor is
+ * converted first and the centring happens in device space. */
+static void drawTextV(SDL_Renderer *ren, const std::string &s, int x, int cy,
+                      SDL_Color c, TTF_Font *font, int align = ALIGN_LEFT)
+{
+    if (!ren || !font || s.empty()) return;
+    int w = 0, h = 0;
+    if (TTF_SizeUTF8(font, s.c_str(), &w, &h) != 0) return;
+    const int ax  = uiPx(x);
+    const int acy = uiPx(cy);
+    const int dx = (align == ALIGN_CENTER) ? ax - w / 2
+                 : (align == ALIGN_RIGHT)  ? ax - w
+                                           : ax;
+    drawTextPx(ren, s, dx, acy - h / 2, c, font, false);
+}
+
+/** Vertically centred inside a rect; 'pad' insets the anchored edge. */
+static void drawTextIn(SDL_Renderer *ren, const std::string &s, const SDL_Rect &rc,
+                       SDL_Color c, TTF_Font *font,
+                       int align = ALIGN_LEFT, int pad = 0)
+{
+    int x = (align == ALIGN_CENTER) ? rc.x + rc.w / 2
+          : (align == ALIGN_RIGHT)  ? rc.x + rc.w - pad
+                                    : rc.x + pad;
+    drawTextV(ren, s, x, rc.y + rc.h / 2, c, font, align);
+}
+
+/** Draws in the colour most recently passed to setColor(). */
 static void fillCircle(SDL_Renderer *ren, int cx, int cy, int rad)
 {
     if (rad <= 0) return;
@@ -314,24 +703,36 @@ static void fillCircle(SDL_Renderer *ren, int cx, int cy, int rad)
     }
 }
 
+/**
+ * Rounded rect as horizontal scanlines rather than mid-rect + 2 side rects +
+ * 4 circles: the old construction overlapped itself, which is invisible at
+ * alpha 255 but paints visible darker seams wherever a translucent fill is
+ * used (the tint chips, the shadow, the hairlines). Honours c.a, so the
+ * renderer must have SDL_BLENDMODE_BLEND set (done in initRenderer()).
+ */
 static void fillRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad, SDL_Color c)
 {
     if (rc.w <= 0 || rc.h <= 0) return;
+    if (rad < 0) rad = 0;
     if (rad > rc.w / 2) rad = rc.w / 2;
     if (rad > rc.h / 2) rad = rc.h / 2;
-    SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, 255);
-    SDL_Rect mid = rc;
-    mid.x += rad;
-    mid.w -= rad * 2;
-    SDL_RenderFillRect(ren, &mid);
-    SDL_Rect left{rc.x, rc.y + rad, rad, rc.h - rad * 2};
-    SDL_Rect right{rc.x + rc.w - rad, rc.y + rad, rad, rc.h - rad * 2};
-    SDL_RenderFillRect(ren, &left);
-    SDL_RenderFillRect(ren, &right);
-    fillCircle(ren, rc.x + rad, rc.y + rad, rad);
-    fillCircle(ren, rc.x + rc.w - 1 - rad, rc.y + rad, rad);
-    fillCircle(ren, rc.x + rad, rc.y + rc.h - 1 - rad, rad);
-    fillCircle(ren, rc.x + rc.w - 1 - rad, rc.y + rc.h - 1 - rad, rad);
+    setColor(ren, c);
+    if (rad == 0) { SDL_RenderFillRect(ren, &rc); return; }
+
+    /* Straight band in the middle — one call, no overlap with the corners. */
+    SDL_Rect mid{rc.x, rc.y + rad, rc.w, rc.h - rad * 2};
+    if (mid.h > 0) SDL_RenderFillRect(ren, &mid);
+
+    for (int i = 0; i < rad; i++) {
+        /* dy = distance from the corner circle's centre, in pixel centres */
+        int dy = rad - 1 - i;
+        int dx = (int)(std::sqrt((double)(rad * rad - dy * dy)) + 0.5);
+        int inset = rad - dx;
+        SDL_RenderDrawLine(ren, rc.x + inset, rc.y + i,
+                                rc.x + rc.w - 1 - inset, rc.y + i);
+        SDL_RenderDrawLine(ren, rc.x + inset, rc.y + rc.h - 1 - i,
+                                rc.x + rc.w - 1 - inset, rc.y + rc.h - 1 - i);
+    }
 }
 
 static void drawRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad,
@@ -343,30 +744,455 @@ static void drawRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad,
         fillRoundRect(ren, in, rad > 0 ? rad - 1 : 0, fill);
 }
 
-static void drawButton(SDL_Renderer *ren, const Button &b)
+/** Soft drop shadow: three stacked translucent rounded rects, offset down. */
+static void drawShadow(SDL_Renderer *ren, SDL_Rect rc, int rad)
 {
-    if (b.label.empty()) return;           /* ghost hit-area, custom-drawn */
-    SDL_Color c = b.color;
-    if (g_press == b.id) {
-        c.r = (Uint8)std::max(0, (int)c.r - 26);
-        c.g = (Uint8)std::max(0, (int)c.g - 26);
-        c.b = (Uint8)std::max(0, (int)c.b - 26);
-    } else if (g_hot == b.id) {
-        c.r = (Uint8)std::min(255, (int)c.r + 22);
-        c.g = (Uint8)std::min(255, (int)c.g + 22);
-        c.b = (Uint8)std::min(255, (int)c.b + 22);
+    static const int spread[3] = {6, 4, 2};
+    static const int weight[3] = {12, 20, 28};   /* out of 64 */
+    const SDL_Color base = THEME.shadow;
+    for (int i = 0; i < 3; i++) {
+        SDL_Color c = base;
+        int a = (int)base.a * weight[i] / 64;
+        c.a = (Uint8)(a > 255 ? 255 : a);
+        if (c.a == 0) continue;
+        SDL_Rect r{rc.x - spread[i], rc.y,
+                   rc.w + spread[i] * 2, rc.h + spread[i] * 2};
+        fillRoundRect(ren, r, rad + spread[i], c);
     }
-    drawRoundRect(ren, b.rect, THEME.radius, c, THEME.border);
-    int tw = 0, th = 0;
-    if (g_font) TTF_SizeUTF8(g_font, b.label.c_str(), &tw, &th);
-    drawText(ren, b.label, b.rect.x + b.rect.w / 2,
-             b.rect.y + (b.rect.h - th) / 2, THEME.text, g_font, true);
 }
 
-static void addButton(int x, int y, int w, int h,
-                      const std::string &label, int id, SDL_Color color)
+/** Card / panel: soft shadow + surface fill. No border (UU-style flat cards). */
+static void drawCard(SDL_Renderer *ren, SDL_Rect rc, int rad)
 {
-    g_buttons.push_back({{x, y, w, h}, label, id, color});
+    drawShadow(ren, rc, rad);
+    fillRoundRect(ren, rc, rad, THEME.surface);
+}
+
+/** A 1px divider at 25% — a full-strength rule would read as a control edge. */
+static void drawHairline(SDL_Renderer *ren, int x, int y, int w, int h, SDL_Color c)
+{
+    SDL_Color d = c;
+    d.a = 0x40;
+    fillRoundRect(ren, SDL_Rect{x, y, w, h}, 0, d);
+}
+
+/** 1px-ish circle outline built from line segments (no arc primitive in SDL). */
+static void drawRing(SDL_Renderer *ren, int cx, int cy, int r, SDL_Color c)
+{
+    if (r <= 0) return;
+    setColor(ren, c);
+    const int steps = 48;
+    int px = cx + r, py = cy;
+    for (int i = 1; i <= steps; i++) {
+        double a = 2.0 * UI_PI * i / steps;
+        int x = cx + (int)std::lround(r * std::cos(a));
+        int y = cy + (int)std::lround(r * std::sin(a));
+        SDL_RenderDrawLine(ren, px, py, x, y);
+        px = x; py = y;
+    }
+}
+
+/** iOS-style toggle. The OFF track uses the border token: at surfaceAlt or
+ * press the white knob had almost no edge against the card behind it. */
+static void drawToggle(SDL_Renderer *ren, SDL_Rect rc, bool on)
+{
+    int rad = rc.h / 2;
+    fillRoundRect(ren, rc, rad, on ? SWITCH_ON : THEME.border);
+    setColor(ren, WHITE);
+    fillCircle(ren, on ? rc.x + rc.w - rad : rc.x + rad, rc.y + rad, rad - 2);
+}
+
+/* ── icons ────────────────────────────────────────────────────────────────
+ * Every glyph is drawn from the same primitives as the rest of the UI — no
+ * image assets, no icon font, no SVG. Each is centred on (cx, cy) in a
+ * nominal 'size' box so call sites can place them uniformly.
+ */
+static void glyphMonitor(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    int w = size, h = size;
+    int sh = (int)(h * 0.66);
+    int top = cy - h / 2;
+    fillRoundRect(ren, SDL_Rect{cx - w / 2, top, w, sh}, 3, c);
+    fillRoundRect(ren, SDL_Rect{cx - 1, top + sh, 2, (int)(h * 0.20)}, 1, c);
+    fillRoundRect(ren, SDL_Rect{cx - w / 4, cy + h / 2 - 2, w / 2, 2}, 1, c);
+}
+
+static void glyphArrow(SDL_Renderer *ren, int cx, int cy, int size, bool up, SDL_Color c)
+{
+    setColor(ren, c);
+    int half = size / 2, head = size / 3;
+    int yTip = up ? cy - half : cy + half;
+    int yEnd = up ? cy + half : cy - half;
+    int yWing = yTip + (up ? head : -head);
+    for (int i = 0; i < 2; i++) {          /* 2px stem, readable at 18px */
+        SDL_RenderDrawLine(ren, cx + i, yEnd, cx + i, yTip);
+        SDL_RenderDrawLine(ren, cx - head, yWing + (up ? i : -i), cx + i, yTip);
+        SDL_RenderDrawLine(ren, cx + head, yWing + (up ? i : -i), cx + i, yTip);
+    }
+}
+
+static void glyphSliders(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    int w = size;
+    int x0 = cx - w / 2;
+    int y1 = cy - size / 4, y2 = cy + size / 4;
+    setColor(ren, c);
+    for (int i = 0; i < 2; i++) {
+        SDL_RenderDrawLine(ren, x0, y1 + i, x0 + w, y1 + i);
+        SDL_RenderDrawLine(ren, x0, y2 + i, x0 + w, y2 + i);
+    }
+    fillCircle(ren, x0 + w / 3, y1, 3);
+    fillCircle(ren, x0 + (w * 2) / 3, y2, 3);
+}
+
+static void glyphPower(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    int r = size / 2;
+    setColor(ren, c);
+    /* Ring with a gap at the top, then the stem through that gap. */
+    const double gap   = 0.80;
+    const double start = -UI_PI / 2 + gap / 2;
+    const double end   = 3 * UI_PI / 2 - gap / 2;
+    const int steps = 40;
+    int px = cx + (int)std::lround(r * std::cos(start));
+    int py = cy + (int)std::lround(r * std::sin(start));
+    for (int i = 1; i <= steps; i++) {
+        double a = start + (end - start) * i / steps;
+        int x = cx + (int)std::lround(r * std::cos(a));
+        int y = cy + (int)std::lround(r * std::sin(a));
+        SDL_RenderDrawLine(ren, px, py, x, y);
+        px = x; py = y;
+    }
+    for (int i = 0; i < 2; i++)
+        SDL_RenderDrawLine(ren, cx + i, cy - r - 2, cx + i, cy + 1);
+}
+
+/* ── appearance glyphs ────────────────────────────────────────────────────
+ * Sun and moon for the header switcher; 跟随系统 reuses the monitor, which is
+ * the desktop convention (Windows Terminal, VS Code, Chrome, Firefox all mark
+ * their "system" option with a display) and is a good deal more legible at this
+ * size than macOS's half-filled circle. Neither glyph needs a knockout colour —
+ * the moon is subtracted geometrically — which matters because they sit on a
+ * cell whose fill changes with the selected / hovered / pressed state, so a
+ * knockout would have to be told which of six backgrounds to punch through.
+ */
+static void glyphSun(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    /* The core is deliberately small: at size/4 the rays came out shorter than
+     * the disc was wide and the mark read as a dashed circle rather than a sun. */
+    const int core = (size / 6 > 2) ? size / 6 : 2;
+    const int r0   = core + 1;          /* rays start at the core's edge       */
+    const int r1   = size / 2;          /* ...and stop at the nominal box      */
+    setColor(ren, c);
+    fillCircle(ren, cx, cy, core);
+    /* Rays are 2x2 blocks stamped along the direction rather than two parallel
+     * 1px lines: on the diagonals the two lines land 1.41 px apart and leave a
+     * visibly dashed, lighter ray, so the eight rays did not match in weight. */
+    for (int i = 0; i < 8; i++) {
+        const double a  = UI_PI * i / 4.0;
+        const double ca = std::cos(a), sa = std::sin(a);
+        for (int t = r0; t <= r1; t++) {
+            SDL_Rect px{cx + (int)std::lround(ca * t), cy + (int)std::lround(sa * t), 2, 2};
+            SDL_RenderFillRect(ren, &px);
+        }
+    }
+}
+
+static void glyphMoon(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    const int r  = size / 2;
+    const int bx = cx + (r * 5) / 10;   /* the bite, up and to the right        */
+    const int by = cy - (r * 15) / 100;
+    setColor(ren, c);
+    for (int y = -r; y <= r; y++) {
+        const int a = (int)std::sqrt((double)(r * r - y * y));
+        int lo = cx - a, hi = cx + a;
+        const int d = (cy + y) - by;
+        if (std::abs(d) <= r) {
+            const int b  = (int)std::sqrt((double)(r * r - d * d));
+            const int bl = bx - b, bh = bx + b;
+            if (bl <= lo && bh >= hi)     continue;        /* row fully eaten  */
+            else if (bl <= lo)            lo = bh + 1;     /* eaten from left  */
+            else if (bh >= hi)            hi = bl - 1;     /* eaten from right */
+            else if (bl - lo >= hi - bh)  hi = bl - 1;     /* split: keep wider*/
+            else                          lo = bh + 1;
+        }
+        if (lo <= hi) SDL_RenderDrawLine(ren, lo, cy + y, hi, cy + y);
+    }
+}
+
+/* Update: a circular arrow. The obvious alternative — an arrow dropping into a
+ * tray — is exactly what 接收 already looks like (a down arrow), and 发送 owns
+ * the up arrow, so anything straight would read as a second copy of one of the
+ * home-screen cards sitting in the header. Drawn 2px thick to match glyphArrow
+ * at 18px, which is the only size the header asks for. */
+static void glyphUpdate(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    const double kPi  = 3.14159265358979;
+    const double r    = size / 2.0 - 1.0;
+    const double gap  = 0.50;                       /* half-opening, radians */
+    const double a0   = -kPi / 2.0 + gap;           /* open at the top       */
+    const double a1   = a0 + 2.0 * kPi - 2.0 * gap;
+    const int    seg  = 28;
+    setColor(ren, c);
+    double px = 0, py = 0;
+    for (int i = 0; i <= seg; i++) {
+        const double a = a0 + (a1 - a0) * i / seg;
+        const double x = cx + std::cos(a) * r;
+        const double y = cy + std::sin(a) * r;
+        if (i) {
+            for (int t = 0; t < 2; t++)             /* 2px stroke, as elsewhere */
+                SDL_RenderDrawLine(ren, (int)std::lround(px) + t, (int)std::lround(py),
+                                   (int)std::lround(x) + t, (int)std::lround(y));
+        }
+        px = x; py = y;
+    }
+    /* Arrowhead closing the sweep, tip at the end of the arc and pointing along
+     * it. The head is a closed triangle, not two open barbs: at 18px a barb is
+     * only ~5px long, so the open form reads as a tail hanging off the ring
+     * rather than as an arrow. hlen/angle are deliberately tight — a wide head
+     * stops looking like an arrowhead and starts looking like a bend. */
+    const double hx = cx + std::cos(a1) * r;
+    const double hy = cy + std::sin(a1) * r;
+    const double tx = -std::sin(a1), ty = std::cos(a1);
+    const double hlen = size * 0.30, hrot = 0.52;
+    double bx[2], by[2];
+    for (int k = 0; k < 2; k++) {
+        const double rot = (k ? 1.0 : -1.0) * hrot;
+        const double dx = tx * std::cos(rot) - ty * std::sin(rot);
+        const double dy = tx * std::sin(rot) + ty * std::cos(rot);
+        bx[k] = hx - dx * hlen;
+        by[k] = hy - dy * hlen;
+        for (int t = 0; t < 2; t++)
+            SDL_RenderDrawLine(ren, (int)std::lround(hx) + t, (int)std::lround(hy),
+                               (int)std::lround(bx[k]) + t, (int)std::lround(by[k]));
+    }
+    for (int t = 0; t < 2; t++)
+        SDL_RenderDrawLine(ren, (int)std::lround(bx[0]) + t, (int)std::lround(by[0]),
+                           (int)std::lround(bx[1]) + t, (int)std::lround(by[1]));
+}
+
+static void glyphWarning(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c,
+                         SDL_Color knockout)
+{
+    int top = cy - size / 2, bot = cy + size / 2;
+    int half = size / 2;
+    setColor(ren, c);
+    for (int y = top; y <= bot; y++) {
+        int w = (y - top) * half / size;
+        SDL_RenderDrawLine(ren, cx - w, y, cx + w, y);
+    }
+    /* Exclamation knocked out in the surface behind it so it reads as a mark. */
+    setColor(ren, knockout);
+    SDL_Rect bar{cx - 1, cy - size / 4, 3, size / 2};
+    SDL_RenderFillRect(ren, &bar);
+    SDL_Rect dot{cx - 1, cy + size / 3, 3, 3};
+    SDL_RenderFillRect(ren, &dot);
+}
+
+static void drawGlyph(SDL_Renderer *ren, int glyph, int cx, int cy, int size, SDL_Color c)
+{
+    switch (glyph) {
+    case GLYPH_MONITOR:    glyphMonitor(ren, cx, cy, size, c); break;
+    case GLYPH_ARROW_UP:   glyphArrow(ren, cx, cy, size, true,  c); break;
+    case GLYPH_ARROW_DOWN: glyphArrow(ren, cx, cy, size, false, c); break;
+    case GLYPH_SLIDERS:    glyphSliders(ren, cx, cy, size, c); break;
+    case GLYPH_POWER:      glyphPower(ren, cx, cy, size, c); break;
+    case GLYPH_SUN:        glyphSun(ren, cx, cy, size, c); break;
+    case GLYPH_MOON:       glyphMoon(ren, cx, cy, size, c); break;
+    case GLYPH_UPDATE:     glyphUpdate(ren, cx, cy, size, c); break;
+    default: break;
+    }
+}
+
+/* ── buttons ─────────────────────────────────────────────────────────────── */
+static void drawButton(SDL_Renderer *ren, const Button &b)
+{
+    if (b.variant == BTN_V_GHOST) return;      /* hit area only, caller paints */
+
+    const bool hot   = (g_hot == b.id);
+    const bool press = (g_press == b.id);
+    const int  r     = THEME.radius;
+    /* Buttons use the bold small face; a caller may override for tight cells. */
+    TTF_Font *f = b.font ? b.font : g_fontBS;
+
+    auto centred = [&](SDL_Color c) {
+        drawTextV(ren, b.label, b.rect.x + b.rect.w / 2, b.rect.y + b.rect.h / 2,
+                  c, f, ALIGN_CENTER);
+    };
+    /* Hover is a translucent wash laid over the variant's own fill. The wash
+     * must move that fill AWAY from the label colour — darken under a white
+     * label, lighten under a dark one — or hovering would erode the label's
+     * contrast (a white wash on the primary fill drops it to 3.72:1, and a
+     * dark wash on a tint chip to 4.17:1). */
+    auto wash = [&](SDL_Color c, Uint8 a) {
+        if (!hot || press) return;
+        fillRoundRect(ren, b.rect, r, withAlpha(c, a));
+    };
+
+    switch (b.variant) {
+    case BTN_V_NAV: {
+        if (b.on) {
+            fillRoundRect(ren, b.rect, r, THEME.primary);
+            SDL_Rect bar{b.rect.x - 9, b.rect.y + 9, 3, b.rect.h - 18};
+            fillRoundRect(ren, bar, 2, THEME.accent);
+        } else if (press) {
+            fillRoundRect(ren, b.rect, r, THEME.press);
+        } else if (hot) {
+            /* surfaceAlt, not hover: the inactive label is textDim, and
+             * textDim on the darker hover fill is only 4.46:1 */
+            fillRoundRect(ren, b.rect, r, THEME.surfaceAlt);
+        }
+        SDL_Color fg = b.on ? THEME.onPrimary : THEME.textDim;
+        if (b.glyph != GLYPH_NONE)
+            drawGlyph(ren, b.glyph, b.rect.x + 23, b.rect.y + b.rect.h / 2, 18, fg);
+        drawTextV(ren, b.label, b.rect.x + 42, b.rect.y + b.rect.h / 2,
+                  fg, g_fontBS, ALIGN_LEFT);
+        break;
+    }
+
+    case BTN_V_CHOICE: {
+        /* A standalone selectable cell: it owns its border, so a row of them
+         * reads as a set of chips rather than as a track with a thumb.
+         * 'framed' = false is the same cell without that border, for the
+         * header switcher, whose three cells sit on a track that is already a
+         * frame — three borders inside one read as nested boxes. The fill is
+         * unchanged either way, and there it matches the track's own, so an
+         * unselected cell shows only its glyph. */
+        const SDL_Color fg = b.on ? THEME.onPrimary : THEME.text;
+        if (b.on) {
+            fillRoundRect(ren, b.rect, r - 3, THEME.primary);
+            /* Pressing the cell that is ALREADY selected has to respond too —
+             * it used to fall through this branch and do nothing at all.
+             * Black, not THEME.text: a white wash would lighten the primary
+             * fill and take the white label down to 3.2:1. */
+            if (press)
+                fillRoundRect(ren, b.rect, r - 3, withAlpha(BLACK, 0x26));
+        } else if (!b.framed) {
+            fillRoundRect(ren, b.rect, r - 3, THEME.surfaceAlt);
+            if (press)
+                fillRoundRect(ren, b.rect, r - 3, withAlpha(THEME.text, 0x2E));
+            else if (hot)
+                fillRoundRect(ren, b.rect, r - 3, withAlpha(THEME.text, 0x16));
+        } else {
+            drawRoundRect(ren, b.rect, r - 3, THEME.surfaceAlt, THEME.border);
+            /* Resting fill is surfaceAlt, which is also the colour of the track
+             * this cell sits on in the header, so a token-based hover moved the
+             * fill by 1.06:1 — invisible. THEME.hover is tuned for a cell on a
+             * white card and cannot serve both. A wash of the ink colour works
+             * on either background and in either mode (black in light, white in
+             * dark) and costs no legibility: the icon starts ~11:1 from the
+             * fill, so moving toward it still leaves well over AA. */
+            if (press)
+                fillRoundRect(ren, b.rect, r - 3, withAlpha(THEME.text, 0x2E));
+            else if (hot)
+                fillRoundRect(ren, b.rect, r - 3, withAlpha(THEME.text, 0x16));
+        }
+        if (b.glyph != GLYPH_NONE) {
+            /* Icon-only cell (the header switcher): the glyph is sized from the
+             * cell so a change to SEG_H carries through to the artwork. */
+            int gs = b.rect.h - 6;
+            if (gs < 14) gs = 14;
+            if (gs > 20) gs = 20;
+            drawGlyph(ren, b.glyph, b.rect.x + b.rect.w / 2,
+                      b.rect.y + b.rect.h / 2, gs, fg);
+        } else {
+            centred(fg);
+        }
+        break;
+    }
+
+    case BTN_V_CHIP_OK:
+    case BTN_V_CHIP_ACC: {
+        const bool ok = (b.variant == BTN_V_CHIP_OK);
+        fillRoundRect(ren, b.rect, r - 3, ok ? THEME.successTint : THEME.primaryTint);
+        wash(WHITE, 0x1F);                 /* light fill, dark label → lighten */
+        centred(ok ? THEME.onSuccessTint : THEME.onPrimaryTint);
+        break;
+    }
+
+    case BTN_V_PRIMARY: {
+        fillRoundRect(ren, b.rect, r,
+                      (hot || press) ? THEME.primaryHover : THEME.primary);
+        centred(THEME.onPrimary);
+        break;
+    }
+
+    case BTN_V_DANGER: {
+        fillRoundRect(ren, b.rect, r, DANGER_SOLID);
+        wash(BLACK, 0x1F);                 /* white label → darken */
+        centred(WHITE);
+        break;
+    }
+
+    case BTN_V_LINK: {
+        wash(THEME.danger, 0x14);
+        centred(THEME.danger);
+        break;
+    }
+
+    case BTN_V_SECONDARY:
+    default: {
+        drawRoundRect(ren, b.rect, r,
+                      press ? THEME.press : (hot ? THEME.hover : THEME.surfaceAlt),
+                      THEME.border);
+        centred(THEME.text);
+        break;
+    }
+    }
+}
+
+static void addButton(int x, int y, int w, int h, const std::string &label, int id,
+                      int variant = BTN_V_SECONDARY, int glyph = GLYPH_NONE,
+                      TTF_Font *font = nullptr)
+{
+    Button b;
+    b.rect    = SDL_Rect{x, y, w, h};
+    b.label   = label;
+    b.id      = id;
+    b.variant = variant;
+    b.glyph   = glyph;
+    b.font    = font;
+    g_buttons.push_back(b);
+}
+
+/** A selectable cell; 'on' fills it with the accent. Pass a glyph and leave
+ * 'label' empty for an icon-only cell (the header appearance switcher). */
+static void addChoice(int x, int y, int w, int h, const std::string &label,
+                      int id, bool on, TTF_Font *font = nullptr,
+                      int glyph = GLYPH_NONE)
+{
+    Button b;
+    b.rect    = SDL_Rect{x, y, w, h};
+    b.label   = label;
+    b.id      = id;
+    b.variant = BTN_V_CHOICE;
+    b.glyph   = glyph;
+    b.on      = on;
+    b.font    = font;
+    g_buttons.push_back(b);
+}
+
+/** A cell of the header appearance switcher: a BTN_V_CHOICE that paints no
+ * border of its own, because the track underneath already frames the three of
+ * them (see the framed flag in drawButton). */
+static void addSegment(int x, int y, int w, int h, int id, bool on, int glyph)
+{
+    addChoice(x, y, w, h, "", id, on, nullptr, glyph);
+    g_buttons.back().framed = false;
+}
+
+/** A nav-rail item; 'on' marks the active tab. */
+static void addNav(int y, const std::string &label, int id, int glyph, bool on)
+{
+    Button b;
+    b.rect    = SDL_Rect{NAV_ITEM_X, y, NAV_ITEM_W, NAV_ITEM_H};
+    b.label   = label;
+    b.id      = id;
+    b.variant = BTN_V_NAV;
+    b.glyph   = glyph;
+    b.on      = on;
+    g_buttons.push_back(b);
 }
 
 /* ── format helpers ──────────────────────────────────────────────────────── */
@@ -380,6 +1206,77 @@ static std::string relTime(long long ts)
     if (d < 86400) return std::to_string(d / 3600) + "小时前";
     if (d < 86400 * 30) return std::to_string(d / 86400) + "天前";
     return "很久以前";
+}
+
+/* ── update helpers ──────────────────────────────────────────────────────── */
+static bool updateIsIgnored(const UpdateInfo &ui)
+{
+    return ui.state == UpdateState::Available && !g_cfg.ignored_version.empty() &&
+           ui.remote_tag == g_cfg.ignored_version;
+}
+
+/** True while the header update button has something to say: a release is
+ * waiting (or ignored — then it stays away), it is being fetched, or it is on
+ * disk ready to install. A failed check/download does NOT resurrect it; that
+ * lives in the 更新 card, which is where the retry labels are. */
+static bool updateBadgeVisible(const UpdateInfo &ui)
+{
+    switch (ui.state) {
+    case UpdateState::Available:   return !updateIsIgnored(ui);
+    case UpdateState::Downloading:
+    case UpdateState::Downloaded:  return true;
+    default:                       return false;
+    }
+}
+
+/* One line for the update row; 'col' receives the matching colour. */
+static std::string updateStatusText(const UpdateInfo &ui, SDL_Color &col)
+{
+    switch (ui.state) {
+    case UpdateState::Checking:
+        col = THEME.textDim;
+        return "正在检查更新…";
+    case UpdateState::UpToDate:
+        col = THEME.success;
+        return "已是最新版本";
+    case UpdateState::Available:
+        col = THEME.success;
+        return "发现新版本 " + ui.remote_tag + (updateIsIgnored(ui) ? "·已忽略" : "");
+    case UpdateState::Downloading: {
+        col = THEME.text;
+        int p = updateProgress();
+        return (p >= 0) ? ("正在下载更新包… " + std::to_string(p) + "%")
+                        : "正在下载更新包…";
+    }
+    case UpdateState::Downloaded:
+        if (!ui.detail.empty()) {            /* the last hand-over failed */
+            col = THEME.danger;
+            return "启动安装程序失败，请重试";
+        }
+        col = THEME.success;
+        return "更新包已下载，点击「立即安装」";
+    case UpdateState::Failed:
+        col = THEME.danger;
+        return (ui.is_download ? "下载失败：" : "检查失败：") + updateErrorText(ui.detail);
+    case UpdateState::Idle:
+    default: {
+        col = THEME.textDim;
+        std::string s = "当前版本 v" MIVARA_VERSION;
+        if (g_cfg.last_update_check > 0)
+            s += " · 上次检查：" + relTime(g_cfg.last_update_check);
+        return s;
+    }
+    }
+}
+
+/* Right edge available to the status text: the leftmost button of the row
+ * depends on the state, and the strings are long on purpose. The text starts
+ * at BODY_X + 20 (180) and stops 16px short of the leftmost button. */
+static int updateTextMaxW(const UpdateInfo &ui)
+{
+    if (ui.state == UpdateState::Available) return 246;   /* 忽略此版本 at x=442 */
+    if (ui.state == UpdateState::Failed)    return 380;   /* 打开下载页 at x=576 */
+    return 514;                                           /* primary only (x=710) */
 }
 
 static std::string codecDisplay(const std::string &impl)
@@ -428,9 +1325,13 @@ static std::string truncateUtf8(const std::string &s, size_t maxChars)
 static std::string fitText(const std::string &s, TTF_Font *font, int maxW)
 {
     if (!font || s.empty() || maxW <= 0) return s;
+    /* 'maxW' is a layout width; the font is rasterised at the display scale, so
+     * every measurement below comes back in device pixels — compare like with
+     * like or a scaled build clips text that fits. */
+    const int limit = uiPx(maxW);
     int w = 0, h = 0;
     TTF_SizeUTF8(font, s.c_str(), &w, &h);
-    if (w <= maxW) return s;
+    if (w <= limit) return s;
     /* Shrink the plain string, measure "…" only for display. An earlier
      * version re-appended "…" to an already-ellipsized string each pass, so
      * t never shrank once it ended with "…" — an infinite loop (frozen GUI)
@@ -443,7 +1344,7 @@ static std::string fitText(const std::string &s, TTF_Font *font, int maxW)
         t = t.substr(0, end);
         std::string shown = t + "…";
         TTF_SizeUTF8(font, shown.c_str(), &w, &h);
-        if (w <= maxW) return shown;
+        if (w <= limit) return shown;
     }
     return "…";
 }
@@ -629,7 +1530,7 @@ static void openLogWindow()
     if (g_log_open) return;
     g_log_win = SDL_CreateWindow("Mivara 日志",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                 LOG_WIN_W, LOG_WIN_H, 0);
+                                 uiPx(LOG_WIN_W), uiPx(LOG_WIN_H), 0);
     if (!g_log_win) return;
     g_log_ren = SDL_CreateRenderer(g_log_win, -1,
                                    SDL_RENDERER_ACCELERATED |
@@ -639,6 +1540,8 @@ static void openLogWindow()
         g_log_win = nullptr;
         return;
     }
+    SDL_SetRenderDrawBlendMode(g_log_ren, SDL_BLENDMODE_BLEND);
+    SDL_RenderSetScale(g_log_ren, g_uiScale, g_uiScale);   /* logical layout */
     g_log_open = true;
     g_log_scroll = 0;
 }
@@ -675,7 +1578,11 @@ static void renderLogWindow()
     SDL_Rect bClear{LOG_WIN_W - 150, 8, 64, 28};
     SDL_Rect bClose{LOG_WIN_W - 78, 8, 64, 28};
     int mx = -1, my = -1;
-    if (SDL_GetMouseFocus() == g_log_win) SDL_GetMouseState(&mx, &my);
+    if (SDL_GetMouseFocus() == g_log_win) {
+        SDL_GetMouseState(&mx, &my);
+        mx = uiCoord(mx);              /* device pixels -> logical layout */
+        my = uiCoord(my);
+    }
     auto hover = [&](const SDL_Rect &r) {
         return mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h;
     };
@@ -978,9 +1885,21 @@ static std::wstring selfExePathW()
     return buf;
 }
 
+/* Fully-qualified System32 path for a system executable: CreateProcess with a
+ * bare name searches the current directory first, so a planted schtasks.exe in
+ * a user-writable working directory would run with this process's admin token. */
+static std::wstring sysExePath(const wchar_t *name)
+{
+    wchar_t dir[MAX_PATH] = {0};
+    if (!GetSystemDirectoryW(dir, MAX_PATH) || !dir[0])
+        return std::wstring();   /* fail closed: never fall back to a bare name */
+    return L"\"" + std::wstring(dir) + L"\\" + name + L"\"";
+}
+
 /* schtasks with CREATE_NO_WINDOW; waits for the exit code. */
 static bool runHiddenW(const std::wstring &cmd)
 {
+    if (cmd.empty()) return false;
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -1005,12 +1924,13 @@ static bool applyAutoStart(int enable)
     if (enable) {
         /* /tr value must contain an embedded quoted path (spaces in
          * "Program Files"), and /rl highest avoids a UAC prompt at logon. */
-        std::wstring cmd = L"schtasks.exe /create /tn \"Mivara\" /tr \"\\\"" +
+        std::wstring cmd = sysExePath(L"schtasks.exe") +
+                           L" /create /tn \"Mivara\" /tr \"\\\"" +
                            selfExePathW() +
                            L"\\\"\" /sc onlogon /rl highest /f";
         return runHiddenW(cmd);
     }
-    return runHiddenW(L"schtasks.exe /delete /tn \"Mivara\" /f");
+    return runHiddenW(sysExePath(L"schtasks.exe") + L" /delete /tn \"Mivara\" /f");
 #else
     (void)enable;
     return true; /* no-op outside Windows */
@@ -1155,54 +2075,96 @@ static void buildButtons()
 {
     g_buttons.clear();
 
-    /* left nav sidebar — present on every screen */
-    const NavTab tab = navTabForScreen(g_screen);
-    addButton(16, HEADER_H + 26, NAV_W - 32, 48, "主  页", BTN_NAV_HOME,
-              tab == NAV_HOME ? THEME.primary : THEME.press);
-    addButton(16, HEADER_H + 86, NAV_W - 32, 48, "设  置", BTN_NAV_SETTINGS,
-              tab == NAV_SETTINGS ? THEME.primary : THEME.press);
-    addButton(16, WIN_H - 76, NAV_W - 32, 48, "退  出", BTN_NAV_QUIT, THEME.press);
+    /* ── header: appearance switcher (on every screen) ───────────────────── */
+    {
+        /* sun / moon / monitor — the third cell is 跟随系统 */
+        static const int glyph[3] = {GLYPH_SUN, GLYPH_MOON, GLYPH_MONITOR};
+        static const int ids[3]   = {BTN_THEME_LIGHT, BTN_THEME_DARK,
+                                     BTN_THEME_SYSTEM};
+        static const ThemeMode modes[3] = {ThemeMode::Light, ThemeMode::Dark,
+                                           ThemeMode::System};
+        const ThemeMode m = themeMode();
+        for (int i = 0; i < 3; i++)
+            addSegment(SEG_CELL_X(i), SEG_Y + SEG_PAD, SEG_CELL_W, SEG_CELL_H,
+                       ids[i], m == modes[i], glyph[i]);
+    }
+
+    /* ── header: update button (on every screen, only while one is waiting) ─ */
+    {
+        UpdateInfo ui = updateGetInfo();
+        if (updateBadgeVisible(ui))
+            addButton(UPD_BTN_X, UPD_BTN_Y, UPD_BTN_W, UPD_BTN_H, "",
+                      BTN_HDR_UPDATE, BTN_V_GHOST);
+    }
+
+    /* ── nav rail (on every screen) ──────────────────────────────────────── */
+    {
+        const NavTab tab = navTabForScreen(g_screen);
+        addNav(NAV_HOME_Y, "主页", BTN_NAV_HOME,     GLYPH_MONITOR, tab == NAV_HOME);
+        addNav(NAV_SET_Y,  "设置", BTN_NAV_SETTINGS, GLYPH_SLIDERS, tab == NAV_SETTINGS);
+        addNav(NAV_QUIT_Y, "退出", BTN_NAV_QUIT,     GLYPH_POWER,   false);
+    }
 
     const int cx = CONTENT_CX;
     switch (g_screen) {
     case SCR_HOME: {
-        addButton(CONTENT_X + 40, 150, 280, 115, "接 收", BTN_HOME_RECEIVE, THEME.success);
-        addButton(CONTENT_X + 360, 150, 280, 115, "发 送", BTN_HOME_SEND, THEME.primary);
-        if (g_receiver.active)
-            addButton(CONTENT_X + 40, 270, 280, 38, "停止接收", BTN_HOME_RECEIVE_STOP, THEME.danger);
-        if (g_sender.active)
-            addButton(CONTENT_X + 360, 270, 280, 38, "停止发送", BTN_HOME_SENDER_STOP, THEME.danger);
-        /* connection history rows under the two cards */
-        int y = 376;
+        /* Update band first: it is the topmost control and the hit test is
+         * first-match-wins. */
+        {
+            UpdateInfo ui = updateGetInfo();
+            const bool av = (ui.state == UpdateState::Available && !updateIsIgnored(ui));
+            const bool dn = (ui.state == UpdateState::Downloaded);
+            if (av || dn)
+                addButton(BODY_X, HOME_BAND_Y, BODY_W, 36, "", BTN_UPD_NOTICE,
+                          BTN_V_GHOST);
+        }
+        /* Stop buttons BEFORE the cards: they are nested inside the card
+         * rect, so registering the card first would swallow every click. */
+        for (int i = 0; i < 2; i++) {
+            const bool active = (i == 0) ? g_receiver.active : g_sender.active;
+            if (!active) continue;
+            SDL_Rect s = rcHomeStop(i);
+            addButton(s.x, s.y, s.w, s.h, i == 0 ? "停止接收" : "停止发送",
+                      i == 0 ? BTN_HOME_RECEIVE_STOP : BTN_HOME_SENDER_STOP,
+                      BTN_V_DANGER);
+        }
+        for (int i = 0; i < 2; i++) {
+            const bool active = (i == 0) ? g_receiver.active : g_sender.active;
+            if (active) continue;          /* the stop button owns this card */
+            addButton(HOME_CARD_X(i), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H, "",
+                      i == 0 ? BTN_HOME_RECEIVE : BTN_HOME_SEND, BTN_V_GHOST);
+        }
+        /* connection history rows */
         for (int i = 0; i < HIST_VISIBLE; i++) {
-            int idx = i + g_hist_scroll;
+            const int idx = i + g_hist_scroll;
             if (idx >= (int)g_hist.size()) break;
-            int rowX = CONTENT_X + 30, rowW = CONTENT_W - 60;
-            int x3 = rowX + rowW - 72;          /* 删除 */
-            int x2 = x3 - 84;                   /* 扩展 */
-            int x1 = x2 - 84;                   /* 投屏 */
-            addButton(rowX, y, x1 - rowX - 10, 46, "", BTN_HIST_BASE + idx * 10, THEME.surface);
-            addButton(x1, y + 5, 76, 36, "投屏",
-                      BTN_HIST_BASE + idx * 10 + 1, THEME.success);
-            addButton(x2, y + 5, 76, 36, "扩展",
-                      BTN_HIST_BASE + idx * 10 + 2, THEME.primary);
-            addButton(x3, y + 5, 72, 36, "删除",
-                      BTN_HIST_BASE + idx * 10 + 3, THEME.danger);
-            y += 52;
+            SDL_Rect row = rcHistRow(i);
+            /* body click area stops short of the trailing buttons */
+            addButton(row.x, row.y, HIST_BTN_X - 8 - row.x, row.h, "",
+                      BTN_HIST_BASE + idx * 10, BTN_V_GHOST);
+            SDL_Rect b1 = rcHistBtn(i, 0);
+            SDL_Rect b2 = rcHistBtn(i, 1);
+            SDL_Rect b3 = rcHistBtn(i, 2);
+            addButton(b1.x, b1.y, b1.w, b1.h, "投屏", BTN_HIST_BASE + idx * 10 + 1,
+                      BTN_V_CHIP_OK);
+            addButton(b2.x, b2.y, b2.w, b2.h, "扩展", BTN_HIST_BASE + idx * 10 + 2,
+                      BTN_V_CHIP_ACC);
+            addButton(b3.x, b3.y, b3.w, b3.h, "删除", BTN_HIST_BASE + idx * 10 + 3,
+                      BTN_V_LINK);
         }
         if (!g_hist.empty())
-            addButton(CONTENT_X + CONTENT_W - 150, 340, 130, 34, "清空历史",
-                      BTN_HIST_CLEAR, THEME.danger);
+            addButton(BODY_R - 88, HIST_CARD_Y + 12, 88, 28, "清空", BTN_HIST_CLEAR,
+                      BTN_V_LINK);
         break;
     }
 
     case SCR_RECEIVING:
-        addButton(cx - 190, 490, 170, 52, "停止接收", BTN_RECV_STOP, THEME.danger);
-        addButton(cx + 20,  490, 170, 52, "日志", BTN_RECV_LOG, THEME.press);
+        addButton(cx - 178, 518, 170, 48, "停止接收", BTN_RECV_STOP, BTN_V_DANGER);
+        addButton(cx + 8,   518, 170, 48, "日志",     BTN_RECV_LOG,  BTN_V_SECONDARY);
         break;
 
     case SCR_SEARCHING:
-        addButton(cx - 90, 470, 180, 52, "取 消", BTN_SEARCH_CANCEL, THEME.press);
+        addButton(cx - 90, 480, 180, 48, "取 消", BTN_SEARCH_CANCEL, BTN_V_SECONDARY);
         break;
 
     case SCR_FOUND: {
@@ -1211,109 +2173,169 @@ static void buildButtons()
             std::lock_guard<std::mutex> lk(g_dev_mtx);
             n = g_devices.size();
         }
-        int y = 150;
-        for (size_t i = 0; i < n && i < 6; i++, y += 56) {
-            addButton(CONTENT_X + CONTENT_W - 230, y + 6, 100, 40, "投屏",
-                      BTN_DEV_BASE + (int)i * 10 + 1, THEME.success);
-            addButton(CONTENT_X + CONTENT_W - 120, y + 6, 100, 40, "扩展",
-                      BTN_DEV_BASE + (int)i * 10 + 2, THEME.primary);
+        for (size_t i = 0; i < n && i < 6; i++) {
+            const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
+            addButton(BODY_R - 220, y + 8, 100, 36, "投屏",
+                      BTN_DEV_BASE + (int)i * 10 + 1, BTN_V_CHIP_OK);
+            addButton(BODY_R - 112, y + 8, 100, 36, "扩展",
+                      BTN_DEV_BASE + (int)i * 10 + 2, BTN_V_CHIP_ACC);
         }
-        addButton(cx - 170, 510, 160, 48, "重新搜索", BTN_FOUND_RESEARCH, THEME.press);
-        addButton(cx + 10,  510, 160, 48, "手动输入ip", BTN_FOUND_MANUAL, THEME.press);
+        {
+            const int y = foundActionsY((int)n);
+            addButton(cx - 168, y, 160, 44, "重新搜索",   BTN_FOUND_RESEARCH, BTN_V_SECONDARY);
+            addButton(cx + 8,   y, 160, 44, "手动输入 ip", BTN_FOUND_MANUAL,  BTN_V_SECONDARY);
+        }
         break;
     }
 
     case SCR_NOT_FOUND:
-        addButton(cx - 320, 300, 200, 56, "继续搜索", BTN_NF_CONTINUE, THEME.success);
-        addButton(cx - 100, 300, 200, 56, "手动输入ip", BTN_NF_MANUAL, THEME.primary);
-        addButton(cx + 120, 300, 200, 56, "退 出", BTN_NF_QUIT, THEME.danger);
+        addButton(cx - 280, 484, 180, 52, "继续搜索",   BTN_NF_CONTINUE, BTN_V_PRIMARY);
+        addButton(cx - 90,  484, 180, 52, "手动输入 ip", BTN_NF_MANUAL,   BTN_V_SECONDARY);
+        addButton(cx + 100, 484, 180, 52, "退 出",      BTN_NF_QUIT,     BTN_V_SECONDARY);
         break;
 
     case SCR_MANUAL_IP:
-        addButton(cx - 180, 330, 160, 52, "连 接", BTN_MANUAL_CONNECT, THEME.success);
-        addButton(cx + 20,  330, 160, 52, "返 回", BTN_MANUAL_BACK, THEME.press);
+        addButton(cx - 168, 440, 160, 48, "连 接", BTN_MANUAL_CONNECT, BTN_V_PRIMARY);
+        addButton(cx + 8,   440, 160, 48, "返 回", BTN_MANUAL_BACK,    BTN_V_SECONDARY);
         break;
 
     case SCR_STREAMING:
-        addButton(cx - 190, 455, 170, 52, "停 止", BTN_STREAM_STOP, THEME.danger);
-        addButton(cx + 20,  455, 170, 52, "日志", BTN_STREAM_LOG, THEME.press);
+        addButton(cx - 178, 510, 170, 48, "停 止", BTN_STREAM_STOP, BTN_V_DANGER);
+        addButton(cx + 8,   510, 170, 48, "日志",  BTN_STREAM_LOG,  BTN_V_SECONDARY);
         break;
 
     case SCR_SETTINGS: {
+        /* codec: a 3x2 choice grid, not a segmented control — six cells at
+         * 93px do not fit on one row next to their label */
         const char *codecLabels[] = {"自动", "H.264", "H.265", "AV1", "原始", "RLE"};
         const char *codecIds[]    = {"auto", "h264", "h265", "av1", "raw", "rle"};
-        int segW = 90, segH = 32;
-        int right = CONTENT_X + CONTENT_W - 70;
-        int segX = right - segW * 6 - 4 * 5;
-        int y0 = 118, pitch = 40;
         for (int i = 0; i < 6; i++) {
-            bool on = (g_cfg_edit.codec == codecIds[i]);
-            addButton(segX + i * (segW + 4), y0, segW, segH,
+            const int col = i % 3, row = i / 3;
+            addChoice(SET_LC_X + col * 101, SET_GRID_Y0 + row * 36, 93, 32,
                       codecLabels[i], BTN_SET_CODEC_BASE + i,
-                      on ? THEME.primary : THEME.press);
+                      g_cfg_edit.codec == codecIds[i]);
         }
-        int y1 = y0 + pitch;
-        addButton(CONTENT_X + 20, y1, CONTENT_W - 40, 34, "", BTN_SET_HW, THEME.surface);
-        /* quality stepper */
-        int y2 = y1 + pitch;
-        addButton(right - 190, y2, 36, 32, "−", BTN_SET_QUALITY_DEC, THEME.press);
-        addButton(right - 36,  y2, 36, 32, "+", BTN_SET_QUALITY_INC, THEME.press);
-        /* fps stepper */
-        int y3 = y2 + pitch;
-        addButton(right - 190, y3, 36, 32, "−", BTN_SET_FPS_DEC, THEME.press);
-        addButton(right - 36,  y3, 36, 32, "+", BTN_SET_FPS_INC, THEME.press);
-        /* bitrate stepper */
-        int y4 = y3 + pitch;
-        addButton(right - 190, y4, 36, 32, "−", BTN_SET_BITRATE_DEC, THEME.press);
-        addButton(right - 36,  y4, 36, 32, "+", BTN_SET_BITRATE_INC, THEME.press);
-        /* scale segmented */
-        int y5 = y4 + pitch;
-        const char *scaleLabels[] = {"100%", "75%", "50%"};
+        /* steppers */
+        addButton(SET_MINUS_X, SET_ROW_Y(0), SET_STEP_W, 32, "−",
+                  BTN_SET_QUALITY_DEC, BTN_V_SECONDARY);
+        addButton(SET_ROW_R - SET_STEP_W, SET_ROW_Y(0), SET_STEP_W, 32, "+",
+                  BTN_SET_QUALITY_INC, BTN_V_SECONDARY);
+        addButton(SET_MINUS_X, SET_ROW_Y(1), SET_STEP_W, 32, "−",
+                  BTN_SET_FPS_DEC, BTN_V_SECONDARY);
+        addButton(SET_ROW_R - SET_STEP_W, SET_ROW_Y(1), SET_STEP_W, 32, "+",
+                  BTN_SET_FPS_INC, BTN_V_SECONDARY);
+        addButton(SET_MINUS_X, SET_ROW_Y(2), SET_STEP_W, 32, "−",
+                  BTN_SET_BITRATE_DEC, BTN_V_SECONDARY);
+        addButton(SET_ROW_R - SET_STEP_W, SET_ROW_Y(2), SET_STEP_W, 32, "+",
+                  BTN_SET_BITRATE_INC, BTN_V_SECONDARY);
+        /* scale + chroma choice rows */
         const int scaleVals[] = {100, 75, 50};
-        int scW = 88, scX = right - scW * 3 - 4 * 2;
-        for (int i = 0; i < 3; i++) {
-            bool on = (g_cfg_edit.scale_percent == scaleVals[i]);
-            addButton(scX + i * (scW + 4), y5, scW, 32,
+        const char *scaleLabels[] = {"100%", "75%", "50%"};
+        for (int i = 0; i < 3; i++)
+            addChoice(SET_ROW_R - 240 + i * 80, SET_ROW_Y(3), 80, 32,
                       scaleLabels[i], BTN_SET_SCALE_BASE + i,
-                      on ? THEME.primary : THEME.press);
-        }
-        /* chroma segmented */
-        int y6 = y5 + pitch;
-        const char *chromaLabels[] = {"4:2:0", "4:4:4"};
+                      g_cfg_edit.scale_percent == scaleVals[i]);
         const char *chromaIds[] = {"420", "444"};
-        int chW = 88, chX = right - chW * 2 - 4;
-        for (int i = 0; i < 2; i++) {
-            bool on = (g_cfg_edit.chroma == chromaIds[i]);
-            addButton(chX + i * (chW + 4), y6, chW, 32,
+        const char *chromaLabels[] = {"4:2:0", "4:4:4"};
+        for (int i = 0; i < 2; i++)
+            addChoice(SET_ROW_R - 160 + i * 80, SET_ROW_Y(4), 80, 32,
                       chromaLabels[i], BTN_SET_CHROMA_BASE + i,
-                      on ? THEME.primary : THEME.press);
-        }
-        int y7 = y6 + pitch;
-        addButton(CONTENT_X + 20, y7, CONTENT_W - 40, 34, "", BTN_SET_CONSOLE, THEME.surface);
-        int y8 = y7 + pitch;
-        addButton(CONTENT_X + 20, y8, CONTENT_W - 40, 34, "", BTN_SET_LOGWIN, THEME.surface);
-        int y9 = y8 + pitch;
-        addButton(CONTENT_X + 20, y9, CONTENT_W - 40, 34, "", BTN_SET_AUTOSTART, THEME.surface);
-        int y10 = y9 + pitch;
-        addButton(CONTENT_X + 20, y10, CONTENT_W - 40, 34, "", BTN_SET_AUTORECV, THEME.surface);
+                      g_cfg_edit.chroma == chromaIds[i]);
 
-        addButton(cx - 155, 630, 140, 48, "确 定", BTN_SET_OK, THEME.success);
-        addButton(cx + 15,  630, 140, 48, "恢复默认", BTN_SET_RESET, THEME.press);
+        /* 连接与启动 toggles */
+        const int tog[6] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
+                            BTN_SET_AUTOSTART, BTN_SET_AUTORECV, BTN_SET_AUTOCHECK};
+        for (int i = 0; i < 6; i++)
+            addButton(SET_RC_X, SET_TOGGLE_Y0 + i * 40, SET_COL_W - SET_PAD * 2, 32,
+                      "", tog[i], BTN_V_GHOST);
+
+        /* 外观 */
+        {
+            static const char *lbl[3] = {"亮色", "暗色", "跟随系统"};
+            const ThemeMode m = themeMode();
+            const ThemeMode modes[3] = {ThemeMode::Light, ThemeMode::Dark,
+                                        ThemeMode::System};
+            for (int i = 0; i < 3; i++)
+                addChoice(SET_RC_X + i * 101, SET_APPEAR_Y + 56, 93, 32,
+                          lbl[i], BTN_SET_THEME_BASE + i, m == modes[i]);
+        }
+
+        /* update card: three fixed slots so the hit targets never move */
+        {
+            const bool canDl = updateDownloadSupported();
+            UpdateInfo ui = updateGetInfo();
+            const int y = SET_UPD_Y + 44;
+            if (ui.state == UpdateState::Available)
+                addButton(442, y, 126, 32,
+                          updateIsIgnored(ui) ? "取消忽略" : "忽略此版本",
+                          BTN_SET_UPD_IGNORE, BTN_V_SECONDARY);
+            if (ui.state == UpdateState::Failed ||
+                (ui.state == UpdateState::Available && canDl))
+                addButton(576, y, 126, 32, "打开下载页", BTN_SET_UPD_PAGE,
+                          BTN_V_SECONDARY);
+            const char *lbl = "检查更新";
+            int id = BTN_SET_UPD_CHECK;
+            if (ui.state == UpdateState::Available) {
+                if (canDl) { lbl = "下载更新"; id = BTN_SET_UPD_DL; }
+                else       { lbl = "打开下载页"; id = BTN_SET_UPD_PAGE; }
+            } else if (ui.state == UpdateState::Downloading) {
+                lbl = "取消下载"; id = BTN_SET_UPD_CANCEL;
+            } else if (ui.state == UpdateState::Downloaded) {
+                lbl = "立即安装"; id = BTN_SET_UPD_INSTALL;
+            } else if (ui.state == UpdateState::Failed) {
+                lbl = "重试";
+                id = (ui.is_download && !ui.remote_tag.empty()) ? BTN_SET_UPD_DL
+                                                               : BTN_SET_UPD_CHECK;
+            }
+            addButton(710, y, 126, 32, lbl, id, BTN_V_PRIMARY);
+        }
+
+        addButton(cx - 168, SET_ACT_Y, 160, SET_ACT_H, "确 定", BTN_SET_OK,
+                  BTN_V_PRIMARY);
+        addButton(cx + 8,   SET_ACT_Y, 160, SET_ACT_H, "恢复默认", BTN_SET_RESET,
+                  BTN_V_SECONDARY);
         if (g_sender.active || g_receiver.active)
-            addButton(cx + 185, 630, 140, 48, "返回会话", BTN_RETURN_SESSION, THEME.press);
+            addButton(cx + 184, SET_ACT_Y, 160, SET_ACT_H, "返回会话",
+                      BTN_RETURN_SESSION, BTN_V_SECONDARY);
         break;
     }
     }
 }
 
 /* ── stat panel text ─────────────────────────────────────────────────────── */
+/* The sender reports the concrete encoder ("h264 (nvenc)", "h264_x264").
+ * codecDisplay() already put the friendly name on the line, so repeating the
+ * raw token reads as "H.264 (h264 (nvenc))" — keep only the distinguishing
+ * part. */
+static std::string codecDetail(const std::string &impl)
+{
+    if (impl.empty()) return "";
+    const size_t lp = impl.find('(');
+    if (lp != std::string::npos) {
+        const size_t rp = impl.rfind(')');
+        return (rp > lp + 1) ? impl.substr(lp + 1, rp - lp - 1)
+                             : impl.substr(lp + 1);
+    }
+    static const char *kNames[] = {"h264", "h265", "hevc", "av1", "raw", "rle"};
+    for (const char *n : kNames) {
+        const size_t len = std::strlen(n);
+        if (impl.size() < len || impl.compare(0, len, n) != 0) continue;
+        /* Bare codec token — raw/rle arrive exactly like this, so there is no
+         * separator to strip and nothing left to say: "原始 (raw)" is the very
+         * duplication this function exists to remove. */
+        if (impl.size() == len) return "";
+        if (impl[len] == ' ' || impl[len] == '_' || impl[len] == '-')
+            return impl.substr(len + 1);
+    }
+    return impl;
+}
+
 static std::string statLine1(const LiveStats &s)
 {
     std::string head = (g_child_label.empty() ? "会话" : g_child_label) + "中";
-    std::string cd = codecDisplay(s.codec);
-    std::string out = head + " · " + cd;
-    if (!s.codec.empty() && s.codec != "raw" && s.codec != "rle")
-        out += " (" + s.codec + ")";
+    std::string out = head + " · " + codecDisplay(s.codec);
+    const std::string detail = codecDetail(s.codec);
+    if (!detail.empty()) out += " (" + detail + ")";
     if (!s.fps.empty()) out += "   " + s.fps + " fps";
     if (!s.kbps.empty()) out += "   " + fmtMbps(s.kbps);
     return out;
@@ -1324,138 +2346,243 @@ static std::string statLine2(const LiveStats &s)
     std::string out;
     if (!s.src.empty() && !s.dst.empty()) out = s.src + "→" + s.dst;
     else if (!s.src.empty()) out = s.src;
-    if (!s.mode.empty()) out += (out.empty() ? "" : "   ") + s.mode;
+    if (!s.mode.empty()) {
+        /* the wire value is English; the rest of the UI is not */
+        const std::string m = (s.mode == "extend") ? "扩展"
+                            : (s.mode == "mirror") ? "投屏"
+                                                   : s.mode;
+        out += (out.empty() ? "" : "   ") + m;
+    }
     if (!s.quality.empty()) out += (out.empty() ? "" : "   ") + std::string("Q") + s.quality;
     return out;
 }
 
-static void drawStatPanel(SDL_Renderer *ren, int x, int y, int w, int h)
+static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
 {
     LiveStats s;
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         s = g_stats;
     }
-    SDL_Rect panel{x, y, w, h};
-    drawRoundRect(ren, panel, THEME.radius, THEME.surface, THEME.border);
+    drawCard(ren, card, CARD_R);
+    const int x = card.x + 20;
+    const int maxW = card.w - 40;
+    drawText(ren, "实时状态", x, card.y + 20, THEME.textDim, g_fontBS);
 
     if (!s.valid) {
-        drawText(ren, "等待统计数据…", x + 24, y + h / 2 - 10, THEME.textDim, g_fontS);
+        drawText(ren, "等待统计数据…", x, card.y + 54, THEME.textDim, g_font);
         return;
     }
     if (s.event == "error") {
-        drawText(ren, "错误" + (s.msg.empty() ? std::string("") : ": " + s.msg),
-                 x + 24, y + 18, THEME.danger, g_fontS);
+        drawText(ren, fitText("错误：" + s.msg, g_font, maxW), x, card.y + 54,
+                 THEME.danger, g_font);
         return;
     }
     if (s.event == "start" || s.event == "stop") {
-        drawText(ren, s.event == "start" ? "会话开始" : "会话结束",
-                 x + 24, y + 18, THEME.textDim, g_fontS);
+        drawText(ren, s.event == "start" ? "会话已开始" : "会话已结束",
+                 x, card.y + 54, THEME.text, g_font);
         return;
     }
-    drawText(ren, fitText(statLine1(s), g_fontS, w - 48), x + 24, y + 18,
-             THEME.text, g_fontS);
+    drawText(ren, fitText(statLine1(s), g_fontB, maxW), x, card.y + 54,
+             THEME.text, g_fontB);
     std::string l2 = statLine2(s);
     if (!l2.empty())
-        drawText(ren, fitText(l2, g_fontS, w - 48), x + 24, y + 52,
+        drawText(ren, fitText(l2, g_fontS, maxW), x, card.y + 94,
                  THEME.textDim, g_fontS);
 }
 
 /* ── screen rendering ────────────────────────────────────────────────────── */
+/* ── chrome ──────────────────────────────────────────────────────────────── */
+static void drawHeader()
+{
+    fillRoundRect(g_ren, SDL_Rect{0, 0, WIN_W, HEADER_H}, 0, THEME.surface);
+    drawHairline(g_ren, 0, HEADER_H - 1, WIN_W, 1, THEME.border);
+    drawGlyph(g_ren, GLYPH_MONITOR, HDR_GLYPH_CX, HEADER_H / 2, 22, THEME.primary);
+    drawTextV(g_ren, "Mivara 幻屏", HDR_WORD_X, HEADER_H / 2, THEME.text,
+              g_fontB, ALIGN_LEFT);
+    /* update button — ghost hit area, painted here because its fill encodes the
+     * update state: tinted while a release waits, green once it is on disk,
+     * with a progress bar under the glyph while it downloads. */
+    {
+        UpdateInfo ui = updateGetInfo();
+        if (updateBadgeVisible(ui)) {
+            const SDL_Rect r{UPD_BTN_X, UPD_BTN_Y, UPD_BTN_W, UPD_BTN_H};
+            const int rad = THEME.radius - 4;
+            const bool done = (ui.state == UpdateState::Downloaded);
+            fillRoundRect(g_ren, r, rad,
+                          done ? THEME.successTint : THEME.primaryTint);
+            if (g_hot == BTN_HDR_UPDATE || g_press == BTN_HDR_UPDATE)
+                fillRoundRect(g_ren, r, rad, withAlpha(WHITE, 0x1F));
+            drawGlyph(g_ren, GLYPH_UPDATE, r.x + r.w / 2, r.y + r.h / 2 - 2, 18,
+                      done ? THEME.onSuccessTint : THEME.onPrimaryTint);
+            if (ui.state == UpdateState::Downloading) {
+                int p = updateProgress();
+                p = (p < 0) ? 0 : (p > 100 ? 100 : p);
+                const SDL_Rect track{r.x + 5, r.y + r.h - 6, r.w - 10, 3};
+                fillRoundRect(g_ren, track, 1, THEME.surface);
+                if (p > 0) {
+                    SDL_Rect fill{track.x, track.y, track.w * p / 100, track.h};
+                    if (fill.w > 0) fillRoundRect(g_ren, fill, 1, THEME.primary);
+                }
+            }
+        }
+    }
+    /* appearance switcher: a track with three choice cells on top of it */
+    drawRoundRect(g_ren, SDL_Rect{SEG_X, SEG_Y, SEG_W, SEG_H}, THEME.radius,
+                  THEME.surfaceAlt, THEME.border);
+}
+
+static void drawNav()
+{
+    fillRoundRect(g_ren, SDL_Rect{0, HEADER_H, NAV_W, WIN_H - HEADER_H}, 0,
+                  THEME.surface);
+    drawHairline(g_ren, NAV_W - 1, HEADER_H, 1, WIN_H - HEADER_H, THEME.border);
+}
+
 static void renderScreen(int mousex, int mousey)
 {
     (void)mousex; (void)mousey;
-    SDL_SetRenderDrawColor(g_ren, THEME.bg.r, THEME.bg.g, THEME.bg.b, 255);
+    setColor(g_ren, THEME.bg);
     SDL_RenderClear(g_ren);
 
     const int cx = CONTENT_CX;
-
-    /* header (full width) */
-    SDL_Rect hdr{0, 0, WIN_W, HEADER_H};
-    SDL_SetRenderDrawColor(g_ren, THEME.surface.r, THEME.surface.g,
-                           THEME.surface.b, 255);
-    SDL_RenderFillRect(g_ren, &hdr);
-    drawText(g_ren, "Mivara  幻屏", WIN_W / 2, 18, THEME.text, g_fontL, true);
-
-    /* left nav sidebar */
-    SDL_Rect nav{0, HEADER_H, NAV_W, WIN_H - HEADER_H};
-    SDL_SetRenderDrawColor(g_ren, THEME.surface.r, THEME.surface.g,
-                           THEME.surface.b, 255);
-    SDL_RenderFillRect(g_ren, &nav);
-    SDL_SetRenderDrawColor(g_ren, THEME.border.r, THEME.border.g,
-                           THEME.border.b, 255);
-    SDL_RenderDrawLine(g_ren, NAV_W - 1, HEADER_H, NAV_W - 1, WIN_H);
+    drawHeader();
+    drawNav();
 
     switch (g_screen) {
     case SCR_HOME: {
-        drawText(g_ren, "零配置局域网投屏 / 无线扩展屏", cx, 112, THEME.textDim,
-                 g_font, true);
-        drawText(g_ren, "作为接收端，等待其他设备投屏", CONTENT_X + 180, 292,
-                 THEME.textDim, g_fontS, true);
-        drawText(g_ren, "搜索接收端并开始投屏", CONTENT_X + 500, 292,
-                 THEME.textDim, g_fontS, true);
-        drawText(g_ren, g_receiver.active ? "接收运行中" : "接收未运行",
-                 CONTENT_X + 180, 220, g_receiver.active ? THEME.success : THEME.textDim, g_fontS, true);
-        drawText(g_ren, g_sender.active ? (g_child_label + "运行中") : "发送未运行",
-                 CONTENT_X + 500, 220, g_sender.active ? THEME.success : THEME.textDim, g_fontS, true);
-        if (!g_status_note.empty())
-            drawText(g_ren, g_status_note, cx, 318, THEME.danger, g_font, true);
-        /* connection history under the two cards */
-        drawText(g_ren, "连接历史", CONTENT_X + 30, 344, THEME.text, g_font);
-        if (g_hist.empty()) {
-            drawText(g_ren, "暂无连接记录，成功连接一次后会自动出现在这里",
-                     cx, 440, THEME.textDim, g_font, true);
-        } else {
-            int y = 376;
-            for (int i = 0; i < HIST_VISIBLE; i++) {
-                int idx = i + g_hist_scroll;
-                if (idx >= (int)g_hist.size()) break;
-                const HistEntry &e = g_hist[idx];
-                SDL_Rect row{CONTENT_X + 30, y, CONTENT_W - 60, 46};
-                bool hov = (g_hot >= BTN_HIST_BASE + idx * 10 &&
-                            g_hot < BTN_HIST_BASE + idx * 10 + 4);
-                drawRoundRect(g_ren, row, THEME.radius,
-                              hov ? THEME.hover : THEME.surface, THEME.border);
-                std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 12);
-                std::string line = nm + " · " + e.ip + ":" +
-                                   std::to_string(e.port) + " · " +
-                                   (e.mode == "extend" ? "扩展" : "投屏") +
-                                   " · " + relTime(e.last_used_unix) +
-                                   " · ×" + std::to_string(e.use_count);
-                drawText(g_ren, fitText(line, g_fontS, 350), CONTENT_X + 50, y + 14,
-                         THEME.text, g_fontS);
-                y += 52;
+        /* update band (the ghost hit-area is added in buildButtons) */
+        {
+            UpdateInfo ui = updateGetInfo();
+            const bool av = (ui.state == UpdateState::Available && !updateIsIgnored(ui));
+            const bool dn = (ui.state == UpdateState::Downloaded);
+            if (av || dn) {
+                SDL_Rect r{BODY_X, HOME_BAND_Y, BODY_W, 36};
+                fillRoundRect(g_ren, r, THEME.radius,
+                              dn ? THEME.successTint : THEME.primaryTint);
+                if (g_hot == BTN_UPD_NOTICE || g_press == BTN_UPD_NOTICE)
+                    fillRoundRect(g_ren, r, THEME.radius, withAlpha(WHITE, 0x1F));
+                std::string msg = dn ? ("新版本 " + ui.remote_tag + " 已下载 · 前往设置安装")
+                                     : ("发现新版本 " + ui.remote_tag + " · 前往设置更新");
+                drawTextIn(g_ren, msg, r, dn ? THEME.onSuccessTint : THEME.onPrimaryTint,
+                           g_fontBS, ALIGN_CENTER);
             }
-            if ((int)g_hist.size() > HIST_VISIBLE) {
-                drawText(g_ren,
-                         "第 " + std::to_string(g_hist_scroll + 1) + "-" +
-                             std::to_string(std::min((int)g_hist.size(),
-                                                     g_hist_scroll + HIST_VISIBLE)) +
-                             " 条 / 共 " + std::to_string(g_hist.size()) + " 条  （滚轮翻页）",
-                         cx, 640, THEME.textDim, g_fontS, true);
+        }
+        drawText(g_ren, "零配置局域网投屏 · 无线扩展屏", BODY_X, HOME_TITLE_Y,
+                 THEME.textDim, g_font);
+        if (!g_status_note.empty())
+            drawTextV(g_ren, g_status_note, BODY_R, HOME_TITLE_Y + 10, THEME.danger,
+                      g_fontS, ALIGN_RIGHT);
+        drawText(g_ren, "快捷操作", BODY_X, HOME_CAPTION_Y, THEME.textDim, g_fontBS);
+
+        /* hero cards */
+        static const char *kTitle[2]   = {"接收", "发送"};
+        static const char *kCaption[2] = {"作为接收端，等待其他设备投屏",
+                                          "搜索接收端并开始投屏"};
+        static const int   kGlyph[2]   = {GLYPH_ARROW_DOWN, GLYPH_ARROW_UP};
+        for (int i = 0; i < 2; i++) {
+            const SDL_Rect card = rcHomeCard(i);
+            const bool active = (i == 0) ? g_receiver.active : g_sender.active;
+            drawCard(g_ren, card, CARD_R);
+
+            SDL_Rect tile{HOME_CARD_X(i) + 16, HOME_CARD_Y + 16, 40, 40};
+            fillRoundRect(g_ren, tile, 12,
+                          i == 0 ? THEME.successTint : THEME.primaryTint);
+            drawGlyph(g_ren, kGlyph[i], tile.x + 20, tile.y + 20, 20,
+                      i == 0 ? THEME.onSuccessTint : THEME.onPrimaryTint);
+
+            drawTextV(g_ren, kTitle[i], card.x + 72, card.y + 36, THEME.text,
+                      g_fontB, ALIGN_LEFT);
+            drawText(g_ren, kCaption[i], card.x + 16, card.y + 72, THEME.textDim,
+                     g_fontS);
+
+            const SDL_Rect chip = rcHomeChip(i);
+            fillRoundRect(g_ren, chip, chip.h / 2,
+                          active ? THEME.successTint : THEME.surfaceAlt);
+            drawTextIn(g_ren,
+                       active ? (i == 0 ? "接收中" : "发送中") : "未运行",
+                       chip, active ? THEME.onSuccessTint : THEME.textDim,
+                       g_fontS, ALIGN_CENTER);
+        }
+
+        /* connection history — the card shrinks when there is nothing to list,
+         * otherwise the empty state is a 288px box with one line in it */
+        {
+            const SDL_Rect card{BODY_X, HIST_CARD_Y, BODY_W,
+                                g_hist.empty() ? HIST_CARD_H_EMPTY : HIST_CARD_H};
+            drawCard(g_ren, card, CARD_R);
+            drawText(g_ren, "连接历史", card.x + 16, card.y + 16, THEME.text,
+                     g_fontBS);
+            if (g_hist.empty()) {
+                drawTextIn(g_ren, "暂无连接记录 · 成功连接一次后会自动出现在这里",
+                           card, THEME.textDim, g_font, ALIGN_CENTER);
+            } else {
+                for (int i = 0; i < HIST_VISIBLE; i++) {
+                    const int idx = i + g_hist_scroll;
+                    if (idx >= (int)g_hist.size()) break;
+                    const HistEntry &e = g_hist[idx];
+                    const SDL_Rect row = rcHistRow(i);
+                    if (g_hot >= BTN_HIST_BASE + idx * 10 &&
+                        g_hot < BTN_HIST_BASE + idx * 10 + 4)
+                        fillRoundRect(g_ren, row, THEME.radius, THEME.hover);
+                    if (idx + 1 < (int)g_hist.size())
+                        drawHairline(g_ren, row.x, row.y + row.h, row.w, 1,
+                                     THEME.border);
+
+                    std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 10);
+                    drawText(g_ren, fitText(nm, g_fontS, 440), row.x + 12, row.y + 5,
+                             THEME.text, g_fontS);
+                    std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
+                                      (e.mode == "extend" ? "扩展" : "投屏") + " · " +
+                                      relTime(e.last_used_unix) + " · ×" +
+                                      std::to_string(e.use_count);
+                    drawText(g_ren, fitText(sub, g_fontS, 440), row.x + 12, row.y + 23,
+                             THEME.textDim, g_fontS);
+                }
+                if ((int)g_hist.size() > HIST_VISIBLE) {
+                    std::string pg = "第 " + std::to_string(g_hist_scroll + 1) + "–" +
+                                     std::to_string(std::min((int)g_hist.size(),
+                                                             g_hist_scroll + HIST_VISIBLE)) +
+                                     " 条 / 共 " + std::to_string(g_hist.size()) +
+                                     " 条 · 滚轮翻页";
+                    drawTextV(g_ren, pg, BODY_R, HIST_PAGER_Y, THEME.textDim,
+                              g_fontS, ALIGN_RIGHT);
+                }
             }
         }
         break;
     }
 
     case SCR_RECEIVING: {
-        drawText(g_ren, "正在接收", cx, 110, THEME.success, g_fontL, true);
         std::string ip = getLocalIPAddress();
-        drawText(g_ren, "本机 IP：  " + ip, cx, 190, THEME.text, g_font, true);
-        drawText(g_ren, "视频端口：8081      计算端口：8082      端口服务：8083",
-                 cx, 236, THEME.textDim, g_font, true);
-        drawText(g_ren, "发现服务：UDP 1900", cx, 274, THEME.textDim, g_font, true);
-        drawText(g_ren, "状态：等待发送端连接…", cx, 330, THEME.text, g_font, true);
-        drawText(g_ren, "发送端可运行  sender " + ip, cx, 376, THEME.textDim,
+        drawText(g_ren, "正在接收", cx, 162, THEME.success, g_fontL, true);
+        drawText(g_ren, "其他设备搜索到本机后即可开始投屏", cx, 210, THEME.textDim,
                  g_font, true);
+
+        const SDL_Rect card{BODY_X, 246, BODY_W, 256};
+        drawCard(g_ren, card, CARD_R);
+        const int lx = card.x + 20;
+        drawText(g_ren, "本机 IP", lx, card.y + 24, THEME.textDim, g_fontS);
+        drawText(g_ren, ip, lx, card.y + 48, THEME.text, g_fontB);
+        drawText(g_ren, "视频端口 8081    ·    计算端口 8082    ·    端口服务 8083    ·    发现服务 UDP 1900",
+                 lx, card.y + 96, THEME.textDim, g_fontS);
+        drawHairline(g_ren, lx, card.y + 132, card.w - 40, 1, THEME.border);
+        drawText(g_ren, "状态：等待发送端连接…", lx, card.y + 150, THEME.text, g_font);
+        drawText(g_ren, "也可在发送端执行  sender " + ip, lx, card.y + 186,
+                 THEME.textDim, g_fontS);
         break;
     }
 
     case SCR_SEARCHING: {
-        int dots = ((int)(SDL_GetTicks() / 400)) % 4;
-        drawText(g_ren, "搜索中" + std::string(dots, '.'), cx, 220, THEME.text,
+        /* radar mark: two rings plus a solid centre */
+        drawRing(g_ren, cx, 290, 56, THEME.accentSoft);
+        drawRing(g_ren, cx, 290, 38, THEME.accentSoft);
+        setColor(g_ren, THEME.accent);
+        fillCircle(g_ren, cx, 290, 9);
+        const int dots = ((int)(SDL_GetTicks() / 400)) % 4;
+        drawText(g_ren, "搜索中" + std::string(dots, '.'), cx, 370, THEME.text,
                  g_fontL, true);
-        drawText(g_ren, "正在通过 SSDP 查找局域网内的接收端", cx, 290,
+        drawText(g_ren, "正在通过 SSDP 查找局域网内的接收端", cx, 420,
                  THEME.textDim, g_font, true);
         break;
     }
@@ -1466,115 +2593,201 @@ static void renderScreen(int mousex, int mousey)
             std::lock_guard<std::mutex> lk(g_dev_mtx);
             devs = g_devices;
         }
-        drawText(g_ren, "发现 " + std::to_string(devs.size()) + " 台设备",
-                 cx, 88, THEME.text, g_fontL, true);
-        int y = 150;
-        for (size_t i = 0; i < devs.size() && i < 6; i++, y += 56) {
-            SDL_Rect row{CONTENT_X + 30, y, CONTENT_W - 60, 52};
-            drawRoundRect(g_ren, row, THEME.radius, THEME.surface, THEME.border);
+        drawText(g_ren, "发现 " + std::to_string(devs.size()) + " 台设备", BODY_X,
+                 TITLE_Y, THEME.text, g_fontB);
+        drawTextV(g_ren, "选择投屏或扩展", BODY_R, TITLE_Y + 12, THEME.textDim,
+                  g_fontS, ALIGN_RIGHT);
+        for (size_t i = 0; i < devs.size() && i < 6; i++) {
+            const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
+            const SDL_Rect row{BODY_X, y, BODY_W, FOUND_ROW_H};
+            /* border, not a shadow: consecutive rows are only 8px apart and
+             * the 12px shadow of one landed on top of the next */
+            drawRoundRect(g_ren, row, THEME.radiusCard - 4, THEME.surface,
+                          THEME.border);
             std::string label = devs[i].name.empty()
                                     ? devs[i].toString()
                                     : truncateUtf8(devs[i].name, 12) + "  ·  " +
                                           devs[i].toString();
-            drawText(g_ren, fitText(label, g_fontS, 360), CONTENT_X + 55, y + 17,
-                     THEME.text, g_fontS);
+            drawTextIn(g_ren, fitText(label, g_font, BODY_R - 240 - BODY_X - 20),
+                       row, THEME.text, g_font, ALIGN_LEFT, 20);
         }
         if (devs.size() > 6)
-            drawText(g_ren, "仅显示前 6 台", cx, y + 8, THEME.textDim, g_font, true);
+            drawText(g_ren, "仅显示前 6 台", BODY_X, FOUND_ACTIONS_MAX_Y - 22,
+                     THEME.textDim, g_fontS);
         break;
     }
 
-    case SCR_NOT_FOUND:
-        drawText(g_ren, "未找到可用设备", cx, 180, THEME.text, g_fontL, true);
-        drawText(g_ren, "请确认接收端已启动，且两台机器在同一局域网",
-                 cx, 240, THEME.textDim, g_font, true);
+    case SCR_NOT_FOUND: {
+        glyphWarning(g_ren, cx, 270, 64, THEME.warning, THEME.bg);
+        drawText(g_ren, "未找到可用设备", cx, 328, THEME.text, g_fontL, true);
+        drawText(g_ren, "请确认接收端已启动，且两台机器在同一局域网", cx, 376,
+                 THEME.textDim, g_font, true);
         if (!g_status_note.empty())
-            drawText(g_ren, g_status_note, cx, 410, THEME.danger, g_font, true);
+            drawText(g_ren, g_status_note, cx, 428, THEME.danger, g_font, true);
         break;
+    }
 
-    case SCR_MANUAL_IP:
-        drawText(g_ren, "手动输入接收端 IP", cx, 140, THEME.text, g_fontL, true);
-        {
-            SDL_Rect box{cx - 200, 220, 400, 60};
-            drawRoundRect(g_ren, box, THEME.radius, THEME.inputBg, THEME.primary);
-            std::string shown = g_manual_ip.empty() ? "例如 192.168.1.105" : g_manual_ip;
-            SDL_Color c = g_manual_ip.empty() ? THEME.textDim : THEME.text;
-            drawText(g_ren, shown, cx, 238, c, g_font, true);
-        }
+    case SCR_MANUAL_IP: {
+        drawText(g_ren, "手动输入接收端 IP", cx, 230, THEME.text, g_fontL, true);
+        drawText(g_ren, "在接收端的主页可以看到它的本机 IP", cx, 278, THEME.textDim,
+                 g_font, true);
+        const SDL_Rect box{cx - 200, 312, 400, 60};
+        /* surface, not inputBg: on the light palette inputBg IS the page colour,
+         * so the field had no fill of its own — only a border. */
+        drawRoundRect(g_ren, box, THEME.radius, THEME.surface,
+                      g_status_note.empty() ? THEME.border : THEME.danger);
+        const bool empty = g_manual_ip.empty();
+        drawTextIn(g_ren, empty ? "例如 192.168.1.105" : g_manual_ip, box,
+                   empty ? THEME.textDim : THEME.text, g_font, ALIGN_CENTER);
         if (!g_status_note.empty())
-            drawText(g_ren, g_status_note, cx, 420, THEME.danger, g_font, true);
+            drawText(g_ren, g_status_note, cx, 396, THEME.danger, g_font, true);
         break;
+    }
 
     case SCR_STREAMING:
-        drawText(g_ren, "正在" + g_child_label, cx, 110, THEME.success, g_fontL, true);
-        drawText(g_ren, g_status_note, cx, 175, THEME.text, g_font, true);
-        drawText(g_ren, "推流中… 关闭请点下方按钮", cx, 215, THEME.textDim,
-                 g_font, true);
-        drawText(g_ren, "实时状态", CONTENT_X + 50, 268, THEME.textDim, g_fontS);
-        drawStatPanel(g_ren, CONTENT_X + 30, 292, CONTENT_W - 60, 120);
+        drawText(g_ren, "正在" + g_child_label, cx, 200, THEME.success, g_fontL, true);
+        if (!g_status_note.empty())
+            drawText(g_ren, g_status_note, cx, 258, THEME.text, g_font, true);
+        drawText(g_ren, "会话进行中 · 关闭窗口不会中断，请点下方按钮结束", cx, 290,
+                 THEME.textDim, g_fontS, true);
+        drawStatPanel(g_ren, SDL_Rect{BODY_X, 330, BODY_W, 148});
         break;
 
     case SCR_SETTINGS: {
-        drawText(g_ren, "设 置", cx, 76, THEME.text, g_fontL, true);
-        const int y0 = 118, pitch = 40;
-        const int lblX = CONTENT_X + 30;
-        const int right = CONTENT_X + CONTENT_W - 70;
-        /* labels */
-        drawText(g_ren, "编码", lblX, y0 + 6, THEME.text, g_font);
-        drawText(g_ren, "画质 (CRF)", lblX, y0 + pitch * 2 + 6, THEME.text, g_font);
-        drawText(g_ren, "帧率上限", lblX, y0 + pitch * 3 + 6, THEME.text, g_font);
-        drawText(g_ren, "码率", lblX, y0 + pitch * 4 + 6, THEME.text, g_font);
-        drawText(g_ren, "缩放", lblX, y0 + pitch * 5 + 6, THEME.text, g_font);
-        drawText(g_ren, "色度", lblX, y0 + pitch * 6 + 6, THEME.text, g_font);
+        drawText(g_ren, "设 置", BODY_X, TITLE_Y, THEME.text, g_fontB);
+        drawTextV(g_ren, "修改后点「确定」保存到 config.ini", BODY_R, TITLE_Y + 12,
+                  THEME.textDim, g_fontS, ALIGN_RIGHT);
 
-        /* value boxes between stepper buttons */
-        auto valueBox = [&](int y, const std::string &val) {
-            SDL_Rect box{right - 150, y, 110, 32};
-            drawRoundRect(g_ren, box, 6, THEME.inputBg, THEME.border);
-            drawText(g_ren, val, box.x + box.w / 2, box.y + 7, THEME.text,
-                     g_fontS, true);
-        };
-        valueBox(y0 + pitch * 2, std::to_string(g_cfg_edit.quality));
-        valueBox(y0 + pitch * 3, std::to_string(g_cfg_edit.fps_limit) + " fps");
-        valueBox(y0 + pitch * 4,
-                 g_cfg_edit.bitrate_kbps == 0
-                     ? "质量模式"
-                     : std::to_string(g_cfg_edit.bitrate_kbps) + " kbps");
+        /* ── left column: 画质与编码 ────────────────────────────────────── */
+        {
+            const SDL_Rect card{SET_COL_L, SET_CARD_Y, SET_COL_W, SET_L_H};
+            drawCard(g_ren, card, CARD_R);
+            drawText(g_ren, "画质与编码", SET_LC_X, card.y + 20, THEME.textDim,
+                     g_fontBS);
+            drawText(g_ren, "编码", SET_LC_X, SET_CODEC_LABEL_Y, THEME.text, g_font);
 
-        /* toggle rows (ghost hit-areas) */
-        auto toggleRow = [&](int id, int y, const char *label, bool on) {
-            SDL_Rect row{CONTENT_X + 20, y, CONTENT_W - 40, 34};
-            bool hov = (g_hot == id || g_press == id);
-            drawRoundRect(g_ren, row, THEME.radius,
-                          hov ? THEME.hover : THEME.surface, THEME.border);
-            drawText(g_ren, label, row.x + 18, y + 6, THEME.text, g_font);
-            SDL_Rect pill{row.x + row.w - 70, y + 6, 56, 22};
-            SDL_Color pc = on ? THEME.success : THEME.inputBg;
-            fillRoundRect(g_ren, pill, 11, pc);
-            fillCircle(g_ren, on ? (pill.x + pill.w - 11) : (pill.x + 11),
-                       pill.y + 11, 9);
-        };
-        toggleRow(BTN_SET_HW, y0 + pitch, "硬件加速", g_cfg_edit.hw_accel != 0);
-        toggleRow(BTN_SET_CONSOLE, y0 + pitch * 7, "状态控制台",
-                  g_cfg_edit.show_status_console != 0);
-        toggleRow(BTN_SET_LOGWIN, y0 + pitch * 8, "日志窗口",
-                  g_cfg_edit.show_log_window != 0);
-        toggleRow(BTN_SET_AUTOSTART, y0 + pitch * 9, "开机自启动",
-                  g_cfg_edit.auto_start != 0);
-        toggleRow(BTN_SET_AUTORECV, y0 + pitch * 10, "自动接收",
-                  g_cfg_edit.auto_receive != 0);
+            std::string vQ = std::to_string(g_cfg_edit.quality);
+            std::string vF = std::to_string(g_cfg_edit.fps_limit) + " fps";
+            std::string vB = (g_cfg_edit.bitrate_kbps == 0)
+                                 ? std::string("质量模式")
+                                 : std::to_string(g_cfg_edit.bitrate_kbps) + " kbps";
+            static const char *kRow[5] = {"画质 (CRF)", "帧率上限", "码率", "缩放",
+                                          "色度"};
+            for (int i = 0; i < 5; i++)
+                drawTextV(g_ren, kRow[i], SET_LC_X, SET_ROW_Y(i) + 16, THEME.text,
+                          g_font, ALIGN_LEFT);
+            const std::string *vals[3] = {&vQ, &vF, &vB};
+            for (int i = 0; i < 3; i++) {
+                const SDL_Rect box{SET_VAL_X, SET_ROW_Y(i), SET_VAL_W, 32};
+                fillRoundRect(g_ren, box, THEME.radius - 3, THEME.surfaceAlt);
+                drawTextIn(g_ren, *vals[i], box, THEME.text, g_fontS, ALIGN_CENTER);
+            }
+        }
 
-        drawText(g_ren, "所有设置保存到 config.ini，通过命令行传给子进程",
-                 cx, 580, THEME.textDim, g_fontS, true);
+        /* ── right column: 连接与启动 ───────────────────────────────────── */
+        {
+            const SDL_Rect card{SET_COL_R, SET_CARD_Y, SET_COL_W, SET_R_H};
+            drawCard(g_ren, card, CARD_R);
+            drawText(g_ren, "连接与启动", SET_RC_X, card.y + 20, THEME.textDim,
+                     g_fontBS);
+            static const char *kToggle[6] = {"硬件加速", "状态控制台", "日志窗口",
+                                             "开机自启动", "自动接收", "自动检查更新"};
+            const bool on[6] = {g_cfg_edit.hw_accel != 0,
+                                g_cfg_edit.show_status_console != 0,
+                                g_cfg_edit.show_log_window != 0,
+                                g_cfg_edit.auto_start != 0,
+                                g_cfg_edit.auto_receive != 0,
+                                g_cfg_edit.auto_check_update != 0};
+            const int id[6] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
+                               BTN_SET_AUTOSTART, BTN_SET_AUTORECV,
+                               BTN_SET_AUTOCHECK};
+            for (int i = 0; i < 6; i++) {
+                const int y = SET_TOGGLE_Y0 + i * 40;
+                const SDL_Rect row{SET_RC_X, y, SET_COL_W - SET_PAD * 2, 32};
+                if (g_hot == id[i] || g_press == id[i])
+                    fillRoundRect(g_ren, row, THEME.radius - 3, THEME.hover);
+                drawTextV(g_ren, kToggle[i], row.x, y + 16, THEME.text, g_font,
+                          ALIGN_LEFT);
+                drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
+            }
+        }
+
+        /* ── right column: 外观 ─────────────────────────────────────────── */
+        {
+            const SDL_Rect card{SET_COL_R, SET_APPEAR_Y, SET_COL_W, SET_APPEAR_H};
+            drawCard(g_ren, card, CARD_R);
+            drawText(g_ren, "外观", SET_RC_X, card.y + 20, THEME.textDim, g_fontBS);
+            /* the three cells are painted by drawButton (BTN_V_CHOICE) */
+        }
+
+        /* ── 更新 (full width) ──────────────────────────────────────────── */
+        {
+            const SDL_Rect card{BODY_X, SET_UPD_Y, BODY_W, SET_UPD_H};
+            drawCard(g_ren, card, CARD_R);
+            drawText(g_ren, "软件更新", card.x + 20, card.y + 14, THEME.textDim,
+                     g_fontBS);
+            UpdateInfo ui = updateGetInfo();
+            SDL_Color col = THEME.textDim;
+            std::string txt = updateStatusText(ui, col);
+            drawText(g_ren, fitText(txt, g_fontS, updateTextMaxW(ui)),
+                     card.x + 20, card.y + 40, col, g_fontS);
+            if (ui.state == UpdateState::Downloading) {
+                int p = updateProgress();
+                p = p < 0 ? 0 : (p > 100 ? 100 : p);
+                const SDL_Rect bar{card.x + 20, card.y + 66, 240, 5};
+                fillRoundRect(g_ren, bar, 2, THEME.surfaceAlt);
+                if (p > 0) {
+                    const SDL_Rect fill{bar.x, bar.y, bar.w * p / 100, bar.h};
+                    fillRoundRect(g_ren, fill, 2, THEME.primary);
+                }
+            }
+        }
+
+        /* ── 确定 / 恢复默认 / 返回会话 ─────────────────────────────────── */
         break;
     }
     }
 
     for (auto &b : g_buttons) drawButton(g_ren, b);
+
+    /* dot on the 设置 nav item while an update is pending */
+    {
+        UpdateInfo ui = updateGetInfo();
+        const bool dot = (ui.state == UpdateState::Downloaded) ||
+                         (ui.state == UpdateState::Available && !updateIsIgnored(ui));
+        if (dot) {
+            setColor(g_ren, ui.state == UpdateState::Downloaded ? THEME.success
+                                                                : THEME.danger);
+            fillCircle(g_ren, NAV_ITEM_X + NAV_ITEM_W - 8, NAV_SET_Y + 22, 5);
+        }
+    }
     SDL_RenderPresent(g_ren);
 }
 
 /* ── button actions ──────────────────────────────────────────────────────── */
+/** Hand the verified installer over to Setup and quit on success.
+ * Launch FIRST and quit only on success: if the hand-over fails the user keeps
+ * the running session and simply clicks 立即安装 again. On success the normal
+ * exit path is what stops the children (the Ctrl+C path detaches the virtual
+ * display) while Setup shows its wizard, so app.exe is released before Setup
+ * replaces it. */
+static void startInstall()
+{
+    UpdateInfo ui = updateGetInfo();
+    if (ui.state != UpdateState::Downloaded) return;
+    if (g_upd_installing) return;                /* one hand-over, ever */
+    g_upd_installing = true;
+    if (updateLaunchInstaller()) {
+        logPush("[gui] 已启动安装程序，Mivara 退出");
+        SDL_Event q;
+        q.type = SDL_QUIT;
+        SDL_PushEvent(&q);
+    } else {
+        logPush("[gui] 启动安装程序失败");
+        g_upd_installing = false;                /* allow a retry */
+    }
+}
+
 static void onButton(int id)
 {
     if (id >= BTN_SET_CODEC_BASE && id < BTN_SET_CODEC_BASE + 6) {
@@ -1592,6 +2805,19 @@ static void onButton(int id)
         g_cfg_edit.chroma = vals[id - BTN_SET_CHROMA_BASE];
         return;
     }
+    /* appearance: the header switcher and the 外观 card both land here */
+    for (int i = 0; i < kThemeIdCount; i++) {
+        if (kThemeIds[i].id != id) continue;
+        const ThemeMode picked = kThemeIds[i].mode;
+        themeSetMode(picked);
+        /* Persist immediately: the header switcher is available on every
+         * screen, so requiring 确定 would make it look broken on the others.
+         * This mirrors 日志窗口 / 忽略此版本, the other instant side effects. */
+        g_cfg.theme = themeModeKey(picked);
+        g_cfg_edit.theme = g_cfg.theme;
+        configSave(g_cfg);
+        return;
+    }
 
     switch (id) {
     case BTN_NAV_HOME:
@@ -1601,7 +2827,11 @@ static void onButton(int id)
         g_screen = resolveHomeScreen();
         break;
     case BTN_NAV_SETTINGS:
-        openSettings();
+        /* Only re-snapshot when arriving from another screen. openSettings()
+         * does g_cfg_edit = g_cfg, so re-clicking the tab that is already open
+         * used to throw away every pending edit with no visible cause — the
+         * 画质 box just snapped back to its saved value. */
+        if (g_screen != SCR_SETTINGS) openSettings();
         break;
     case BTN_NAV_QUIT: {
         SDL_Event e; e.type = SDL_QUIT; SDL_PushEvent(&e);
@@ -1727,10 +2957,74 @@ static void onButton(int id)
     case BTN_SET_AUTORECV:
         g_cfg_edit.auto_receive = !g_cfg_edit.auto_receive;
         break;
+    case BTN_SET_AUTOCHECK:
+        g_cfg_edit.auto_check_update = !g_cfg_edit.auto_check_update;
+        break;
+    case BTN_SET_UPD_IGNORE: {
+        UpdateInfo ui = updateGetInfo();
+        if (ui.state == UpdateState::Available) {
+            if (updateIsIgnored(ui)) {
+                g_cfg.ignored_version.clear();
+                logPush("[gui] 已取消忽略 " + ui.remote_tag);
+            } else {
+                g_cfg.ignored_version = ui.remote_tag;
+                logPush("[gui] 已忽略版本 " + ui.remote_tag);
+            }
+            configSave(g_cfg);   /* immediate side effect (cf. BTN_SET_LOGWIN) */
+        }
+        break;
+    }
+    case BTN_SET_UPD_CHECK:
+        updateCheckStart();          /* no-op while a check/download is running */
+        break;
+    case BTN_SET_UPD_DL:
+        updateDownloadStart();       /* Available, or 重试 after a failed download */
+        break;
+    case BTN_SET_UPD_CANCEL:
+        updateDownloadCancel();
+        break;
+    case BTN_SET_UPD_INSTALL:
+        startInstall();
+        break;
+    case BTN_SET_UPD_PAGE:
+        if (!updateOpenReleasePage()) logPush("[gui] 打开浏览器失败");
+        break;
+    case BTN_UPD_NOTICE:
+        openSettings();
+        break;
+    case BTN_HDR_UPDATE: {
+        UpdateInfo ui = updateGetInfo();
+        if (ui.state == UpdateState::Available) {
+            if (!updateDownloadSupported()) {    /* POSIX: browser hand-off only */
+                if (!updateOpenReleasePage()) logPush("[gui] 打开浏览器失败");
+                break;
+            }
+            /* One click buys the whole run: download, then hand over to Setup
+             * as soon as it verifies. Only a live session stops it — quitting
+             * would kill that session — and then the button just turns green
+             * and waits for a second click. */
+            if (updateDownloadStart()) {
+                g_upd_auto_install = true;
+                logPush("[gui] 开始下载更新 " + ui.remote_tag);
+            }
+        } else if (ui.state == UpdateState::Downloaded) {
+            startInstall();
+        }
+        /* Downloading: deliberately inert — a stray click must not cancel a
+         * download that is already running (取消下载 lives in the 更新 card). */
+        break;
+    }
     case BTN_SET_OK: {
         const int want = g_cfg_edit.auto_start ? 1 : 0;
         const int had = g_cfg.auto_start ? 1 : 0;
+        /* Update metadata is runtime state, not a user setting: preserve it
+         * across the working-copy commit (else the 24h throttle and the
+         * ignored-version filter would be silently reset on every 确定). */
+        const long long   keep_last = g_cfg.last_update_check;
+        const std::string keep_ign  = g_cfg.ignored_version;
         g_cfg = g_cfg_edit;
+        g_cfg.last_update_check = keep_last;
+        g_cfg.ignored_version   = keep_ign;
         configSave(g_cfg);
         /* Re-register whenever auto_start is on so a moved exe path stays
          * current; drop the task when it was just switched off. */
@@ -1773,7 +3067,12 @@ static void onButton(int id)
         break;
     }
     case BTN_SET_RESET:
-        g_cfg_edit = AppConfig{};
+        g_cfg_edit = AppConfig{};          /* theme defaults to "system" */
+        /* The appearance applies instantly everywhere else (header switcher),
+         * so applying it here too keeps 恢复默认 from looking half-done. */
+        themeSetMode(ThemeMode::System);
+        g_cfg.theme = "system";
+        configSave(g_cfg);
         break;
 
     case BTN_HIST_CLEAR:
@@ -1839,10 +3138,42 @@ int main(int argc, char *argv[])
         SDL_Quit();
         return 1;
     }
-    g_font  = openFont(22);
-    g_fontL = openFont(34);
-    g_fontS = openFont(16);
-    if (!g_font || !g_fontL || !g_fontS) {
+
+    /* Resolve the display scale before anything is measured or created — see
+     * the "display scale" block for why the UI is drawn through it. */
+    {
+        float ddpi = 0, hdpi = 0, vdpi = 0;
+        if (SDL_GetDisplayDPI(0, &ddpi, &hdpi, &vdpi) == 0 && ddpi > 0)
+            g_uiScale = ddpi / 96.0f;
+        if (g_uiScale < 1.0f) g_uiScale = 1.0f;
+        if (g_uiScale > 3.0f) g_uiScale = 3.0f;
+        /* Snap to quarter steps — Windows only offers 100/125/150/175/200%, and
+         * an arbitrary factor would land every rounded edge on its own
+         * sub-pixel offset. */
+        g_uiScale = (float)std::lround((double)g_uiScale * 4.0) / 4.0f;
+        /* The layout is fixed, so scaling must never push the window past the
+         * screen: at 125% on a 768-tall panel the bottom row (确定 / 退出)
+         * would land off-screen with no way to reach it. Round DOWN to the
+         * previous quarter step, and never below 1:1 — an unscaled 880x700
+         * window is the most this layout can promise. */
+        SDL_Rect usable{};
+        if (SDL_GetDisplayUsableBounds(0, &usable) == 0 &&
+            usable.w > 0 && usable.h > 0) {
+            double fit = (double)usable.w / WIN_W;
+            const double fitH = (double)usable.h / WIN_H;
+            if (fitH < fit) fit = fitH;
+            const float capped = (float)(std::floor(fit * 4.0) / 4.0);
+            if (capped < 1.0f) g_uiScale = 1.0f;
+            else if (g_uiScale > capped) g_uiScale = capped;
+        }
+    }
+
+    g_font   = openFont(uiPx(FONT_BODY));       /* 16 — row labels, values  */
+    g_fontL  = openFont(uiPx(FONT_DISPLAY));    /* 30 — screen titles       */
+    g_fontS  = openFont(uiPx(FONT_SMALL));      /* 13 — captions, chips     */
+    g_fontB  = openFontBold(uiPx(FONT_TITLE));  /* 22 — card titles         */
+    g_fontBS = openFontBold(uiPx(FONT_SMALL + 2));  /* 15 — buttons         */
+    if (!g_font || !g_fontL || !g_fontS || !g_fontB || !g_fontBS) {
         std::cerr << "找不到中文字体（msyh/simhei/NotoSansCJK）\n";
         TTF_Quit(); SDL_Quit();
         return 1;
@@ -1851,14 +3182,28 @@ int main(int argc, char *argv[])
     configLoad(g_cfg);
     g_hist = historyLoad();
 
-    g_win = SDL_CreateWindow("Mivara", SDL_WINDOWPOS_CENTERED,
-                             SDL_WINDOWPOS_CENTERED, WIN_W, WIN_H, 0);
+    /* The stored appearance must be applied before the first frame. An
+     * unparsable value leaves the default (follow system) in place. */
+    {
+        ThemeMode m = ThemeMode::System;
+        themeModeFromKey(g_cfg.theme.c_str(), m);
+        themeSetMode(m);
+    }
+
+    g_win = SDL_CreateWindow("Mivara v" MIVARA_VERSION, SDL_WINDOWPOS_CENTERED,
+                             SDL_WINDOWPOS_CENTERED, uiPx(WIN_W), uiPx(WIN_H), 0);
     g_ren = SDL_CreateRenderer(g_win, -1,
                                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!g_win || !g_ren) {
         std::cerr << "SDL_CreateWindow/Renderer: " << SDL_GetError() << "\n";
         return 1;
     }
+    /* Required by fillRoundRect: the tint chips, hairlines and the stacked
+     * drop shadow all rely on SDL honouring the alpha channel. */
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    /* Every shape primitive below is in logical units; this is what maps them
+     * onto the larger back buffer. */
+    SDL_RenderSetScale(g_ren, g_uiScale, g_uiScale);
 
     if (g_cfg.show_log_window) openLogWindow();
 
@@ -1870,8 +3215,20 @@ int main(int argc, char *argv[])
 
     initSockets();
     logPush("[gui] app start");
+    {
+        char sbuf[64];
+        std::snprintf(sbuf, sizeof(sbuf), "[gui] 显示缩放 %.2fx（窗口 %dx%d）",
+                      g_uiScale, uiPx(WIN_W), uiPx(WIN_H));
+        logPush(sbuf);
+    }
+    updateStartupSweep();       /* drop installers left by an earlier run */
 
     if (g_cfg.auto_receive) launchReceiver();
+
+    /* first automatic update check ~3 s in, after startup has settled; the
+     * thread is only ever started from inside the loop, so an early return
+     * above can never leave a joinable worker behind */
+    g_upd_auto_at = SDL_GetTicks() + 3000;
 
     bool running = true;
     while (running) {
@@ -1905,10 +3262,10 @@ int main(int argc, char *argv[])
             else if (ev.type == SDL_MOUSEBUTTONDOWN &&
                      ev.button.button == SDL_BUTTON_LEFT) {
                 if (g_log_win && ev.button.windowID == SDL_GetWindowID(g_log_win)) {
-                    handleLogClick(ev.button.x, ev.button.y);
+                    handleLogClick(uiCoord(ev.button.x), uiCoord(ev.button.y));
                 } else if (ev.button.windowID == SDL_GetWindowID(g_win)) {
                     g_press = BTN_NONE;
-                    SDL_Point p{ev.button.x, ev.button.y};
+                    SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
                     for (auto &b : g_buttons) {
                         if (SDL_PointInRect(&p, &b.rect)) { g_press = b.id; break; }
                     }
@@ -1917,7 +3274,7 @@ int main(int argc, char *argv[])
             else if (ev.type == SDL_MOUSEBUTTONUP &&
                      ev.button.button == SDL_BUTTON_LEFT) {
                 if (ev.button.windowID == SDL_GetWindowID(g_win)) {
-                    SDL_Point p{ev.button.x, ev.button.y};
+                    SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
                     int hit = BTN_NONE;
                     for (auto &b : g_buttons) {
                         if (SDL_PointInRect(&p, &b.rect)) { hit = b.id; break; }
@@ -1968,6 +3325,54 @@ int main(int argc, char *argv[])
         if (g_search_done.exchange(false))
             setScreen((g_found_count > 0) ? SCR_FOUND : SCR_NOT_FOUND);
 
+        /* async update check / download completion (main thread only) */
+        {
+            UpdateInfo upd;
+            if (updateTake(upd)) {
+                if (upd.is_download) {
+                    if (upd.state == UpdateState::Downloaded) {
+                        logPush("[gui] 更新包已下载：" + upd.remote_tag);
+                        /* the header button asked for download→install in one
+                         * go; a live session is the one thing that defers it */
+                        if (g_upd_auto_install) {
+                            g_upd_auto_install = false;
+                            if (g_sender.active || g_receiver.active)
+                                logPush("[gui] 会话进行中：更新已就绪，结束会话后点右上角安装");
+                            else
+                                startInstall();
+                        }
+                    }
+                    else if (upd.state == UpdateState::Available && upd.detail == "cancelled") {
+                        g_upd_auto_install = false;
+                        logPush("[gui] 已取消下载");
+                    }
+                    else if (upd.state == UpdateState::Failed) {
+                        g_upd_auto_install = false;
+                        logPush("[gui] 更新下载失败：" + updateErrorText(upd.detail));
+                    }
+                } else {
+                    /* every finished check refreshes the 24 h throttle */
+                    g_cfg.last_update_check = (long long)std::time(nullptr);
+                    configSave(g_cfg);
+                    if (upd.state == UpdateState::Available)
+                        logPush("[gui] 更新检查：发现新版本 " + upd.remote_tag);
+                    else if (upd.state == UpdateState::UpToDate)
+                        logPush(std::string("[gui] 更新检查：已是最新版本（v") +
+                                MIVARA_VERSION + "）");
+                    else
+                        logPush("[gui] 更新检查失败：" + updateErrorText(upd.detail));
+                }
+            }
+            /* one delayed automatic check per launch (default on, 24 h throttle;
+             * manual checks are never throttled) */
+            if (!g_upd_auto_checked && g_cfg.auto_check_update &&
+                SDL_GetTicks() >= g_upd_auto_at) {
+                g_upd_auto_checked = true;
+                if ((long long)std::time(nullptr) - g_cfg.last_update_check >= 86400)
+                    updateCheckStart();
+            }
+        }
+
         /* child exit tracking */
         if (g_sender.active && childExited(g_sender, "sender")) {
             g_child_extend = false;
@@ -1983,8 +3388,18 @@ int main(int argc, char *argv[])
             }
         }
 
+        /* Rebuild BEFORE the hover test, not after: g_buttons must be the list
+         * this frame is about to paint. The event loop above deliberately still
+         * hit-tests the list that was on screen when the click happened (that is
+         * what the user aimed at), but a hover computed from it would be a frame
+         * stale whenever the screen changed inside the loop. */
+        buildButtons();
         int mx = -1, my = -1;
-        if (SDL_GetMouseFocus() == g_win) SDL_GetMouseState(&mx, &my);
+        if (SDL_GetMouseFocus() == g_win) {
+            SDL_GetMouseState(&mx, &my);
+            mx = uiCoord(mx);          /* device pixels -> logical layout */
+            my = uiCoord(my);
+        }
         g_hot = BTN_NONE;
         for (auto &b : g_buttons) {
             if (mx >= b.rect.x && mx < b.rect.x + b.rect.w &&
@@ -1993,7 +3408,9 @@ int main(int argc, char *argv[])
                 break;
             }
         }
-        buildButtons();
+        /* Re-resolve "follow system" before painting; the call rate-limits
+         * itself, and it is a no-op unless the mode is System. */
+        themeTick(SDL_GetTicks());
         renderScreen(mx, my);
         if (g_log_open) renderLogWindow();
     }
@@ -2002,6 +3419,7 @@ int main(int argc, char *argv[])
         ++g_search_generation;
         g_search_thread.join();
     }
+    updateJoin();               /* abort + join any in-flight check/download */
     stopChild(g_sender, g_child_extend);
     stopChild(g_receiver);
     closeLogWindow();
