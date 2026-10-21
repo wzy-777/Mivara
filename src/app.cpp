@@ -41,6 +41,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "config.h"
@@ -619,8 +620,56 @@ static int uiPx(int v) { return (int)std::lround((double)v * g_uiScale); }
  * mapping can resolve it. */
 static int uiCoord(int px) { return (int)std::floor((double)px / g_uiScale); }
 
+/** Logical edge -> the device pixel the shape layer starts/ends on.
+ *
+ * floor/ceil, not lround, and that pairing is load-bearing: the renderer paints
+ * a scaled rect as [floor(x*s), ceil((x+w)*s)), so two shapes that share a
+ * logical edge land on the SAME device pixel instead of each rounding to its
+ * own. The rounded-rect bands below rely on it — round-to-nearest leaves a
+ * one-pixel gap between the middle band and the corner masks at 1.25x. At
+ * scale 1.0 both reduce to the identity. */
+static int uiDevLo(int v) { return (int)std::floor((double)v * g_uiScale); }
+static int uiDevHi(int v) { return (int)std::ceil((double)v * g_uiScale); }
+
+static SDL_Rect uiDevRect(int x, int y, int w, int h)
+{
+    SDL_Rect r{uiDevLo(x), uiDevLo(y), 0, 0};
+    r.w = uiDevHi(x + w) - r.x;
+    r.h = uiDevHi(y + h) - r.y;
+    return r;
+}
+
+/** Drops the render scale for the lifetime of a shape body.
+ *
+ * Every shape primitive from here down paints in DEVICE pixels, and has to: a
+ * shape rasterised in logical units and then stretched by g_uiScale lands its
+ * edges on fractional device pixels, which with no antialiasing turns a regular
+ * staircase into an uneven one. Same save / force-1 / restore dance drawTextPx
+ * does (:653-657), and the scopes nest, so a shape may call a shape. */
+struct ScaleScope {
+    SDL_Renderer *ren;
+    float sx, sy;
+    explicit ScaleScope(SDL_Renderer *r) : ren(r)
+    {
+        SDL_RenderGetScale(ren, &sx, &sy);
+        SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    }
+    ~ScaleScope() { SDL_RenderSetScale(ren, sx, sy); }
+    ScaleScope(const ScaleScope &) = delete;
+    ScaleScope &operator=(const ScaleScope &) = delete;
+};
+
+/* The colour most recently handed to setColor(). The shape layer needs it
+ * because fillCircle/fillRoundRect are documented to draw "in the colour most
+ * recently passed to setColor()" and several call sites rely on that (:802,
+ * :844-845, :887, :2581, :2761). Carrying the colour through the mask cache
+ * instead would have meant changing six signatures and every one of those
+ * call sites for no behavioural gain. */
+static SDL_Color g_drawColor{0x00, 0x00, 0x00, 0xFF};
+
 static void setColor(SDL_Renderer *ren, SDL_Color c)
 {
+    g_drawColor = c;
     SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, c.a);
 }
 
@@ -693,8 +742,203 @@ static void drawTextIn(SDL_Renderer *ren, const std::string &s, const SDL_Rect &
     drawTextV(ren, s, x, rc.y + rc.h / 2, c, font, align);
 }
 
-/** Draws in the colour most recently passed to setColor(). */
-static void fillCircle(SDL_Renderer *ren, int cx, int cy, int rad)
+/* ── shape layer: device-native geometry + coverage antialiasing ───────────
+ *
+ * SDL's shape primitives — RenderDrawLine, RenderFillRect — are hard-edged:
+ * no coverage, no antialiasing, anywhere. Every circle, every rounded corner
+ * and every glyph in this file is built out of them, so at 1:1 the corners
+ * already read as a staircase, and at a fractional display scale
+ * (SDL_RenderSetScale(1.25) on a 125 % display) each logical scanline is
+ * stretched to 1.25 device pixels, which the rasteriser resolves to one or two
+ * rows depending on the fractional offset. Measured on the shipped backend
+ * (SDL_RENDERER_ACCELERATED -> direct3d/D3D9): a 1-logical-px hairline that is
+ * a uniform 1px at 1:1 comes out as 17 rows of 1px and 5 of 2px at 1.25x, and
+ * the rounded-corner edge deviates 0.49 -> 0.82 px RMS from the true arc. Text
+ * never had this problem because drawTextPx rasterises FreeType at DEVICE size
+ * (:639-659); the shapes now get the same treatment, plus the coverage the
+ * primitives never had.
+ *
+ * Each shape is rasterised ONCE, supersampled, into a coverage-only mask cached
+ * per (renderer, kind, size), and drawn as a single tinted blit. Three
+ * properties fall out of that and are worth stating because they are what make
+ * it safe:
+ *   - the mask carries COVERAGE ONLY — RGB is white, alpha is the shape.
+ *     Colour arrives at blit time through SetTextureColorMod/AlphaMod, so no
+ *     colour literal ever enters a mask and a theme switch needs no
+ *     invalidation;
+ *   - the mask is built by running the ORIGINAL primitive at MASK_SS x, so a
+ *     glyph's hand-tuned maths (the 2px stems, the sun's ray blocks, the moon
+ *     bite) is never re-authored — its silhouette cannot drift;
+ *   - masks are per-renderer (an SDL texture belongs to the renderer that made
+ *     it), so the log window gets its own cache — see closeLogWindow.
+ *
+ * What this does NOT do: turn the drop shadow's three spread bands into a real
+ * gradient (each band's edge is smoothed, the banding stays), or touch the
+ * layout, the hit rects, the fonts, or the window size.
+ */
+
+/* Supersamples per axis when rasterising a mask. 4 gives 17 coverage levels,
+ * which is what a corner arc needs to stop reading as a step; each build is
+ * one-off per (kind, size) and the whole set is a few hundred kB. */
+static const int MASK_SS = 4;
+
+/* True only while a glyph mask is being rasterised. The public shape helpers
+ * then draw their original hard-edged scanlines instead of recursing into the
+ * mask cache, which is how a glyph body gets baked without being rewritten. */
+static bool g_baking = false;
+
+enum MaskKind { MK_DISC = 1, MK_CORNER, MK_RING, MK_GLYPH, MK_WARN };
+
+/* (renderer, kind, a, b) -> texture. 'a' is a device radius, a glyph id or a
+ * warning size; 'b' is a device thickness or size where the kind needs two
+ * dimensions. Keyed by renderer because an SDL_Texture is bound to the
+ * renderer that created it — blitting the log window's copy from the main
+ * renderer (or the reverse) is undefined. */
+static std::unordered_map<SDL_Renderer *,
+                          std::unordered_map<long long, SDL_Texture *>> g_masks;
+
+static long long maskKey(int kind, int a, int b)
+{
+    return ((long long)kind << 48) | ((long long)(a & 0xFFFFFF) << 24) |
+           (long long)(b & 0xFFFFFF);
+}
+
+/** Drop a renderer's masks. Textures must go before their renderer does. */
+static void dropMasks(SDL_Renderer *ren)
+{
+    auto it = g_masks.find(ren);
+    if (it == g_masks.end()) return;
+    for (auto &kv : it->second)
+        if (kv.second) SDL_DestroyTexture(kv.second);
+    g_masks.erase(it);
+}
+
+/** A throwaway supersampled canvas, cleared to transparent.
+ *
+ * The shape is painted at MASK_SS x by multiplying the GEOMETRY, not by
+ * setting the render scale: the software backend scales a DrawLine's
+ * coordinates but not its thickness, so a scaled scanline lands every
+ * MASK_SS-th row and combs the shape, while at scale 1 the primitive's own
+ * per-row loop covers every supersampled row. */
+struct MaskCanvas {
+    SDL_Surface  *surf = nullptr;
+    SDL_Renderer *ren  = nullptr;
+    MaskCanvas(int w, int h)
+    {
+        surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+        if (!surf) return;
+        ren = SDL_CreateSoftwareRenderer(surf);
+        if (!ren) return;
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
+        SDL_RenderClear(ren);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        /* Ink colour for the bake. The clear above leaves the draw colour at
+         * transparent black, and fillCircleRaw takes its colour from the
+         * ambient setColor() rather than a parameter — without this the disc
+         * bakes as alpha-0 lines and vanishes. */
+        SDL_SetRenderDrawColor(ren, 0xFF, 0xFF, 0xFF, 0xFF);
+    }
+    ~MaskCanvas()
+    {
+        if (ren) { SDL_RenderFlush(ren); SDL_DestroyRenderer(ren); }
+        if (surf) SDL_FreeSurface(surf);
+    }
+    MaskCanvas(const MaskCanvas &) = delete;
+    MaskCanvas &operator=(const MaskCanvas &) = delete;
+};
+
+/** Supersampled ARGB -> coverage-only ARGB: RGB white, A = the ss x ss block
+ * average at (i,j). The box filter is what turns the hard supersampled edges
+ * into the coverage ramp.
+ *
+ * ss=1 is the "already a 0/255 silhouette" case (the glyph and warning masks,
+ * which are baked at LOGICAL resolution and upscaled by the linear filter at
+ * blit time). It must still go through here rather than hand the raw surface to
+ * uploadMask: MaskCanvas clears to (0,0,0,0), so a transparent pixel would be
+ * BLACK, and bilinear filtering at a fractional scale would then mix black into
+ * the edge RGB — multiplying the glyph by its own coverage a second time and
+ * leaving every antialiased edge muddy instead of a light tint of the ink. */
+static SDL_Surface *coverageFrom(SDL_Surface *src, int w, int h, int ss = MASK_SS)
+{
+    if (!src || w <= 0 || h <= 0 || ss <= 0) return nullptr;
+    SDL_Surface *out = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32,
+                                                      SDL_PIXELFORMAT_ARGB8888);
+    if (!out) return nullptr;
+    SDL_LockSurface(src);
+    SDL_LockSurface(out);
+    const Uint32 *sp = (const Uint32 *)src->pixels;
+    Uint32       *op = (Uint32 *)out->pixels;
+    const int sstride = src->pitch / 4, ostride = out->pitch / 4;
+    const int n = ss * ss;
+    for (int j = 0; j < h; j++) {
+        const int by = j * ss;
+        for (int i = 0; i < w; i++) {
+            const int bx = i * ss;
+            int sum = 0;
+            for (int sy = 0; sy < ss; sy++) {
+                const Uint32 *row = sp + (size_t)(by + sy) * sstride + bx;
+                for (int sx = 0; sx < ss; sx++)
+                    sum += (int)((row[sx] >> 24) & 0xFF);
+            }
+            op[(size_t)j * ostride + i] =
+                (Uint32)((Uint32)((sum + n / 2) / n) << 24) | 0x00FFFFFFu;
+        }
+    }
+    SDL_UnlockSurface(out);
+    SDL_UnlockSurface(src);
+    return out;
+}
+
+/** Coverage surface -> a texture on 'ren'. The blend mode is set here rather
+ * than left at SDL's default (NONE), which would paint the mask's transparent
+ * pixels as opaque black. */
+static SDL_Texture *uploadMask(SDL_Renderer *ren, SDL_Surface *cov, bool linear)
+{
+    if (!cov) return nullptr;
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, cov);
+    SDL_FreeSurface(cov);
+    if (!tex) return nullptr;
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    if (linear) SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+    return tex;
+}
+
+/** One tinted mask blit, in DEVICE pixels — callers hold a ScaleScope.
+ * final alpha = mask coverage x c.a / 255, which is why a translucent fill
+ * (the shadow, the tint chips, the hairlines) composites correctly instead of
+ * double-darkening where two shapes meet. */
+static void blitMask(SDL_Renderer *ren, SDL_Texture *tex, int x, int y, int size,
+                     SDL_Color c, SDL_RendererFlip flip = SDL_FLIP_NONE)
+{
+    if (!tex || size <= 0) return;
+    SDL_SetTextureColorMod(tex, c.r, c.g, c.b);
+    SDL_SetTextureAlphaMod(tex, c.a);
+    SDL_Rect dst{x, y, size, size};
+    SDL_RenderCopyEx(ren, tex, nullptr, &dst, 0.0, nullptr, flip);
+}
+
+/** Cached mask lookup, or a null texture if the build failed. */
+static SDL_Texture *maskCacheGet(SDL_Renderer *ren, int kind, int a, int b,
+                                 long long &key)
+{
+    key = maskKey(kind, a, b);
+    auto &cache = g_masks[ren];
+    auto it = cache.find(key);
+    return (it == cache.end()) ? nullptr : it->second;
+}
+
+static SDL_Texture *maskCachePut(SDL_Renderer *ren, long long key, SDL_Surface *cov,
+                                 bool linear = false)
+{
+    return g_masks[ren][key] = uploadMask(ren, cov, linear);
+}
+
+/* ── the shipped rasterisers, verbatim, in whatever units the renderer is in ─
+ * Kept as the mask bakers so a shape's silhouette cannot drift from the one
+ * that was hand-tuned on screen. */
+
+static void fillCircleRaw(SDL_Renderer *ren, int cx, int cy, int rad)
 {
     if (rad <= 0) return;
     for (int dy = -rad; dy <= rad; dy++) {
@@ -703,14 +947,7 @@ static void fillCircle(SDL_Renderer *ren, int cx, int cy, int rad)
     }
 }
 
-/**
- * Rounded rect as horizontal scanlines rather than mid-rect + 2 side rects +
- * 4 circles: the old construction overlapped itself, which is invisible at
- * alpha 255 but paints visible darker seams wherever a translucent fill is
- * used (the tint chips, the shadow, the hairlines). Honours c.a, so the
- * renderer must have SDL_BLENDMODE_BLEND set (done in initRenderer()).
- */
-static void fillRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad, SDL_Color c)
+static void fillRoundRectRaw(SDL_Renderer *ren, SDL_Rect rc, int rad, SDL_Color c)
 {
     if (rc.w <= 0 || rc.h <= 0) return;
     if (rad < 0) rad = 0;
@@ -733,6 +970,233 @@ static void fillRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad, SDL_Color c)
         SDL_RenderDrawLine(ren, rc.x + inset, rc.y + rc.h - 1 - i,
                                 rc.x + rc.w - 1 - inset, rc.y + rc.h - 1 - i);
     }
+}
+
+/* ── mask bakers ─────────────────────────────────────────────────────────── */
+
+/** A filled disc of device radius R. Built from the shipped fillCircle, so the
+ * silhouette — including its one-pixel-wide poles, which is what a circle of
+ * radius R in integer ROW space actually looks like — is unchanged. */
+static SDL_Texture *discMask(SDL_Renderer *ren, int R)
+{
+    if (R <= 0) return nullptr;
+    long long key;
+    if (SDL_Texture *hit = maskCacheGet(ren, MK_DISC, R, 0, key)) return hit;
+
+    const int n = 2 * R + 1;
+    SDL_Surface *cov = nullptr;
+    {
+        MaskCanvas cv(n * MASK_SS, n * MASK_SS);
+        if (cv.ren) {
+            /* Centre the disc on the MIDDLE of output pixel R's supersample
+             * block, not on its first canvas pixel. coverageFrom turns block
+             * [4R,4R+4) into output pixel R, and blitMask puts that pixel on
+             * the device pixel containing (cx,cy) — so the block's centre is
+             * canvas 4R+MASK_SS/2. Baking at 4R instead leaves the disc 1.5
+             * canvas px (0.375 device px) up-left of centre, which shows up as
+             * a lopsided coverage ramp: measured centroid R-0.376 instead of R,
+             * against R+0.126 for this placement (0.5 canvas px is the floor
+             * for an odd-diameter disc). */
+            fillCircleRaw(cv.ren, R * MASK_SS + MASK_SS / 2,
+                                  R * MASK_SS + MASK_SS / 2, R * MASK_SS);
+            cov = coverageFrom(cv.surf, n, n);
+        }
+    }
+    return maskCachePut(ren, key, cov);
+}
+
+/** The TOP-LEFT quarter of a rounded rect of device radius R. The other three
+ * corners are this one flipped, so one mask serves all four. */
+static SDL_Texture *cornerMask(SDL_Renderer *ren, int R)
+{
+    if (R <= 0) return nullptr;
+    long long key;
+    if (SDL_Texture *hit = maskCacheGet(ren, MK_CORNER, R, 0, key)) return hit;
+
+    SDL_Surface *cov = nullptr;
+    {
+        const int d = 2 * R * MASK_SS;
+        MaskCanvas cv(d, d);
+        if (cv.ren) {
+            fillRoundRectRaw(cv.ren, SDL_Rect{0, 0, d, d}, R * MASK_SS, WHITE);
+            cov = coverageFrom(cv.surf, R, R);
+        }
+    }
+    return maskCachePut(ren, key, cov);
+}
+
+/** Half-extent of a ring mask, in device pixels — shared by the baker and the
+ * blitter so the two can never disagree about the centre. */
+static int ringHalf(int R, int thick)
+{
+    return R + (thick + 1) / 2 + 1;
+}
+
+/** A circle outline of device radius R and thickness 'thick'.
+ *
+ * Analytic rather than baked from the shipped 48-chord polygon: a 48-gon of
+ * hard steps is exactly the artefact this layer exists to remove, and the ring
+ * is a new shape with no hand-tuned silhouette to stay faithful to. */
+static SDL_Texture *ringMask(SDL_Renderer *ren, int R, int thick)
+{
+    if (R <= 0) return nullptr;
+    if (thick < 1) thick = 1;
+    long long key;
+    if (SDL_Texture *hit = maskCacheGet(ren, MK_RING, R, thick, key)) return hit;
+
+    const int half = ringHalf(R, thick);
+    const int n = 2 * half + 1;
+    SDL_Surface *cov = SDL_CreateRGBSurfaceWithFormat(0, n, n, 32,
+                                                      SDL_PIXELFORMAT_ARGB8888);
+    if (!cov) return maskCachePut(ren, key, nullptr);
+    SDL_LockSurface(cov);
+    Uint32 *op = (Uint32 *)cov->pixels;
+    const int stride = cov->pitch / 4;
+    const double outer = R + thick * 0.5, inner = R - thick * 0.5;
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++) {
+            const double dx = i - half, dy = j - half;
+            const double d  = std::sqrt(dx * dx + dy * dy);
+            /* signed distance -> coverage, one pixel wide each side */
+            double a = 0.5 + (outer - d);
+            if (a > 1.0) a = 1.0;
+            if (a < 0.0) a = 0.0;
+            double b = 0.5 + (d - inner);
+            if (b > 1.0) b = 1.0;
+            if (b < 0.0) b = 0.0;
+            op[(size_t)j * stride + i] =
+                ((Uint32)(a * b * 255.0 + 0.5) << 24) | 0x00FFFFFFu;
+        }
+    SDL_UnlockSurface(cov);
+    return maskCachePut(ren, key, cov);
+}
+
+/* ── the public shape primitives ─────────────────────────────────────────── */
+
+/** Fill a device rect at 'k' of the colour's own alpha. */
+static void fillScaled(SDL_Renderer *ren, int x, int y, int w, int h,
+                       SDL_Color c, double k)
+{
+    if (w <= 0 || h <= 0 || k <= 0.0) return;
+    double a = (double)c.a * (k > 1.0 ? 1.0 : k) + 0.5;
+    if (a < 1.0) return;
+    SDL_Color s = c;
+    s.a = (Uint8)(a > 255.0 ? 255.0 : a);
+    SDL_SetRenderDrawColor(ren, s.r, s.g, s.b, s.a);
+    SDL_Rect r{x, y, w, h};
+    SDL_RenderFillRect(ren, &r);
+}
+
+/**
+ * An axis-aligned rect with exact fractional-edge coverage, in DEVICE units.
+ *
+ * A plain RenderFillRect can only land on whole device pixels, so a 1-logical-px
+ * hairline at 1.25x would be painted as two full-strength rows where it should
+ * be one full row and one quarter-strength — 60 % too heavy, and the divider
+ * stack would read as chunky on any fractional-DPI display. (Measured: as
+ * shipped the stack came out 17 rows of 1px and 5 of 2px; snapping it to whole
+ * pixels made it 22 rows of 2px — even, but wrong in weight. This gives a
+ * uniform 1.25px.)
+ *
+ * Coverage of an axis-aligned rect is separable, and only the outermost device
+ * row and column can be partial, so this is at most nine fills, not a mask.
+ */
+static void fillRectCov(SDL_Renderer *ren, double x0, double y0, double x1, double y1,
+                        SDL_Color c)
+{
+    const int ix0 = (int)std::floor(x0), ix1 = (int)std::ceil(x1);
+    const int iy0 = (int)std::floor(y0), iy1 = (int)std::ceil(y1);
+    const int w = ix1 - ix0, h = iy1 - iy0;
+    if (w <= 0 || h <= 0) return;
+
+    /* Bands along one axis: {origin, length, coverage}. A single-pixel band has
+     * no interior, so it carries the whole (<= 1) coverage itself. */
+    int    o[3], len[3], n;
+    double k[3];
+    auto split = [&](int i0, int i1, int extent, double f0, double f1) {
+        if (extent == 1) { o[0] = i0; len[0] = 1; k[0] = f1 - f0; return 1; }
+        int m = 0;
+        o[m] = i0; len[m] = 1; k[m] = i0 + 1 - f0; m++;
+        if (extent > 2) { o[m] = i0 + 1; len[m] = extent - 2; k[m] = 1.0; m++; }
+        o[m] = i1 - 1; len[m] = 1; k[m] = f1 - (i1 - 1); m++;
+        return m;
+    };
+    const int nx = split(ix0, ix1, w, x0, x1), xo[3] = {o[0], o[1], o[2]};
+    const int xl[3] = {len[0], len[1], len[2]};
+    const double xk[3] = {k[0], k[1], k[2]};
+    n = split(iy0, iy1, h, y0, y1);
+    const int yo[3] = {o[0], o[1], o[2]};
+    const int yl[3] = {len[0], len[1], len[2]};
+    const double yk[3] = {k[0], k[1], k[2]};
+
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < nx; i++)
+            fillScaled(ren, xo[i], yo[j], xl[i], yl[j], c, xk[i] * yk[j]);
+}
+
+/** Filled disc centred on (cx,cy), radius 'rad' LOGICAL units. Draws in the
+ * colour most recently passed to setColor(). */
+static void fillCircle(SDL_Renderer *ren, int cx, int cy, int rad)
+{
+    if (rad <= 0) return;
+    if (g_baking) { fillCircleRaw(ren, cx, cy, rad); return; }
+    const int R = uiPx(rad);
+    if (R <= 0) return;
+    ScaleScope scope(ren);
+    blitMask(ren, discMask(ren, R), uiPx(cx) - R, uiPx(cy) - R, 2 * R + 1, g_drawColor);
+}
+
+/**
+ * Rounded rect as three abutting device-aligned bands plus four corner masks.
+ *
+ * Not mid-rect + 2 side rects + 4 circles: that construction overlapped itself,
+ * which is invisible at alpha 255 but paints visible darker seams wherever a
+ * translucent fill is used (the tint chips, the shadow, the hairlines). The
+ * bands here share their edges exactly — same uiDevLo/uiDevHi pair — so an
+ * opaque fill is seamless and a translucent one is uniform. Honours c.a, so the
+ * renderer must have SDL_BLENDMODE_BLEND set (done in initRenderer()).
+ */
+static void fillRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad, SDL_Color c)
+{
+    if (rc.w <= 0 || rc.h <= 0) return;
+    if (rad < 0) rad = 0;
+    if (rad > rc.w / 2) rad = rc.w / 2;
+    if (rad > rc.h / 2) rad = rc.h / 2;
+    if (g_baking) { fillRoundRectRaw(ren, rc, rad, c); return; }
+
+    const SDL_Rect d = uiDevRect(rc.x, rc.y, rc.w, rc.h);
+    if (d.w <= 0 || d.h <= 0) return;
+    ScaleScope scope(ren);
+    setColor(ren, c);
+
+    int dr = uiPx(rad);
+    if (dr > d.w / 2) dr = d.w / 2;
+    if (dr > d.h / 2) dr = d.h / 2;
+    /* No corners to butt against, so the edges can keep their fractional
+     * coverage instead of snapping out to whole device pixels. */
+    if (dr <= 0) {
+        fillRectCov(ren, rc.x * g_uiScale, rc.y * g_uiScale,
+                    (rc.x + rc.w) * g_uiScale, (rc.y + rc.h) * g_uiScale, c);
+        return;
+    }
+
+    const SDL_Rect mid{d.x, d.y + dr, d.w, d.h - 2 * dr};
+    const SDL_Rect top{d.x + dr, d.y, d.w - 2 * dr, dr};
+    const SDL_Rect bot{d.x + dr, d.y + d.h - dr, d.w - 2 * dr, dr};
+    if (mid.h > 0) SDL_RenderFillRect(ren, &mid);
+    if (top.w > 0) {
+        SDL_RenderFillRect(ren, &top);
+        SDL_RenderFillRect(ren, &bot);
+    }
+
+    SDL_Texture *cm = cornerMask(ren, dr);
+    if (!cm) return;
+    const int x1 = d.x + d.w - dr, y1 = d.y + d.h - dr;
+    blitMask(ren, cm, d.x, d.y, dr, c);
+    blitMask(ren, cm, x1,  d.y, dr, c, SDL_FLIP_HORIZONTAL);
+    blitMask(ren, cm, d.x, y1,  dr, c, SDL_FLIP_VERTICAL);
+    blitMask(ren, cm, x1,  y1,  dr, c,
+             (SDL_RendererFlip)(SDL_FLIP_HORIZONTAL | SDL_FLIP_VERTICAL));
 }
 
 static void drawRoundRect(SDL_Renderer *ren, SDL_Rect rc, int rad,
@@ -776,20 +1240,19 @@ static void drawHairline(SDL_Renderer *ren, int x, int y, int w, int h, SDL_Colo
     fillRoundRect(ren, SDL_Rect{x, y, w, h}, 0, d);
 }
 
-/** 1px-ish circle outline built from line segments (no arc primitive in SDL). */
+/** 1px-ish circle outline. Was 48 hard line segments (SDL has no arc
+ * primitive); now a cached annulus mask, which is rounder and one draw call. */
 static void drawRing(SDL_Renderer *ren, int cx, int cy, int r, SDL_Color c)
 {
     if (r <= 0) return;
-    setColor(ren, c);
-    const int steps = 48;
-    int px = cx + r, py = cy;
-    for (int i = 1; i <= steps; i++) {
-        double a = 2.0 * UI_PI * i / steps;
-        int x = cx + (int)std::lround(r * std::cos(a));
-        int y = cy + (int)std::lround(r * std::sin(a));
-        SDL_RenderDrawLine(ren, px, py, x, y);
-        px = x; py = y;
-    }
+    const int R = uiPx(r);
+    const int thick = uiPx(1);
+    if (R <= 0) return;
+    ScaleScope scope(ren);
+    SDL_Texture *m = ringMask(ren, R, thick);
+    if (!m) return;
+    const int half = ringHalf(R, thick);
+    blitMask(ren, m, uiPx(cx) - half, uiPx(cy) - half, 2 * half + 1, c);
 }
 
 /** iOS-style toggle. The OFF track uses the border token: at surfaceAlt or
@@ -972,37 +1435,151 @@ static void glyphUpdate(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c
                            (int)std::lround(bx[1]) + t, (int)std::lround(by[1]));
 }
 
-static void glyphWarning(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c,
-                         SDL_Color knockout)
+/** The warning triangle's ink, as a COVERAGE mask: white where the mark is,
+ * transparent where the exclamation punches through. The knockout is written
+ * with blending off rather than painted in the surface colour — a mask has no
+ * colour to paint it with, and the screen code lays the real knockout rects
+ * over the blitted triangle afterwards. 'u' is one logical unit in canvas
+ * units, so the 3px bar and dot stay 3 logical px wide at any supersampling. */
+static void warningInk(SDL_Renderer *ren, int cx, int cy, int size, int u)
 {
     int top = cy - size / 2, bot = cy + size / 2;
     int half = size / 2;
-    setColor(ren, c);
+    setColor(ren, WHITE);
     for (int y = top; y <= bot; y++) {
         int w = (y - top) * half / size;
         SDL_RenderDrawLine(ren, cx - w, y, cx + w, y);
     }
-    /* Exclamation knocked out in the surface behind it so it reads as a mark. */
-    setColor(ren, knockout);
-    SDL_Rect bar{cx - 1, cy - size / 4, 3, size / 2};
+    SDL_BlendMode prev;
+    SDL_GetRenderDrawBlendMode(ren, &prev);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
+    SDL_Rect bar{cx - u, cy - size / 4, 3 * u, size / 2};
+    SDL_Rect dot{cx - u, cy + size / 3, 3 * u, 3 * u};
     SDL_RenderFillRect(ren, &bar);
-    SDL_Rect dot{cx - 1, cy + size / 3, 3, 3};
     SDL_RenderFillRect(ren, &dot);
+    SDL_SetRenderDrawBlendMode(ren, prev);
+}
+
+/* ── glyph masks ─────────────────────────────────────────────────────────── */
+
+/** Half-extent, in LOGICAL units, of the square a glyph is baked into.
+ *
+ * Glyphs are centred on (cx,cy) but several overrun the nominal 'size' box —
+ * the power symbol's stem starts 2px above it and the update arrow's head
+ * reaches ~0.8x size from the centre — so the box is generous rather than
+ * tight, and the wasted transparent margin costs nothing (the mask is cached). */
+static int glyphHalf(int size)
+{
+    return (size * 4) / 5 + 3;
+}
+
+/** Ink only: draws a glyph body centred on (cx,cy) in whatever units the
+ * renderer is in. Used by the mask baker and never by the screen code, which
+ * blits the baked mask instead. */
+static void paintGlyph(SDL_Renderer *ren, int glyph, int cx, int cy, int size)
+{
+    switch (glyph) {
+    case GLYPH_MONITOR:    glyphMonitor(ren, cx, cy, size, WHITE); break;
+    case GLYPH_ARROW_UP:   glyphArrow(ren, cx, cy, size, true,  WHITE); break;
+    case GLYPH_ARROW_DOWN: glyphArrow(ren, cx, cy, size, false, WHITE); break;
+    case GLYPH_SLIDERS:    glyphSliders(ren, cx, cy, size, WHITE); break;
+    case GLYPH_POWER:      glyphPower(ren, cx, cy, size, WHITE); break;
+    case GLYPH_SUN:        glyphSun(ren, cx, cy, size, WHITE); break;
+    case GLYPH_MOON:       glyphMoon(ren, cx, cy, size, WHITE); break;
+    case GLYPH_UPDATE:     glyphUpdate(ren, cx, cy, size, WHITE); break;
+    default: break;
+    }
+}
+
+/** The mask a glyph is drawn from.
+ *
+ * A glyph body's STROKE WIDTH is not a parameter — glyphArrow draws its 2px
+ * stem by calling RenderDrawLine twice, one pixel apart, and the power ring is
+ * one RenderDrawLine per chord. So one canvas pixel must be one LOGICAL pixel:
+ * rasterising the body at MASK_SS x its logical size scales its coordinates but
+ * leaves every stroke one canvas pixel wide, which comes out of the downsample
+ * as a quarter-pixel hairline and turns the power ring almost invisible.
+ *
+ * There is therefore no supersampling here. The body is baked at the resolution
+ * it was designed at — exactly what the old device-scale draw did — and the
+ * mask is blitted up to device size with linear filtering, which is what turns
+ * the hard staircase into a coverage ramp at a fractional display scale. At
+ * scale 1.0 the blit is 1:1 and the result is bit-identical to the old draw.
+ */
+static SDL_Texture *glyphMask(SDL_Renderer *ren, int glyph, int size, int &halfLog)
+{
+    const int hl = glyphHalf(size);
+    halfLog = hl;
+    long long key;
+    if (SDL_Texture *hit = maskCacheGet(ren, MK_GLYPH, glyph, size, key)) return hit;
+
+    const int n = 2 * hl + 1;
+    SDL_Surface *cov = nullptr;
+    {
+        MaskCanvas cv(n, n);
+        if (cv.ren) {
+            g_baking = true;
+            paintGlyph(cv.ren, glyph, hl, hl, size);
+            g_baking = false;
+            /* No downsample (ss=1): the mask is already a 0/255 silhouette, and
+             * it is the linear upscale at blit time that turns it into
+             * coverage. It still goes through coverageFrom so the transparent
+             * pixels carry WHITE rgb — see the note there. */
+            cov = coverageFrom(cv.surf, n, n, 1);
+        }
+    }
+    return maskCachePut(ren, key, cov, true);
+}
+
+static SDL_Texture *warnMask(SDL_Renderer *ren, int size, int &halfLog)
+{
+    const int hl = glyphHalf(size);
+    halfLog = hl;
+    long long key;
+    if (SDL_Texture *hit = maskCacheGet(ren, MK_WARN, size, 0, key)) return hit;
+
+    const int n = 2 * hl + 1;
+    SDL_Surface *cov = nullptr;
+    {
+        MaskCanvas cv(n, n);
+        if (cv.ren) {
+            warningInk(cv.ren, hl, hl, size, 1);
+            cov = coverageFrom(cv.surf, n, n, 1);
+        }
+    }
+    return maskCachePut(ren, key, cov, true);
 }
 
 static void drawGlyph(SDL_Renderer *ren, int glyph, int cx, int cy, int size, SDL_Color c)
 {
-    switch (glyph) {
-    case GLYPH_MONITOR:    glyphMonitor(ren, cx, cy, size, c); break;
-    case GLYPH_ARROW_UP:   glyphArrow(ren, cx, cy, size, true,  c); break;
-    case GLYPH_ARROW_DOWN: glyphArrow(ren, cx, cy, size, false, c); break;
-    case GLYPH_SLIDERS:    glyphSliders(ren, cx, cy, size, c); break;
-    case GLYPH_POWER:      glyphPower(ren, cx, cy, size, c); break;
-    case GLYPH_SUN:        glyphSun(ren, cx, cy, size, c); break;
-    case GLYPH_MOON:       glyphMoon(ren, cx, cy, size, c); break;
-    case GLYPH_UPDATE:     glyphUpdate(ren, cx, cy, size, c); break;
-    default: break;
+    if (glyph == GLYPH_NONE || size <= 0) return;
+    ScaleScope scope(ren);
+    int hl = 0;
+    SDL_Texture *m = glyphMask(ren, glyph, size, hl);
+    if (!m) return;
+    const int hd = uiPx(hl);
+    blitMask(ren, m, uiPx(cx) - hd, uiPx(cy) - hd, 2 * hd + 1, c);
+}
+
+static void glyphWarning(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c,
+                         SDL_Color knockout)
+{
+    if (size <= 0) return;
+    ScaleScope scope(ren);
+    int hl = 0;
+    SDL_Texture *m = warnMask(ren, size, hl);
+    if (m) {
+        const int hd = uiPx(hl);
+        blitMask(ren, m, uiPx(cx) - hd, uiPx(cy) - hd, 2 * hd + 1, c);
     }
+    /* The exclamation is two axis-aligned rects, so it needs no mask — but it
+     * still has to be snapped to device pixels or its 3px bar lands on 3.75. */
+    setColor(ren, knockout);
+    SDL_Rect bar = uiDevRect(cx - 1, cy - size / 4, 3, size / 2);
+    SDL_Rect dot = uiDevRect(cx - 1, cy + size / 3, 3, 3);
+    SDL_RenderFillRect(ren, &bar);
+    SDL_RenderFillRect(ren, &dot);
 }
 
 /* ── buttons ─────────────────────────────────────────────────────────────── */
@@ -1549,6 +2126,9 @@ static void openLogWindow()
 static void closeLogWindow()
 {
     if (!g_log_open) return;
+    /* The log window owns its own renderer, so it owns its own shape masks —
+     * an SDL_Texture may not outlive the renderer that made it. */
+    dropMasks(g_log_ren);
     if (g_log_ren) SDL_DestroyRenderer(g_log_ren);
     if (g_log_win) SDL_DestroyWindow(g_log_win);
     g_log_ren = nullptr;
@@ -3428,6 +4008,7 @@ int main(int argc, char *argv[])
     if (g_fontL) TTF_CloseFont(g_fontL);
     if (g_fontS) TTF_CloseFont(g_fontS);
     TTF_Quit();
+    dropMasks(g_ren);           /* a mask texture may not outlive its renderer */
     SDL_DestroyRenderer(g_ren);
     SDL_DestroyWindow(g_win);
     SDL_Quit();
