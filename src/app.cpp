@@ -1,7 +1,7 @@
 /**
  * APP.CPP – Mivara GUI LAUNCHER (SDL2 + SDL2_ttf)
  *
- * Layout: fixed left nav sidebar (主页 / 设置 + 退出) with the active
+ * Layout: fixed left nav sidebar (主页 / 设置) with the active
  * tab's content to its right. Session flows (search / stream / receive) and
  * the connection-history list live inside the 主页 tab and remain reachable
  * via "返回会话" while browsing 设置.
@@ -11,7 +11,7 @@
  *   RECEIVING  – "正在接收" + local IP / ports; spawns bin/receiver
  *   SEARCHING  – "搜索中" (SSDP discovery on a background thread)
  *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend)
- *   NOT_FOUND  – 继续搜索 / 手动输入ip / 退出
+ *   NOT_FOUND  – 继续搜索 / 手动输入ip
  *   MANUAL_IP  – type a receiver IP, then the same mode choice
  *   STREAMING  – session running (bin/sender …) + live STAT panel
  *   SETTINGS   – AppConfig editor (codec / hw / quality / fps / bitrate / …)
@@ -118,7 +118,6 @@
 #define NAV_ITEM_H 44
 #define NAV_HOME_Y 76
 #define NAV_SET_Y 128
-#define NAV_QUIT_Y 644
 
 #define HDR_GLYPH_CX 36
 #define HDR_WORD_X 58
@@ -329,7 +328,6 @@ enum BtnId {
     /* left nav sidebar */
     BTN_NAV_HOME = 8000,
     BTN_NAV_SETTINGS,
-    BTN_NAV_QUIT,
     BTN_RETURN_SESSION = 8010,
     /* Header appearance switcher. It shares the 8000 block with the nav ids
      * (8000..8010) — keep any new nav item below BTN_THEME_LIGHT — and it needs
@@ -2682,7 +2680,6 @@ static void buildButtons()
         const NavTab tab = navTabForScreen(g_screen);
         addNav(NAV_HOME_Y, "主页", BTN_NAV_HOME,     GLYPH_MONITOR, tab == NAV_HOME);
         addNav(NAV_SET_Y,  "设置", BTN_NAV_SETTINGS, GLYPH_SLIDERS, tab == NAV_SETTINGS);
-        addNav(NAV_QUIT_Y, "退出", BTN_NAV_QUIT,     GLYPH_POWER,   false);
     }
 
     const int cx = CONTENT_CX;
@@ -3413,11 +3410,6 @@ static void onButton(int id)
          * 画质 box just snapped back to its saved value. */
         if (g_screen != SCR_SETTINGS) openSettings();
         break;
-    case BTN_NAV_QUIT: {
-        SDL_Event e; e.type = SDL_QUIT; SDL_PushEvent(&e);
-        break;
-    }
-
     case BTN_HOME_RECEIVE:
         launchReceiver();
         break;
