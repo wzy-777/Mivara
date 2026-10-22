@@ -40,8 +40,12 @@ Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescripti
 Source: "..\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs; Excludes: "sender_noUAC.exe"
 ; helper scripts
 Source: "..\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion
-; docs
+; docs — shipped offline so the relative links inside the installed READMEs resolve
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\README_EN.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\CODE_SIGNING_POLICY.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; virtual-display driver (extend mode) – excludes the >100MB vendor GUI
 Source: "..\vdd\install_vdd.ps1"; DestDir: "{app}\vdd"; Flags: ignoreversion
 Source: "..\vdd\install_vdd2.ps1"; DestDir: "{app}\vdd"; Flags: ignoreversion
