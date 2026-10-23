@@ -2,7 +2,8 @@
 # ============================================================================
 # Mivara (幻屏) — one-shot release
 # ============================================================================
-#   build (portable) → artifacts → commit → push → tag → GitHub Release → verify
+#   build (portable) → artifacts → commit → push → tag → GitHub Release →
+#   winget PR → verify
 #
 # Usage:
 #   ./release.sh 0.9.3              # bump + full release
@@ -11,6 +12,7 @@
 #   ./release.sh 0.9.3 --yes        # no confirmation prompt (CI-like use)
 #   ./release.sh 0.9.3 --skip-build # reuse dist/ artifacts from a previous run
 #   ./release.sh 0.9.3 --no-winget  # do not create/update winget/<ver>/
+#   ./release.sh 0.9.3 --no-winget-pr  # keep winget/<ver>/ but do not submit the PR
 #
 # What it automates (AGENTS.md "Installer" checklist):
 #   * portable build  : make clean + OPT_FLAGS="-O3 -march=x86-64 -flto"
@@ -18,6 +20,8 @@
 #   * SHA256SUMS.txt  : the in-app updater is fail-closed without it
 #   * version bump    : src/version.h + both README badges + winget/<ver>/
 #   * publish         : commit → push → lightweight tag → GitHub Release (3 assets)
+#   * winget PR       : winget/submit.sh creates/updates the microsoft/winget-pkgs
+#                       PR in place (one PR per package — see that script)
 #   * verification    : releases/latest redirect, asset list, and a re-download of
 #                       the published installer hashed against the local one
 #
@@ -44,7 +48,7 @@ step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32mok\033[0m  %s\n' "$*"; }
 warn() { printf '    \033[33m!\033[0m   %s\n' "$*" >&2; }
 die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -54,6 +58,7 @@ DRY_RUN=0
 YES=0
 SKIP_BUILD=0
 DO_WINGET=1
+DO_WINGET_PR=1
 VERIFY_DOWNLOAD=1
 NOTES=""
 TITLE=""
@@ -65,6 +70,7 @@ while [ $# -gt 0 ]; do
     --yes|-y)         YES=1 ;;
     --skip-build)     SKIP_BUILD=1 ;;
     --no-winget)      DO_WINGET=0 ;;
+    --no-winget-pr)   DO_WINGET_PR=0 ;;
     --no-verify-download) VERIFY_DOWNLOAD=0 ;;
     --notes)          shift; NOTES="${1:-}" ;;
     --title)          shift; TITLE="${1:-}" ;;
@@ -337,6 +343,9 @@ fi
 
 if [ "$YES" != 1 ]; then
   printf '\n即将对 %s 执行：commit → push %s → tag %s → GitHub Release（公开可见）\n' "$REPO_SLUG" "$BRANCH" "$TAG"
+  if [ "$DO_WINGET" = 1 ] && [ "$DO_WINGET_PR" = 1 ]; then
+    printf '并向 microsoft/winget-pkgs 提交/更新 PR（公开可见）\n'
+  fi
   printf '继续? [y/N] '
   read -r ans
   case "$ans" in y|Y|yes|YES) ;; *) die "已取消（没有推送任何东西）" ;; esac
@@ -375,6 +384,23 @@ gh_net release create "$TAG" \
   如果 release 已被部分创建（例如只传上去一个资产），先删掉再重跑：
   gh release delete $TAG --yes --cleanup-tag"
 ok "Release 已创建"
+
+# ---------------------------------------------------------------------------
+# 10b. winget-pkgs PR (create, or update the open PR in place)
+# ---------------------------------------------------------------------------
+# Runs after the release so the installer URL winget's validation downloads
+# already resolves. A failure here must not fail the release: the artifacts
+# are public and correct, and the script is idempotent — rerun it by hand.
+if [ "$DO_WINGET" = 1 ] && [ "$DO_WINGET_PR" = 1 ]; then
+  step "提交 winget 清单"
+  if "$ROOT/winget/submit.sh" "$VER"; then
+    ok "winget-pkgs 已提交"
+  else
+    warn "winget PR 未提交成功——发布本身已完成。可稍后重跑：./winget/submit.sh $VER"
+  fi
+elif [ "$DO_WINGET" = 1 ]; then
+  warn "跳过 winget PR（--no-winget-pr）；可稍后运行 ./winget/submit.sh $VER"
+fi
 
 # ---------------------------------------------------------------------------
 # 11. Live verification (against the published bytes, not the local files)
@@ -417,4 +443,8 @@ fi
 step "完成"
 printf '  Release : %s/releases/tag/%s\n' "$REPO_URL" "$TAG"
 printf '  SHA-256 : %s\n' "$HASH"
-printf '\n  仍需人工完成：winget 清单提交到 microsoft/winget-pkgs（见 winget/README.md）\n'
+if [ "$DO_WINGET" = 1 ] && [ "$DO_WINGET_PR" = 1 ]; then
+  printf '\n  winget  : PR 已提交/更新，等待自动校验与社区版主合并\n'
+else
+  printf '\n  仍需人工完成：winget 清单提交（./winget/submit.sh %s）\n' "$VER"
+fi
