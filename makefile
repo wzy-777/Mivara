@@ -120,8 +120,10 @@ ifeq ($(OS),Windows_NT)
     NET_LIBS := -lws2_32 -liphlpapi -lpthread
     # sender: console subsystem (logs + Ctrl+C graceful stop), no SDL
     # -lsetupapi: enable/disable the Root\MttVDD device (vdd.cpp)
-    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi
-    RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
+    # -ladvapi32: registry override lookup for vdd_settings.xml (vdd.cpp)
+    # -luser32: stitch KVM (hooks, Raw Input, SendInput, MessageBox) in kvm.cpp
+    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi -ladvapi32 -luser32
+    RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32
     # app: -lwinhttp (update check/download), -lbcrypt (SHA-256 via CNG),
     #      -ladvapi32 (SetNamedSecurityInfo + SDDL on the update directory)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -lsetupapi \
@@ -173,6 +175,7 @@ OBJ_SENDER   := $(BUILDDIR)/sender.o
 OBJ_RECEIVER := $(BUILDDIR)/receiver.o
 OBJ_UPDATE   := $(BUILDDIR)/update.o
 OBJ_THEME    := $(BUILDDIR)/theme.o
+OBJ_KVM      := $(BUILDDIR)/kvm.o
 
 # ============================================================================
 # PHONY TARGET DECLARATIONS
@@ -226,19 +229,20 @@ $(OBJ_CONFIG): $(SRCDIR)/config.h
 $(OBJ_HISTORY): $(SRCDIR)/history.h
 $(OBJ_UPDATE): $(SRCDIR)/update.h $(SRCDIR)/version.h
 $(OBJ_THEME): $(SRCDIR)/theme.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
-$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h
+$(OBJ_KVM): $(SRCDIR)/kvm.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
+$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h
 
 # ============================================================================
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
-$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) | $(BINDIR)
+$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) | $(BINDIR)
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
@@ -306,6 +310,7 @@ check:
 	@for f in app.cpp sender.cpp receiver.cpp discover.cpp discover.h \
                gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
+               kvm.cpp kvm.h \
                config.cpp config.h history.cpp history.h \
 	               update.cpp update.h version.h theme.cpp theme.h; do \
         if [ -f $(SRCDIR)/$$f ]; then \
@@ -394,5 +399,6 @@ help:
 	@echo "  make help         Show this message"
 	@echo ""
 	@echo "SENDER CLI:"
-	@echo "  bin/sender [ip] [port] [--mode mirror|extend]"
+	@echo "  bin/sender [ip] [port] [--mode mirror|extend|stitch]"
 	@echo "    --mode skips all interactive prompts (used by the GUI)"
+	@echo "    stitch = software KVM (keyboard+mouse only, no video), Windows only"

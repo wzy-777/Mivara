@@ -29,6 +29,15 @@ namespace {
 
 const size_t HIST_CAP = 20;
 
+/* Recognised wire tokens for the mode column. Anything else falls back to
+ * mirror so an old/hand-edited history.ini can never break a row. */
+std::string normMode(const std::string &mode)
+{
+    if (mode == "extend" || mode == "stitch")
+        return mode;
+    return "mirror";
+}
+
 std::string historyPath()
 {
 #ifdef _WIN32
@@ -124,9 +133,7 @@ std::vector<HistEntry> historyLoad()
         if (e.port <= 0 || e.port > 65535)
             continue;
         e.name = trim(parts[2]);
-        e.mode = trim(parts[3]);
-        if (e.mode != "mirror" && e.mode != "extend")
-            e.mode = "mirror";
+        e.mode = normMode(trim(parts[3]));
         e.last_used_unix = atoll(parts[4].c_str());
         e.use_count = atoi(parts[5].c_str());
         if (e.use_count < 1)
@@ -150,7 +157,7 @@ void historyUpsert(const std::string &ip, int port, const std::string &name,
     fresh.ip = ip;
     fresh.port = port;
     fresh.name = name;
-    fresh.mode = (mode == "extend") ? "extend" : "mirror";
+    fresh.mode = normMode(mode);
     fresh.last_used_unix = (long long)time(nullptr);
     fresh.use_count = 1;
 

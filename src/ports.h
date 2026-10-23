@@ -59,6 +59,9 @@ typedef int ports_sock_t;
 #define PORTS_OP_GET_PORT 0x04u
 #define PORTS_OP_KILL_PORT 0x05u
 
+    /** Return non-zero when the service should stop (NULL = never stop). */
+    typedef int (*ports_stop_fn)(void);
+
 /* Socket states (mirrors Linux TCP states, mapped on other platforms) */
 #define PSTATE_ESTABLISHED 1
 #define PSTATE_SYN_SENT 2
@@ -150,11 +153,14 @@ typedef int ports_sock_t;
 
     /* ─── Receiver-side (server) API ─────────────────────────────── */
 
-    /** Handle one connected client (blocking until disconnect). */
-    void ports_service_handle_client(int client_sock);
+    /** Handle one connected client (blocking until disconnect).
+     *  `should_stop` is polled at least once per second; NULL means never. */
+    void ports_service_handle_client(int client_sock, ports_stop_fn should_stop);
 
-    /** Start the port service listener (blocking, run in a thread). */
-    void ports_service_run(void);
+    /** Start the port service listener (blocking, run in a thread).
+     *  Returns within ~2 s of `should_stop` returning non-zero (one
+     *  stop-poll interval plus per-client worker drain). */
+    void ports_service_run(ports_stop_fn should_stop);
 
 #ifdef __cplusplus
 } /* extern "C" */

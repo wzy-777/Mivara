@@ -29,6 +29,9 @@ typedef int gpu_sock_t;
 /* ─── Constants ───────────────────────────────────────────────── */
 #define GPU_ACCEL_PORT 8082
 
+    /** Return non-zero when the service should stop (NULL = never stop). */
+    typedef int (*gpu_stop_fn)(void);
+
     /* ── Sender-side (client) ─────────────────────────────────────── */
 
     /** Connect to the receiver's GPU service. Returns socket fd or -1. */
@@ -52,11 +55,13 @@ typedef int gpu_sock_t;
 
     /* ── Receiver-side (server) ───────────────────────────────────── */
 
-    /** Handle one connected GPU-service client (blocking until disconnect). */
-    void gpu_service_handle_client(int client_sock);
+    /** Handle one connected GPU-service client (blocking until disconnect).
+     *  `should_stop` is polled at least once per second; NULL means never. */
+    void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop);
 
-    /** Start the GPU service listener – run in a dedicated thread (blocking). */
-    void gpu_service_run(void);
+    /** Start the GPU service listener – run in a dedicated thread (blocking).
+     *  Returns within ~1 s of `should_stop` returning non-zero. */
+    void gpu_service_run(gpu_stop_fn should_stop);
 
 #ifdef __cplusplus
 }

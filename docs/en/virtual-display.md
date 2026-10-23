@@ -33,4 +33,15 @@ pnputil /scan-devices
 
 ### Resolution Notes
 
-Once activated, the virtual display is automatically configured to **1920x1080@60** and placed right of the existing desktop. The resolution can be chosen at session start (interactive mode) or defaults to 1920x1080; to change the default, edit the `vddConfigure(dev, x, 0, w, h, 60)` call in `vddStartup()` in vdd.cpp, or add modes to the driver's `vdd_settings.xml` and rebuild.
+Extend mode **asks the receiver for its current resolution first** (a zero-window probe) and then configures the virtual display to the same size, so the extended screen is 1:1 instead of stretched when the two aspect ratios differ. The virtual display is placed right of the existing desktop.
+
+The driver reads its mode list from `vdd_settings.xml` once at start-up; a size that is not in the list cannot be applied. Therefore:
+
+- If the list already contains the receiver's size, it is used directly (the shipped list has 800x600, 1366x768, 1920x1080, 2560x1440 and 3840x2160).
+- If it does not, the sender can append the size to `vdd_settings.xml` **after explicit user consent** (the original is backed up once as `vdd_settings.xml.mivara.bak` and the result is re-read and verified), then restarts the virtual display device once so the driver reloads it. The GUI asks on the first extend connection and remembers the answer in `config.ini` as `vdd_mode_write` (`ask` / `always` / `never`). If the virtual display is currently in use (e.g. a leftover session after a crash), the file is left untouched this time; the new mode loads at the next session.
+- Without an exact mode and without write permission, the sender picks the **closest aspect ratio** the driver exposes and the receiver centres the picture with black bars instead of stretching it.
+- Matching uses the receiver's full resolution: a 4K receiver also raises capture, encoding and bandwidth. To save resources, set a smaller `extend_res` in `config.ini`; the receiver then centres the picture with black bars, still without stretching.
+
+To force a size manually, use `--extend-res 2560x1600` on the command line or set `extend_res=2560x1600` in `config.ini` (default `auto`). Added modes appear in the sender's Windows Settings > Display > Display resolution list while the extend session is running and can be selected there; they remain available to every later extend session.
+
+> The settings path comes from the registry `HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver` values `SettingsPath` / `VDDPATH` when present, otherwise `C:\Windows\System32\drivers\UMDF\vdd_settings.xml`. Writing requires administrator rights (the sender carries a `requireAdministrator` manifest).

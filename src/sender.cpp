@@ -50,6 +50,7 @@
 #include <algorithm>
 #include "discover.h"
 #include "gpu_accelerate.h"
+#include "kvm.h"
 #include "ports.h"
 #include "vdd.h"
 #include "proto.h"
@@ -93,6 +94,9 @@
 /* ── Display mode (values go over the wire – keep in sync with receiver) ── */
 #define MODE_MIRROR        0u
 #define MODE_TRUE_EXTEND   1u
+/* Local only: 拼接 is a KVM input channel (kvm.h), never a HsRequestV2 mode.
+ * It must never be written into DISPLAY_MODE / sent on 8081. */
+#define MODE_STITCH        2u
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 #define BYTES_PER_PIXEL       3
@@ -221,6 +225,7 @@ class NetworkSocket
     bool valid()    const { return _s >= 0; }
     void raw_close()      { ::close(_s); _s = -1; }
 #endif
+    bool _quiet = false;    /* one-shot probes: no error chatter */
 
 public:
     ~NetworkSocket() { close(); }
@@ -238,15 +243,17 @@ public:
     }
 
     bool connect(const std::string &ip, int port,
-                 int timeout_ms = CONNECTION_TIMEOUT_MS)
+                 int timeout_ms = CONNECTION_TIMEOUT_MS, bool quiet = false)
     {
+        _quiet = quiet;
         if (!create()) return false;
 
         struct sockaddr_in addr = {};
         addr.sin_family = AF_INET;
         addr.sin_port   = htons((uint16_t)port);
         if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-            std::cerr << COL_RED << "Invalid IP: " << ip << COL_RESET << "\n";
+            if (!quiet)
+                std::cerr << COL_RED << "Invalid IP: " << ip << COL_RESET << "\n";
             return false;
         }
 
@@ -275,8 +282,9 @@ public:
         fcntl(_s, F_SETFL, fl);
 #endif
         if (!ok) {
-            std::cerr << COL_RED << "Timeout: " << ip << ":"
-                      << port << COL_RESET << "\n";
+            if (!quiet)
+                std::cerr << COL_RED << "Timeout: " << ip << ":"
+                          << port << COL_RESET << "\n";
             close(); return false;
         }
 
@@ -298,9 +306,22 @@ public:
         tmo.tv_sec = 5;
         setsockopt(_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tmo, sizeof(tmo));
 #endif
-        std::cout << COL_GREEN << "Connected to "
-                  << ip << ":" << port << COL_RESET << "\n";
+        if (!quiet)
+            std::cout << COL_GREEN << "Connected to "
+                      << ip << ":" << port << COL_RESET << "\n";
         return true;
+    }
+
+    /* Shorten the recv timeout for one-shot requests (display probe). */
+    void setRecvTimeout(int ms) {
+        if (!valid()) return;
+#ifdef _WIN32
+        DWORD t = (DWORD)ms;
+        setsockopt(_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&t, sizeof(t));
+#else
+        struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+        setsockopt(_s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
     }
 
     bool sendAll(const void *data, size_t size) {
@@ -310,14 +331,16 @@ public:
             int n = (int)send(_s, p + sent, (int)(size - sent), 0);
 #ifdef _WIN32
             if (n == SOCKET_ERROR) {
-                std::cerr << COL_RED << "Send error: "
-                          << WSAGetLastError() << COL_RESET << "\n";
+                if (!_quiet)
+                    std::cerr << COL_RED << "Send error: "
+                              << WSAGetLastError() << COL_RESET << "\n";
                 return false;
             }
 #else
             if (n < 0) {
-                std::cerr << COL_RED << "Send error: "
-                          << strerror(errno) << COL_RESET << "\n";
+                if (!_quiet)
+                    std::cerr << COL_RED << "Send error: "
+                              << strerror(errno) << COL_RESET << "\n";
                 return false;
             }
 #endif
@@ -469,9 +492,41 @@ static std::vector<uint8_t> captureScreen()
  * ══════════════════════════════════════════════════════════════════════════ */
 #ifdef _WIN32
 
+/* Strict whole-token "WxH" parser (e.g. 2560x1600). */
+static bool parseWxH(const std::string &s, int &w, int &h)
+{
+    const size_t x = s.find_first_of("xX");
+    if (x == std::string::npos || x == 0 || x + 1 >= s.size())
+        return false;
+    auto whole = [](const std::string &t, int &v) {
+        if (t.empty()) return false;
+        long long n = 0;
+        for (char c : t) {
+            if (c < '0' || c > '9') return false;
+            n = n * 10 + (c - '0');
+            if (n > 100000) return false;
+        }
+        v = (int)n;
+        return true;
+    };
+    int pw = 0, ph = 0;
+    if (!whole(s.substr(0, x), pw) || !whole(s.substr(x + 1), ph))
+        return false;
+    /* The encoder requires even dimensions; reject odd sizes up front so the
+     * VDD never gets a mode the capture path cannot stream. */
+    if (pw < 320 || pw > 7680 || ph < 240 || ph > 4320 ||
+        (pw & 1) || (ph & 1))
+        return false;
+    w = pw;
+    h = ph;
+    return true;
+}
+
 /* Ask the user which resolution the virtual display should use.
- * Modes mirror the driver's vdd_settings.xml. Default: 1920x1080. */
-static void selectExtendResolution(int &w, int &h)
+ * Modes mirror the driver's vdd_settings.xml. When the receiver's display
+ * size is known, "match the receiver" is the default (0). */
+static void selectExtendResolution(int &w, int &h,
+                                   int recv_w = 0, int recv_h = 0)
 {
     struct Mode { int w, h; const char *label; };
     static const Mode modes[] = {
@@ -482,30 +537,42 @@ static void selectExtendResolution(int &w, int &h)
         { 800,  600, "800x600"},
     };
     const int nModes = (int)(sizeof(modes) / sizeof(modes[0]));
+    const bool haveRecv = recv_w > 0 && recv_h > 0;
 
     std::cout << "\n"
               << COL_CYAN << COL_BOLD
               << "  Virtual display resolution:\n" << COL_RESET;
+    if (haveRecv)
+        std::cout << "  " << COL_GREEN << "0" << COL_RESET
+                  << "  Match receiver (" << recv_w << "x" << recv_h << ")\n";
     for (int i = 0; i < nModes; i++)
-        std::cout << "  " << (i == 0 ? COL_GREEN : COL_YELLOW) << (i + 1)
-                  << COL_RESET << "  " << modes[i].label << "\n";
+        std::cout << "  " << (!haveRecv && i == 0 ? COL_GREEN : COL_YELLOW)
+                  << (i + 1) << COL_RESET << "  " << modes[i].label << "\n";
     std::cout << "  (resolution can also be changed later in Windows "
                  "display settings – the stream adapts automatically)\n";
-    std::cout << COL_BOLD << "  Choice [1]: " << COL_RESET;
+    std::cout << COL_BOLD << "  Choice [" << (haveRecv ? "0" : "1")
+              << "]: " << COL_RESET;
 
     std::string line;
     std::getline(std::cin, line);
-    int idx = 0;
+    int pick = haveRecv ? 0 : 1;
     if (!line.empty()) {
-        try { idx = std::stoi(line) - 1; }
-        catch (...) { idx = -1; }
+        try { pick = std::stoi(line); }
+        catch (...) { pick = -1; }
     }
-    if (idx < 0 || idx >= nModes) {
-        std::cout << COL_YELLOW << "  Using default 1920x1080\n" << COL_RESET;
-        idx = 0;
+    if (haveRecv && pick == 0) {
+        w = recv_w;
+        h = recv_h;
+    } else if (pick >= 1 && pick <= nModes) {
+        w = modes[pick - 1].w;
+        h = modes[pick - 1].h;
+    } else {
+        std::cout << COL_YELLOW << "  Using default "
+                  << (haveRecv ? "receiver size" : "1920x1080") << "\n"
+                  << COL_RESET;
+        if (haveRecv) { w = recv_w; h = recv_h; }
+        else          { w = modes[0].w; h = modes[0].h; }
     }
-    w = modes[idx].w;
-    h = modes[idx].h;
     std::cout << COL_GREEN << "  Resolution: " << w << "x" << h << "\n"
               << COL_RESET;
 }
@@ -526,6 +593,11 @@ static uint32_t selectDisplayMode()
                       << "  Extend        (real 2nd desktop – virtual display is\n"
                       << "                   attached automatically for the session)\n"
 #endif
+#ifdef _WIN32
+              << "  " << COL_CYAN << "3" << COL_RESET
+                      << "  Stitch        (software KVM – one keyboard/mouse for\n"
+                      << "                   both PCs; no video is streamed)\n"
+#endif
               << COL_BOLD << "  Choice [1]: " << COL_RESET;
 
     std::string line;
@@ -533,6 +605,7 @@ static uint32_t selectDisplayMode()
 
 #ifdef _WIN32
     if (line == "2") return MODE_TRUE_EXTEND;
+    if (line == "3") return MODE_STITCH;
 #endif
     return MODE_MIRROR;             /* default */
 }
@@ -720,6 +793,14 @@ static void stdinReaderLoop()
         if (line.rfind("SETP|", 0) == 0) {
             std::lock_guard<std::mutex> lk(g_setp_mtx);
             g_pending_setp = line;              /* last-wins */
+        } else if (line.rfind("STITCH|", 0) == 0) {
+            /* STITCH|side=left — live direction switch while a 拼接 session
+             * runs. kvmSetControllerSide() is thread-safe and a no-op when no
+             * controller is active, so no mutex is needed here. */
+            if (line.compare(7, 5, "side=") == 0) {
+                const int side = kvmSideFromKey(line.c_str() + 12);
+                if (side >= 0) kvmSetControllerSide(side);
+            }
         } else if (line == "PING") {
             std::cout << "STAT|event=pong\n" << std::flush;
         }
@@ -785,6 +866,44 @@ static HsRequestV2 makeHsRequest(int w, int h)
     r.reserved     = 0;
     return r;
 }
+
+#ifdef _WIN32
+/* Ask the receiver for its current display size before the virtual display
+ * is created. Sends a protocol-v2 handshake with width=height=0: the
+ * receiver answers HsResponseV2 with recv_width/recv_height and HS_ERR_DIMS,
+ * then closes before SDL_Init, so no window is created and no decoder is
+ * opened. A quiet failure is fine – callers keep the default mode and the
+ * receiver letterboxes any residual aspect mismatch. */
+static bool probeReceiverDisplay(const std::string &ip, int port,
+                                 int &w, int &h)
+{
+    NetworkSocket probe;
+    if (!probe.connect(ip, port, 1500, /*quiet=*/true))
+        return false;
+    probe.setRecvTimeout(2000);
+
+    HsRequestV2 req = makeHsRequest(0, 0);
+    if (!probe.sendAll(&req, sizeof(req)))
+        return false;
+
+    HsResponseV2 res = {};
+    if (!probe.recvAll(&res, sizeof(res)))
+        return false;
+    if (ntohl(res.magic) != TVHS_MAGIC ||
+        ntohl(res.version) != TVHS_VERSION)
+        return false;
+
+    int rw = (int)ntohl(res.recv_width);
+    int rh = (int)ntohl(res.recv_height);
+    rw &= ~1;                       /* even dimensions for the encoder */
+    rh &= ~1;
+    if (rw < 320 || rw > 7680 || rh < 240 || rh > 4320)
+        return false;
+    w = rw;
+    h = rh;
+    return true;
+}
+#endif /* _WIN32 */
 
 /* Coded (stream) size for a given capture size, honoring --scale.
  * Coded dims are even; src stays the capture size so the encoder's
@@ -997,15 +1116,28 @@ int main(int argc, char* argv[])
         SetConsoleMode(hOut, conMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     SetConsoleOutputCP(65001);
 #endif
-    getScreenDimensions(SCREEN_WIDTH, SCREEN_HEIGHT);
+    /* Pre-scan --mode before touching capture state: stitch never encodes a
+     * frame, so the Source WxH banner (and GetSystemMetrics) is meaningless
+     * there. The full argv parse below still owns every value. */
+    bool arg_stitch = false;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--mode") == 0 &&
+            std::strcmp(argv[i + 1], "stitch") == 0)
+            arg_stitch = true;
+    }
+    if (!arg_stitch)
+        getScreenDimensions(SCREEN_WIDTH, SCREEN_HEIGHT);
 
     std::cout << COL_CYAN << COL_BOLD
               << "========================================\n"
                  "  Mivara SENDER v" MIVARA_VERSION "\n"
-                 "========================================\n" << COL_RESET
-              << "  Source: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
-              << "  @ " << TARGET_FPS << " FPS\n"
-              << COL_CYAN << "========================================\n"
+                 "========================================\n" << COL_RESET;
+    if (arg_stitch)
+        std::cout << "  Mode: 拼接 (software KVM – keyboard/mouse only)\n";
+    else
+        std::cout << "  Source: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT
+                  << "  @ " << TARGET_FPS << " FPS\n";
+    std::cout << COL_CYAN << "========================================\n"
               << COL_RESET;
 
     if (!initSockets()) {
@@ -1024,19 +1156,44 @@ int main(int argc, char* argv[])
 #endif
 
     /* Discover receivers (or use direct IP from command line).
-     * CLI: sender [ip] [port] [--mode mirror|extend]
+     * CLI: sender [ip] [port] [--mode mirror|extend|stitch]
      *          [--codec auto|h264|h265|av1|raw|rle] [--hw 0|1]
      *          [--bitrate <kbps>] [--quality <0-51>] [--fps <n>]
      *          [--scale <pct>] [--chroma 420|444]
-     *   --mode is non-interactive (GUI/automation): skips the prompts
-     *   and, for extend, uses the default 1920x1080 virtual display. */
+     *          [--extend-res auto|WxH] [--vdd-add-modes 0|1]
+     *          [--stitch-side left|right|top|bottom]
+     *   --mode is non-interactive (GUI/automation): skips the prompts.
+     *   --stitch-side names the edge the peer sits on (default right); the
+     *   GUI asks the user and can switch it mid-session over stdin.
+     *   Extend auto-probes the receiver and matches its display size; when
+     *   that size is missing from the driver's settings file, --vdd-add-modes 1
+     *   appends it (the GUI sets it after an explicit user consent).
+     *   stitch is a software-KVM channel (kvm.h): it never captures or
+     *   encodes anything and exits before the display-mode/VDD code below. */
     std::string cli_mode;                       /* empty = ask interactively */
     std::string cli_ip;
     std::string cli_codec = "h264";
+    std::string cli_extend_res = "auto";
+    int cli_add_modes = -1;                     /* -1 = not specified */
+    int cli_stitch_side = KVM_SIDE_RIGHT;       /* where the peer sits */
     int cli_port = 8081;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             cli_mode = argv[++i];
+        } else if (std::strcmp(argv[i], "--stitch-side") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            cli_stitch_side = kvmSideFromKey(v);
+            if (cli_stitch_side < 0) {
+                std::cerr << COL_RED << "Unknown --stitch-side: " << v
+                          << "  (expected left | right | top | bottom)\n"
+                          << COL_RESET;
+                cleanupSockets();
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--extend-res") == 0 && i + 1 < argc) {
+            cli_extend_res = argv[++i];
+        } else if (std::strcmp(argv[i], "--vdd-add-modes") == 0 && i + 1 < argc) {
+            cli_add_modes = (std::atoi(argv[++i]) != 0) ? 1 : 0;
         } else if (std::strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             cli_codec = argv[++i];
         } else if (std::strcmp(argv[i], "--hw") == 0 && i + 1 < argc) {
@@ -1066,16 +1223,38 @@ int main(int argc, char* argv[])
     }
     g_codec = codecFromString(cli_codec);   /* "auto" → CODEC_H264 */
 
+    /* Resolve the mode before probing: stitch dials the KVM port (8084),
+     * mirror/extend dial the video port (8081). --mode skips the prompt.
+     * Remember whether the choice came from the prompt: cli_mode is never
+     * empty after this block, so the extend path must not use that as the
+     * "interactive" test. */
+    const bool mode_interactive = cli_mode.empty();
+    if (mode_interactive) {
+        const uint32_t picked = selectDisplayMode();
+        cli_mode = (picked == MODE_TRUE_EXTEND) ? "extend"
+                 : (picked == MODE_STITCH)      ? "stitch"
+                                                : "mirror";
+    } else if (cli_mode != "mirror" && cli_mode != "extend" &&
+               cli_mode != "stitch") {
+        std::cerr << COL_RED << "Unknown --mode: " << cli_mode
+                  << "  (expected mirror | extend | stitch)\n" << COL_RESET;
+        cleanupSockets();
+        return 1;
+    }
+
     std::vector<DiscoveredDevice> receivers;
     if (!cli_ip.empty()) {
-        /* Direct connection: sender <ip> [port] */
+        /* Direct connection: sender <ip> [port]
+         * Stitch talks to KVM_PORT, not the video port – probing 8081 would
+         * report success on a receiver whose 8084 listener failed to bind. */
+        const int probe_port = (cli_mode == "stitch") ? KVM_PORT : cli_port;
         std::cout << COL_CYAN << "Direct connection mode: "
-                  << cli_ip << ":" << cli_port << "\n" << COL_RESET;
-        if (testTcpConnection(cli_ip, cli_port, 2000)) {
-            receivers.emplace_back(cli_ip, cli_port);
+                  << cli_ip << ":" << probe_port << "\n" << COL_RESET;
+        if (testTcpConnection(cli_ip, probe_port, 2000)) {
+            receivers.emplace_back(cli_ip, probe_port);
         } else {
             std::cerr << COL_RED << "Cannot connect to "
-                      << cli_ip << ":" << cli_port << "\n" << COL_RESET;
+                      << cli_ip << ":" << probe_port << "\n" << COL_RESET;
             cleanupSockets(); return 1;
         }
     } else {
@@ -1085,7 +1264,7 @@ int main(int argc, char* argv[])
     if (receivers.empty()) {
         std::cerr << COL_RED
                   << "No receivers found!\n"
-                     "  Check firewall: UDP 1900, TCP 8081, TCP 8082\n"
+                     "  Check firewall: UDP 1900, TCP 8081, TCP 8082, TCP 8084\n"
                   << COL_RESET;
         cleanupSockets(); return 1;
     }
@@ -1113,10 +1292,24 @@ int main(int argc, char* argv[])
     std::cout << COL_GREEN << "Selected: " << sel.toString()
               << COL_RESET << "\n";
 
-    /* Choose display mode (CLI --mode skips the prompt) */
-    if (cli_mode == "extend")      DISPLAY_MODE = MODE_TRUE_EXTEND;
-    else if (cli_mode == "mirror") DISPLAY_MODE = MODE_MIRROR;
-    else                           DISPLAY_MODE = selectDisplayMode();
+    /* 拼接 (stitch / software KVM) is not a display mode: the peer keeps its
+     * own desktop and only the keyboard/mouse travel. Run the input channel
+     * and leave before any capture, codec, VDD or 8081/8082/8083 traffic. */
+    if (cli_mode == "stitch") {
+        std::cout << COL_GREEN
+                  << "Mode: Stitch (KVM input only – no video stream)\n"
+                  << COL_RESET;
+        /* The GUI switches sides with STITCH|side=… lines on stdin. Stitch
+         * returns before the streaming path starts its own reader. */
+        startStdinReader();
+        const int rc = kvmRunController(sel.ip_address.c_str(), KVM_PORT,
+                                        cli_stitch_side, g_running);
+        cleanupSockets();
+        return rc == 0 ? 0 : 1;
+    }
+
+    /* cli_mode was resolved above (argv or prompt); stitch already returned. */
+    DISPLAY_MODE = (cli_mode == "extend") ? MODE_TRUE_EXTEND : MODE_MIRROR;
     const char *modeLabel =
         DISPLAY_MODE == MODE_TRUE_EXTEND ? "Extend" : "Mirror";
     std::cout << COL_GREEN << "Mode: " << modeLabel << COL_RESET << "\n";
@@ -1126,13 +1319,66 @@ int main(int argc, char* argv[])
      * aim the capture at it). Must happen before the handshake so the
      * correct dimensions are announced to the receiver. */
     if (DISPLAY_MODE == MODE_TRUE_EXTEND) {
-        int vdd_w = 1920, vdd_h = 1080;      /* default resolution */
-        if (cli_mode.empty()) selectExtendResolution(vdd_w, vdd_h);
+        int vdd_w = 1920, vdd_h = 1080;      /* fallback resolution */
+        bool manual = false;
+
+        if (cli_extend_res != "auto") {
+            manual = parseWxH(cli_extend_res, vdd_w, vdd_h);
+            if (manual) {
+                std::cout << COL_CYAN << "Extend resolution (manual): "
+                          << vdd_w << "x" << vdd_h << "\n" << COL_RESET;
+            } else {
+                std::cout << COL_YELLOW << "Ignoring invalid --extend-res '"
+                          << cli_extend_res << "' (want auto or WxH)\n"
+                          << COL_RESET;
+            }
+        }
+
+        if (!manual) {
+            /* Ask the receiver for its current display size BEFORE creating
+             * the virtual display: matching it 1:1 is what eliminates the
+             * stretched picture. The probe starts no session on the
+             * receiver (no window, no decoder). */
+            int recv_w = 0, recv_h = 0;
+            if (probeReceiverDisplay(sel.ip_address, sel.tcp_port,
+                                     recv_w, recv_h)) {
+                std::cout << COL_GREEN << "Receiver display: "
+                          << recv_w << "x" << recv_h << COL_RESET << "\n";
+                if (mode_interactive)
+                    selectExtendResolution(vdd_w, vdd_h, recv_w, recv_h);
+                else {
+                    vdd_w = recv_w;
+                    vdd_h = recv_h;
+                }
+            } else if (mode_interactive) {
+                selectExtendResolution(vdd_w, vdd_h);
+            }
+        }
+
+        /* Make sure the driver's mode list contains the target size.
+         * allowWrite is true only when the user (or the GUI, after an
+         * explicit consent) passed --vdd-add-modes 1. Without it the file
+         * is read but never modified; vddStartup then uses the closest
+         * advertised mode and the receiver letterboxes the difference. */
+        const bool allowWrite = (cli_add_modes == 1);
+        std::string mode_err;
+        const VddModeResult mode_res =
+            vddEnsureMode(vdd_w, vdd_h, allowWrite, mode_err);
+        const bool reload = (mode_res == VDD_MODE_ADDED);
+        if (mode_res == VDD_MODE_ABSENT && !mode_err.empty())
+            std::cout << COL_YELLOW << "VDD: " << mode_err << "\n"
+                      << COL_RESET;
+
         VddInfo vdd;
-        if (!vddStartup(vdd_w, vdd_h, vdd)) {
+        if (!vddStartup(vdd_w, vdd_h, vdd, reload)) {
             emitStatError("vdd_startup_failed");
             cleanupSockets(); return 1;
         }
+        if (vdd.w != vdd_w || vdd.h != vdd_h)
+            std::cout << COL_YELLOW << "Virtual display: requested "
+                      << vdd_w << "x" << vdd_h << ", using "
+                      << vdd.w << "x" << vdd.h
+                      << " (receiver will letterbox)\n" << COL_RESET;
         g_cap_device   = vdd.device;
         g_cap_origin.x = vdd.x;
         g_cap_origin.y = vdd.y;

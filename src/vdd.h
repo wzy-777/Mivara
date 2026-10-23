@@ -26,10 +26,26 @@ struct VddInfo {
 bool vddInstalled();
 
 /* Attach the virtual monitor (if not already active), place it right of the
- * real desktop at reqW x reqH @60Hz (falls back to 1920x1080), and adopt
- * ownership so vddShutdown() will detach it when the session ends.
+ * real desktop at reqW x reqH @60Hz, and adopt ownership so vddShutdown()
+ * will detach it when the session ends. If the driver does not expose the
+ * requested size, the closest advertised mode is used instead.
+ * reloadFirst restarts an already-loaded driver once (needed after
+ * vddEnsureMode() appended a mode to vdd_settings.xml).
  * Returns false on failure (and detaches anything we attached). */
-bool vddStartup(int reqW, int reqH, VddInfo &out);
+bool vddStartup(int reqW, int reqH, VddInfo &out, bool reloadFirst = false);
+
+/* Result of making sure the driver's settings file lists a mode. */
+enum VddModeResult {
+    VDD_MODE_PRESENT,   /* exact w x h already listed */
+    VDD_MODE_ADDED,     /* appended now; the driver must be restarted */
+    VDD_MODE_ABSENT,    /* not listed (writing disabled or not possible) */
+};
+
+/* Ensure w x h is in the driver's vdd_settings.xml. With allowWrite=false
+ * the file is never modified. The original file is backed up once as
+ * vdd_settings.xml.mivara.bak before the first write. err is set when the
+ * mode cannot be made available. Windows only. */
+VddModeResult vddEnsureMode(int w, int h, bool allowWrite, std::string &err);
 
 /* Detach the virtual monitor if this process adopted it. Idempotent and
  * safe to call from any exit path (normal return, Ctrl+C cleanup,

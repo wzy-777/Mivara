@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -16,9 +17,12 @@
 #include <ws2tcpip.h>
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>
 #include <time.h>
 #endif
 
@@ -87,6 +91,116 @@ static int recv_all(int sock, void *buf, size_t size)
         int n = (int)recv(sock, p + got, (int)(size - got), 0);
         if (n <= 0) return -1;
         got += (size_t)n;
+    }
+    return 0;
+}
+
+/* ─── Stop-aware I/O (receiver-side service only) ────────────────
+ *
+ * The service thread must be able to return even while a client sits
+ * idle on a persistent connection.  Each blocking call is gated by a
+ * 1 s select(); the stop callback is re-checked on every timeout.
+ * The client-side helpers above stay byte-for-byte unchanged.        */
+
+#ifdef _WIN32
+#define GPU_FD_SET(s, set) FD_SET((SOCKET)(s), (set))
+#else
+#define GPU_FD_SET(s, set) FD_SET((s), (set))
+#endif
+
+static int gpu_wait(int sock, int for_write, gpu_stop_fn stop)
+{
+    for (;;) {
+        fd_set fds;
+        struct timeval tv;
+        int r;
+
+        if (stop && stop()) return -1;
+
+        FD_ZERO(&fds);
+#ifndef _WIN32
+        if (sock >= FD_SETSIZE) return -1;
+#endif
+        GPU_FD_SET(sock, &fds);
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+
+#ifdef _WIN32
+        r = select(0, for_write ? NULL : &fds, for_write ? &fds : NULL,
+                   NULL, &tv);
+#else
+        r = select(sock + 1, for_write ? NULL : &fds,
+                   for_write ? &fds : NULL, NULL, &tv);
+#endif
+        if (r > 0) return 0;
+        if (r < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            return -1;
+        }
+        /* timeout: loop and re-check the stop flag */
+    }
+}
+
+/* Accepted sockets are put in non-blocking mode: there is no way to bound a
+ * blocking send() with select() alone (select only promises *some* space),
+ * so a stalled peer could otherwise wedge the service past the stop flag. */
+static void gpu_set_nonblocking(int sock)
+{
+#ifdef _WIN32
+    u_long one = 1;
+    ioctlsocket((SOCKET)sock, FIONBIO, &one);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags >= 0) fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+static int recv_all_stop(int sock, void *buf, size_t size, gpu_stop_fn stop)
+{
+    char *p = (char *)buf;
+    size_t got = 0;
+    while (got < size) {
+        int n;
+        if (gpu_wait(sock, 0, stop) < 0) return -1;
+        n = (int)recv(sock, p + got, (int)(size - got), 0);
+        if (n <= 0) {
+#ifdef _WIN32
+            if (n < 0 && (WSAGetLastError() == WSAEINTR ||
+                          WSAGetLastError() == WSAEWOULDBLOCK)) continue;
+#else
+            if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                          errno == EWOULDBLOCK)) continue;
+#endif
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+static int send_all_stop(int sock, const void *buf, size_t size, gpu_stop_fn stop)
+{
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    while (sent < size) {
+        int n;
+        if (gpu_wait(sock, 1, stop) < 0) return -1;
+        n = (int)send(sock, p + sent, (int)(size - sent), 0);
+        if (n <= 0) {
+#ifdef _WIN32
+            if (n < 0 && (WSAGetLastError() == WSAEINTR ||
+                          WSAGetLastError() == WSAEWOULDBLOCK)) continue;
+#else
+            if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                          errno == EWOULDBLOCK)) continue;
+#endif
+            return -1;
+        }
+        sent += (size_t)n;
     }
     return 0;
 }
@@ -267,12 +381,13 @@ void gpu_remote_disconnect(gpu_sock_t gpu_sock)
  * RECEIVER-SIDE SERVER
  * ═══════════════════════════════════════════════════════════════ */
 
-void gpu_service_handle_client(int client_sock)
+void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
 {
     printf("[GPU-SVC] Client connected\n");
     for (;;) {
         GpuRequest req;
-        if (recv_all(client_sock, &req, sizeof(req)) < 0) break;
+        if (should_stop && should_stop()) break;
+        if (recv_all_stop(client_sock, &req, sizeof(req), should_stop) < 0) break;
         if (ntohl(req.magic) != GPU_MAGIC) {
             fprintf(stderr, "[GPU-SVC] Bad magic\n"); break;
         }
@@ -288,7 +403,7 @@ void gpu_service_handle_client(int client_sock)
             resp.magic     = htonl(GPU_MAGIC);
             resp.status    = 0;
             resp.operation = GPU_OP_PING;
-            send_all(client_sock, &resp, sizeof(resp));
+            send_all_stop(client_sock, &resp, sizeof(resp), should_stop);
             printf("[GPU-SVC] Ping OK\n");
             continue;
         }
@@ -301,7 +416,7 @@ void gpu_service_handle_client(int client_sock)
         if (!buf) break;
 
         double t0 = now_ms();
-        if (recv_all(client_sock, buf, data_sz) < 0) { free(buf); break; }
+        if (recv_all_stop(client_sock, buf, data_sz, should_stop) < 0) { free(buf); break; }
 
         uint8_t  *result    = NULL;
         uint32_t  result_sz = 0;
@@ -353,15 +468,15 @@ void gpu_service_handle_client(int client_sock)
         resp.result_size = htonl(result_sz);
         resp.ms_elapsed  = ms;
 
-        if (send_all(client_sock, &resp, sizeof(resp)) < 0) { free(result); break; }
+        if (send_all_stop(client_sock, &resp, sizeof(resp), should_stop) < 0) { free(result); break; }
         if (result && result_sz > 0)
-            if (send_all(client_sock, result, result_sz) < 0) { free(result); break; }
+            if (send_all_stop(client_sock, result, result_sz, should_stop) < 0) { free(result); break; }
         free(result);
     }
     printf("[GPU-SVC] Client disconnected\n");
 }
 
-void gpu_service_run(void)
+void gpu_service_run(gpu_stop_fn should_stop)
 {
 #ifdef _WIN32
     SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
@@ -388,20 +503,57 @@ void gpu_service_run(void)
     }
     listen(server, 4);
     printf("[GPU-SVC] Compute service listening on TCP %d\n", GPU_ACCEL_PORT);
+#ifndef _WIN32
+    /* A peer that vanished mid-frame must not take the receiver with it. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     for (;;) {
+        fd_set fds;
+        struct timeval tv;
+        int ready;
+
+        if (should_stop && should_stop()) break;
+
+        FD_ZERO(&fds);
+        GPU_FD_SET(server, &fds);
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+#ifdef _WIN32
+        ready = select(0, &fds, NULL, NULL, &tv);
+#else
+        ready = select((int)server + 1, &fds, NULL, NULL, &tv);
+#endif
+        if (ready < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            fprintf(stderr, "[GPU-SVC] select() failed\n");
+            break;
+        }
+        if (ready == 0) continue;   /* timeout: re-check the stop flag */
+
         struct sockaddr_in ca;
         memset(&ca, 0, sizeof(ca));
 #ifdef _WIN32
         int calen = sizeof(ca);
         SOCKET client = accept(server, (struct sockaddr *)&ca, &calen);
-        if (client == INVALID_SOCKET) continue;
+        if (client == INVALID_SOCKET) {
+            if (should_stop && should_stop()) break;
+            continue;
+        }
 #else
         socklen_t calen = sizeof(ca);
         int client = accept(server, (struct sockaddr *)&ca, &calen);
-        if (client < 0) continue;
+        if (client < 0) {
+            if (should_stop && should_stop()) break;
+            continue;
+        }
 #endif
         printf("[GPU-SVC] Connection from %s\n", inet_ntoa(ca.sin_addr));
-        gpu_service_handle_client((int)client);
+        gpu_set_nonblocking((int)client);
+        gpu_service_handle_client((int)client, should_stop);
 #ifdef _WIN32
         closesocket(client);
 #else

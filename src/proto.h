@@ -63,6 +63,14 @@ enum CtrlType : uint32_t {
 /* HsRequestV2.codec_flags */
 #define CODEC_FLAG_WANT_HW 0x1u   /* bit0: sender would like hardware encode */
 
+/* Display-size probe convention (no extra packet type, no version bump):
+ * a sender may send a normal HsRequestV2 with width=0 AND height=0 before
+ * starting a session. The receiver answers HsResponseV2 with its current
+ * display size in recv_width/recv_height and status=HS_ERR_DIMS, then
+ * closes without opening a window or a decoder. Extend mode uses this to
+ * size the virtual display before the real handshake. A receiver treats
+ * width=0 as a probe exactly when both dimensions are 0. */
+
 #pragma pack(push, 1)
 /* sender → receiver, 48 bytes */
 struct HsRequestV2 {

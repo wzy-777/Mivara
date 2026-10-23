@@ -47,6 +47,7 @@
 #include "config.h"
 #include "discover.h"
 #include "history.h"
+#include "kvm.h"
 #include "theme.h"
 #include "update.h"
 #include "vdd.h"
@@ -166,9 +167,11 @@
 #define HIST_ROW_W (BODY_W - 32)
 #define HIST_ROW_H 44
 #define HIST_ROW_Y(i) (HIST_CARD_Y + 42 + (i) * 48)
-#define HIST_BTN_X 636                  /* 投屏 / 扩展 / 删除, right-aligned      */
-#define HIST_BTN_W 72
+#define HIST_BTN_X 584                  /* 投屏 / 扩展 / 拼接 / 删除, right-aligned */
+#define HIST_BTN_W 64
+#define HIST_BTN_GAP 6
 #define HIST_DEL_X (HIST_ROW_X + HIST_ROW_W - 44)
+#define HIST_TEXT_W (HIST_BTN_X - 8 - (HIST_ROW_X + 12))   /* name/subtitle fit */
 #define HIST_PAGER_Y 674                /* footer caption, clear of the card's
                                          * bottom edge at 660 and its shadow */
 #define HIST_CARD_H_EMPTY 132
@@ -179,6 +182,10 @@
 #define FOUND_ROW_PITCH 60
 #define FOUND_ROW_H 52
 #define FOUND_ACTIONS_MAX_Y 512
+/* Three per-device actions (投屏 / 扩展 / 拼接), right-aligned in the row. */
+#define DEV_BTN_W 84
+#define DEV_BTN_GAP 8
+#define DEV_BTN_X(k) (BODY_R - DEV_BTN_W - (2 - (k)) * (DEV_BTN_W + DEV_BTN_GAP))
 
 static int foundActionsY(int n)
 {
@@ -205,13 +212,64 @@ static SDL_Rect rcHistRow(int i)
 {
     return SDL_Rect{HIST_ROW_X, HIST_ROW_Y(i), HIST_ROW_W, HIST_ROW_H};
 }
-static SDL_Rect rcHistBtn(int i, int which)   /* 0 投屏 / 1 扩展 / 2 删除 */
+static SDL_Rect rcHistBtn(int i, int which)   /* 0 投屏 / 1 扩展 / 2 拼接 / 3 删除 */
 {
-    static const int w[3] = {HIST_BTN_W, HIST_BTN_W, 44};
-    int x = (which == 2) ? HIST_DEL_X
-                         : HIST_BTN_X + (which == 0 ? 0 : HIST_BTN_W + 8);
+    static const int w[4] = {HIST_BTN_W, HIST_BTN_W, HIST_BTN_W, 44};
+    int x = (which == 3) ? HIST_DEL_X
+                         : HIST_BTN_X + which * (HIST_BTN_W + HIST_BTN_GAP);
     return SDL_Rect{x, HIST_ROW_Y(i) + 6, w[which], 32};
 }
+
+/* 拼接 direction chooser (modal over whatever screen opened it). The pads are
+ * laid out spatially — up / left · 本机 · right / down — so the question reads
+ * as "where is the other PC", which is exactly the side the mouse must leave
+ * from. */
+#define SIDE_DLG_W 420
+#define SIDE_DLG_H 320
+#define SIDE_DLG_X (CONTENT_X + (CONTENT_W - SIDE_DLG_W) / 2)
+#define SIDE_DLG_Y 170
+#define SIDE_DLG_CX (SIDE_DLG_X + SIDE_DLG_W / 2)
+#define SIDE_PAD_W 104
+#define SIDE_PAD_H 44
+#define SIDE_ROW1_Y (SIDE_DLG_Y + 104)
+#define SIDE_ROW2_Y (SIDE_ROW1_Y + 52)
+#define SIDE_ROW3_Y (SIDE_ROW2_Y + 52)
+
+static SDL_Rect rcSidePad(int side)
+{
+    const int top = SIDE_DLG_CX - SIDE_PAD_W / 2;
+    switch (side) {
+    case KVM_SIDE_LEFT:
+        return SDL_Rect{SIDE_DLG_CX - 58 - SIDE_PAD_W, SIDE_ROW2_Y,
+                        SIDE_PAD_W, SIDE_PAD_H};
+    case KVM_SIDE_RIGHT:
+        return SDL_Rect{SIDE_DLG_CX + 58, SIDE_ROW2_Y, SIDE_PAD_W, SIDE_PAD_H};
+    case KVM_SIDE_TOP:
+        return SDL_Rect{top, SIDE_ROW1_Y, SIDE_PAD_W, SIDE_PAD_H};
+    default:
+        return SDL_Rect{top, SIDE_ROW3_Y, SIDE_PAD_W, SIDE_PAD_H};
+    }
+}
+static SDL_Rect rcSideCenter()
+{
+    return SDL_Rect{SIDE_DLG_CX - 40, SIDE_ROW2_Y, 80, SIDE_PAD_H};
+}
+static SDL_Rect rcSideCancel()
+{
+    return SDL_Rect{SIDE_DLG_CX - 60, SIDE_DLG_Y + 264, 120, 34};
+}
+
+/* In-session four-way switch, drawn inside the stitch status panel. */
+#define ST_PANEL_X BODY_X
+#define ST_PANEL_Y 330
+#define ST_PANEL_W BODY_W
+#define ST_PANEL_H 148
+#define ST_DIR_CAPTION_W 36
+#define ST_DIR_CHIP_W 70
+#define ST_DIR_CHIP_H 26
+#define ST_DIR_CHIP_Y (ST_PANEL_Y + 112)
+#define ST_DIR_CHIP_X(i) \
+    (ST_PANEL_X + 20 + ST_DIR_CAPTION_W + (i) * (ST_DIR_CHIP_W + 8))
 
 /* settings: two columns of cards */
 #define SET_COL_L 160
@@ -267,6 +325,33 @@ enum Screen {
  * to NAV_HOME (session flow + connection history live inside the home tab). */
 enum NavTab { NAV_HOME, NAV_SETTINGS };
 
+/* Send-side mode. The keys are exactly the sender's --mode values and the
+ * strings stored in history.ini, so a row can be replayed without a table. */
+enum SendMode { SEND_MIRROR = 0, SEND_EXTEND, SEND_STITCH };
+
+static const char *sendModeKey(int mode)
+{
+    switch (mode) {
+    case SEND_EXTEND: return "extend";
+    case SEND_STITCH: return "stitch";
+    default:          return "mirror";
+    }
+}
+static int sendModeFromKey(const std::string &key)
+{
+    if (key == "extend") return SEND_EXTEND;
+    if (key == "stitch") return SEND_STITCH;
+    return SEND_MIRROR;
+}
+static const char *sendModeLabel(int mode)
+{
+    switch (mode) {
+    case SEND_EXTEND: return "扩展";
+    case SEND_STITCH: return "拼接";
+    default:          return "投屏";
+    }
+}
+
 /* ── button ids ──────────────────────────────────────────────────────────── */
 enum BtnId {
     BTN_NONE = -1,
@@ -321,10 +406,11 @@ enum BtnId {
     BTN_SET_UPD_IGNORE,                 /* 忽略此版本 / 取消忽略 */
     BTN_UPD_NOTICE,                     /* home-screen update banner */
     /* history rows (drawn on the home screen under 接收/发送) */
-    BTN_HIST_BASE = 5000,               /* row i: +i*10 +0 row / +1 投屏 / +2 扩展 / +3 删除 */
+    BTN_HIST_BASE = 5000,               /* row i: +i*10 +0 row / +1 投屏 / +2 扩展
+                                         * / +3 拼接 / +4 删除 */
     BTN_HIST_CLEAR = 5300,
     /* device rows on FOUND */
-    BTN_DEV_BASE = 1000,                /* +i*10 +1 投屏 / +2 扩展 */
+    BTN_DEV_BASE = 1000,                /* +i*10 +1 投屏 / +2 扩展 / +3 拼接 */
     /* left nav sidebar */
     BTN_NAV_HOME = 8000,
     BTN_NAV_SETTINGS,
@@ -347,6 +433,13 @@ enum BtnId {
      * before the switch — that silently turned 「打开下载页」 into "switch to
      * light" once. The assert below keeps the range pinned to the gap. */
     BTN_SET_THEME_BASE = 7070,          /* +0 light / +1 dark / +2 system */
+
+    /* 拼接 direction: the modal chooser shown right after clicking 拼接, and
+     * the live four-way switch on the session screen. Same order as KvmSide
+     * (left/right/top/bottom), so id - base indexes the side tables. */
+    BTN_STITCH_SIDE_BASE = 9000,        /* +0..3, plus cancel */
+    BTN_STITCH_SIDE_CANCEL = 9004,
+    BTN_STITCH_SWITCH_BASE = 9010,      /* +0..3 */
 };
 
 static_assert(BTN_SET_THEME_BASE > BTN_UPD_NOTICE && BTN_SET_THEME_BASE + 2 < BTN_NAV_HOME,
@@ -398,6 +491,7 @@ enum BtnVariant {
     BTN_V_CHOICE,      /* selectable cell; .on fills it with the accent   */
     BTN_V_CHIP_OK,     /* successTint chip (投屏)                          */
     BTN_V_CHIP_ACC,    /* primaryTint chip (扩展)                          */
+    BTN_V_CHIP_STITCH, /* warningTint chip (拼接)                          */
     BTN_V_NAV,         /* nav-rail item; .on marks the active tab         */
     BTN_V_GHOST,       /* hit area only — the caller paints it            */
 };
@@ -445,6 +539,18 @@ struct LiveStats {
     bool valid = false;
     std::string event, msg;
     std::string fps, kbps, codec, hw, mode, src, dst, quality, frames, t;
+    std::string state;      /* event=stitch: waiting | local | remote */
+    std::string side;       /* event=stitch: left | right | top | bottom */
+};
+
+/* The 拼接 chooser holds the device it was opened for; only valid while
+ * `open`. The modal is an overlay, not a Screen, so backing out returns to
+ * the list it was opened from. */
+struct StitchAsk {
+    bool open = false;
+    std::string ip;
+    std::string name;
+    int port = KVM_PORT;
 };
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
@@ -473,6 +579,7 @@ static std::string           g_manual_ip;
 static std::string           g_status_note;
     static std::string           g_child_label;          /* active sender label */
     static bool                  g_child_extend = false;
+    static int                   g_child_mode = SEND_MIRROR;
 
 static std::vector<DiscoveredDevice> g_devices;
 static std::mutex                  g_dev_mtx;
@@ -494,6 +601,7 @@ static AppConfig g_cfg_edit;            /* SCR_SETTINGS working copy */
 static AppConfig g_live_params;         /* params the running sender holds */
 static std::string g_last_ip, g_last_name;
 static int  g_last_port = 8081;
+static StitchAsk g_stitch_ask;          /* 拼接 direction modal (if open) */
 static std::vector<HistEntry> g_hist;
 static int g_hist_scroll = 0;
 
@@ -507,6 +615,31 @@ static int g_press = BTN_NONE;
 
 static ChildProc g_sender;
 static ChildProc g_receiver;
+
+/* ── 拼接 sides ──────────────────────────────────────────────────────────── */
+/* Order matches KvmSide and the BTN_STITCH_*_BASE offsets. "左侧" = the peer
+ * sits to the left of this machine, so that is also the edge the cursor must
+ * leave through. */
+static const char *kStitchSideKey[4]   = {"left", "right", "top", "bottom"};
+static const char *kStitchSideLabel[4] = {"左侧", "右侧", "上方", "下方"};
+static const char *kStitchEnterEdge[4] = {"左缘", "右缘", "上缘", "下缘"};
+static const char *kStitchBackEdge[4]  = {"右缘", "左缘", "下缘", "上缘"};
+
+static int stitchSideFromConfig()
+{
+    const int s = kvmSideFromKey(g_cfg.stitch_side.c_str());
+    return s < 0 ? (int)KVM_SIDE_RIGHT : s;
+}
+
+/* The side the running controller reports; the saved preference is the
+ * fallback before the first STAT line (and in console mode, which has no
+ * stdin channel and therefore never switches). */
+static int stitchSideCurrent()
+{
+    std::lock_guard<std::mutex> lk(g_stats_mtx);
+    const int s = kvmSideFromKey(g_stats.side.c_str());
+    return s >= 0 ? s : stitchSideFromConfig();
+}
 
 /* ── paths & fonts ───────────────────────────────────────────────────────── */
 static std::string exeDir()
@@ -1678,11 +1811,16 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
     }
 
     case BTN_V_CHIP_OK:
-    case BTN_V_CHIP_ACC: {
-        const bool ok = (b.variant == BTN_V_CHIP_OK);
-        fillRoundRect(ren, b.rect, r - 3, ok ? THEME.successTint : THEME.primaryTint);
+    case BTN_V_CHIP_ACC:
+    case BTN_V_CHIP_STITCH: {
+        const bool ok  = (b.variant == BTN_V_CHIP_OK);
+        const bool acc = (b.variant == BTN_V_CHIP_ACC);
+        fillRoundRect(ren, b.rect, r - 3,
+                      ok ? THEME.successTint
+                         : (acc ? THEME.primaryTint : THEME.warningTint));
         wash(WHITE, 0x1F);                 /* light fill, dark label → lighten */
-        centred(ok ? THEME.onSuccessTint : THEME.onPrimaryTint);
+        centred(ok ? THEME.onSuccessTint
+                   : (acc ? THEME.onPrimaryTint : THEME.onWarningTint));
         break;
     }
 
@@ -2006,6 +2144,8 @@ static void parseStatLine(const std::string &line)
             else if (k == "quality") s.quality = v;
             else if (k == "event") s.event = v;
             else if (k == "msg") s.msg = v;
+            else if (k == "state") s.state = v;
+            else if (k == "side") s.side = v;
         }
         if (bar == std::string::npos) break;
         pos = bar + 1;
@@ -2541,6 +2681,7 @@ static Screen resolveHomeScreen()
 static void startSearch()
 {
     if (g_searching.exchange(true)) return;      /* already running */
+    g_status_note.clear();       /* FOUND renders it as a launch error */
     if (g_search_thread.joinable()) g_search_thread.join();
     const unsigned long generation = ++g_search_generation;
     g_search_done = false;
@@ -2564,8 +2705,11 @@ static void startSearch()
 /* Take ip/name by value: history callers pass references into g_hist, and
  * this function reloads g_hist below — keeping those references would leave
  * ip/name dangling before the final status/last-used assignments. */
-static void launchStream(std::string ip, int port, bool extend, std::string name)
+static void launchStream(std::string ip, int port, int mode, std::string name,
+                         const char *stitch_side = nullptr)
 {
+    const bool extend = (mode == SEND_EXTEND);
+    const bool stitch = (mode == SEND_STITCH);
     std::string path = sibling("sender.exe");
 #ifndef _WIN32
     path = sibling("sender");
@@ -2575,50 +2719,150 @@ static void launchStream(std::string ip, int port, bool extend, std::string name
         setScreen(SCR_NOT_FOUND);
         return;
     }
+    if (stitch && !kvmSupported()) {
+        g_status_note = "拼接模式目前仅支持 Windows";
+        logPush("[gui] stitch is unavailable on this platform");
+        return;
+    }
     std::string codec = (g_cfg.codec == "auto" || g_cfg.codec.empty())
                             ? "h264" : g_cfg.codec;
     std::vector<std::string> args = {
         ip, std::to_string(port),
-        "--mode", extend ? "extend" : "mirror",
-        "--codec", codec,
-        "--hw", g_cfg.hw_accel ? "1" : "0",
-        "--bitrate", std::to_string(g_cfg.bitrate_kbps),
-        "--quality", std::to_string(g_cfg.quality),
-        "--fps", std::to_string(g_cfg.fps_limit),
-        "--scale", std::to_string(g_cfg.scale_percent),
-        "--chroma", g_cfg.chroma
+        "--mode", sendModeKey(mode)
     };
+    /* A stitch session has no capture/encoder: passing codec/quality flags
+     * would only suggest they do something. */
+    if (stitch) {
+        /* The chooser's answer, or the saved preference for a caller that
+         * has no chooser (row-body replay). Always one of the four keys. */
+        const int s = kvmSideFromKey(stitch_side ? stitch_side
+                                                 : g_cfg.stitch_side.c_str());
+        args.push_back("--stitch-side");
+        args.push_back(kStitchSideKey[s < 0 ? (int)KVM_SIDE_RIGHT : s]);
+    } else {
+        args.insert(args.end(), {
+            "--codec", codec,
+            "--hw", g_cfg.hw_accel ? "1" : "0",
+            "--bitrate", std::to_string(g_cfg.bitrate_kbps),
+            "--quality", std::to_string(g_cfg.quality),
+            "--fps", std::to_string(g_cfg.fps_limit),
+            "--scale", std::to_string(g_cfg.scale_percent),
+            "--chroma", g_cfg.chroma
+        });
+        if (extend && g_cfg.extend_res != "auto") {
+            args.push_back("--extend-res");
+            args.push_back(g_cfg.extend_res);
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         g_stats = LiveStats{};
     }
     logPush("[gui] launch sender " + ip + ":" + std::to_string(port) +
-            " mode=" + (extend ? "extend" : "mirror") +
-            " codec=" + codec);
-    if (!testTcpConnection(ip, port, 1500)) {
-        logPush("[gui] TCP probe failed for " + ip + ":" + std::to_string(port));
-        g_status_note = "无法连接 " + ip + ":" + std::to_string(port);
-        setScreen(SCR_HOME);
+            " mode=" + sendModeKey(mode) + (stitch ? "" : " codec=" + codec));
+    const int probe_port = stitch ? KVM_PORT : port;
+    if (!testTcpConnection(ip, probe_port, 1500)) {
+        logPush("[gui] TCP probe failed for " + ip + ":" + std::to_string(probe_port));
+        g_status_note = stitch
+            ? "无法连接 " + ip + ":" + std::to_string(probe_port) +
+                  "（对方需先启动接收）"
+            : "无法连接 " + ip + ":" + std::to_string(port);
+        setScreen(stitch ? SCR_FOUND : SCR_HOME);
         return;
     }
+#ifdef _WIN32
+    /* Extend mode: the sender may append the receiver's exact resolution to
+     * the virtual display driver's vdd_settings.xml. That is a system
+     * configuration change, so ask once and remember the answer. */
+    if (extend) {
+        std::string addModes = "0";
+        if (g_cfg.vdd_mode_write == "always") {
+            addModes = "1";
+        } else if (g_cfg.vdd_mode_write == "never") {
+            addModes = "0";
+        } else {
+            int r = MessageBoxW(
+                nullptr,
+                L"扩展模式会把接收端的屏幕分辨率加入发送端的虚拟显示器配置\n"
+                L"(C:\\Windows\\System32\\drivers\\UMDF\\vdd_settings.xml)，\n"
+                L"使扩展屏按 1:1 显示、不会因比例不同而拉伸。\n"
+                L"若该尺寸已在列表中则不会修改文件。\n\n"
+                L"修改前会自动备份原文件；若虚拟显示设备正在运行，会重启它一次\n"
+                L"以加载新模式。\n\n"
+                L"允许修改吗？（选择会记住，可在 config.ini 的 vdd_mode_write\n"
+                L"中改为 ask / always / never）",
+                L"Mivara - 扩展屏分辨率",
+                /* Default = No: a System32 write needs a deliberate Yes. */
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            addModes = (r == IDYES) ? "1" : "0";
+            g_cfg.vdd_mode_write = (r == IDYES) ? "always" : "never";
+            configSave(g_cfg);
+            logPush(std::string("[gui] vdd_settings.xml write: ") +
+                    (r == IDYES ? "allowed" : "denied"));
+        }
+        args.push_back("--vdd-add-modes");
+        args.push_back(addModes);
+    }
+#endif
     if (!spawnChild(g_sender, path, args)) {
         logPush("[gui] spawn sender failed");
         g_status_note = "启动 sender 失败";
         setScreen(SCR_NOT_FOUND);
         return;
     }
-    historyUpsert(ip, port, name.empty() ? ip : name,
-                  extend ? "extend" : "mirror");
+    historyUpsert(ip, port, name.empty() ? ip : name, sendModeKey(mode));
     g_hist = historyLoad();           /* keep the home-screen list in sync */
     g_hist_scroll = 0;
     g_child_extend = extend;
-    g_child_label = extend ? "扩展" : "投屏";
-    g_status_note = "目标: " + ip + ":" + std::to_string(port);
+    g_child_mode = mode;
+    g_child_label = sendModeLabel(mode);
+    /* 拼接 runs over the KVM port, not the video port — the status line must
+     * show the endpoint the sender actually connected to. */
+    g_status_note = "目标: " + ip + ":" +
+                    std::to_string(stitch ? KVM_PORT : port);
     g_live_params = g_cfg;
     g_last_ip = ip;
     g_last_port = port;
     g_last_name = name;
     setScreen(SCR_STREAMING);
+}
+
+/* 拼接 always asks which side the peer is on before spawning the controller:
+ * the answer is what tells the sender which local edge hands control over. */
+static void openStitchDialog(const std::string &ip, int port,
+                             const std::string &name)
+{
+    if (!kvmSupported()) {           /* launchStream reports the error */
+        launchStream(ip, port, SEND_STITCH, name);
+        return;
+    }
+    g_stitch_ask.open = true;
+    g_stitch_ask.ip = ip;
+    g_stitch_ask.port = port;
+    g_stitch_ask.name = name;
+}
+
+static void chooseStitchSide(int side)
+{
+    if (!g_stitch_ask.open || side < 0 || side > 3) return;
+    const std::string ip = g_stitch_ask.ip;
+    const std::string name = g_stitch_ask.name;
+    const int port = g_stitch_ask.port;
+    g_stitch_ask.open = false;
+    /* Remember the answer: it is the default the next chooser opens on. */
+    g_cfg.stitch_side = kStitchSideKey[side];
+    g_cfg_edit.stitch_side = g_cfg.stitch_side;
+    configSave(g_cfg);
+    launchStream(ip, port, SEND_STITCH, name, kStitchSideKey[side]);
+}
+
+/* Single entry point for "start this mode": 拼接 always asks for its side
+ * first, mirror/extend go straight to the sender. */
+static void startSendMode(const std::string &ip, int port, int mode,
+                          const std::string &name)
+{
+    if (mode == SEND_STITCH) openStitchDialog(ip, port, name);
+    else launchStream(ip, port, mode, name);
 }
 
 static void launchReceiver()
@@ -2652,6 +2896,22 @@ static void openSettings()
 static void buildButtons()
 {
     g_buttons.clear();
+
+    /* The direction chooser is modal: only its own pads and 取消 are live, so
+     * a click cannot fall through to the device row or the history list that
+     * opened it. */
+    if (g_stitch_ask.open) {
+        const int cur = stitchSideFromConfig();
+        for (int i = 0; i < 4; i++) {
+            const SDL_Rect r = rcSidePad(i);
+            addChoice(r.x, r.y, r.w, r.h, kStitchSideLabel[i],
+                      BTN_STITCH_SIDE_BASE + i, i == cur);
+        }
+        const SDL_Rect c = rcSideCancel();
+        addButton(c.x, c.y, c.w, c.h, "取 消", BTN_STITCH_SIDE_CANCEL,
+                  BTN_V_SECONDARY);
+        return;
+    }
 
     /* ── header: appearance switcher (on every screen) ───────────────────── */
     {
@@ -2722,11 +2982,14 @@ static void buildButtons()
             SDL_Rect b1 = rcHistBtn(i, 0);
             SDL_Rect b2 = rcHistBtn(i, 1);
             SDL_Rect b3 = rcHistBtn(i, 2);
+            SDL_Rect b4 = rcHistBtn(i, 3);
             addButton(b1.x, b1.y, b1.w, b1.h, "投屏", BTN_HIST_BASE + idx * 10 + 1,
                       BTN_V_CHIP_OK);
             addButton(b2.x, b2.y, b2.w, b2.h, "扩展", BTN_HIST_BASE + idx * 10 + 2,
                       BTN_V_CHIP_ACC);
-            addButton(b3.x, b3.y, b3.w, b3.h, "删除", BTN_HIST_BASE + idx * 10 + 3,
+            addButton(b3.x, b3.y, b3.w, b3.h, "拼接", BTN_HIST_BASE + idx * 10 + 3,
+                      BTN_V_CHIP_STITCH);
+            addButton(b4.x, b4.y, b4.w, b4.h, "删除", BTN_HIST_BASE + idx * 10 + 4,
                       BTN_V_LINK);
         }
         if (!g_hist.empty())
@@ -2752,10 +3015,12 @@ static void buildButtons()
         }
         for (size_t i = 0; i < n && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
-            addButton(BODY_R - 220, y + 8, 100, 36, "投屏",
+            addButton(DEV_BTN_X(0), y + 8, DEV_BTN_W, 36, "投屏",
                       BTN_DEV_BASE + (int)i * 10 + 1, BTN_V_CHIP_OK);
-            addButton(BODY_R - 112, y + 8, 100, 36, "扩展",
+            addButton(DEV_BTN_X(1), y + 8, DEV_BTN_W, 36, "扩展",
                       BTN_DEV_BASE + (int)i * 10 + 2, BTN_V_CHIP_ACC);
+            addButton(DEV_BTN_X(2), y + 8, DEV_BTN_W, 36, "拼接",
+                      BTN_DEV_BASE + (int)i * 10 + 3, BTN_V_CHIP_STITCH);
         }
         {
             const int y = foundActionsY((int)n);
@@ -2777,6 +3042,15 @@ static void buildButtons()
         break;
 
     case SCR_STREAMING:
+        /* Live direction switch, only for a stitch session: changing sides on
+         * a mirror/extend stream would do nothing. */
+        if (g_sender.active && g_child_mode == SEND_STITCH) {
+            const int cur = stitchSideCurrent();
+            for (int i = 0; i < 4; i++)
+                addChoice(ST_DIR_CHIP_X(i), ST_DIR_CHIP_Y, ST_DIR_CHIP_W,
+                          ST_DIR_CHIP_H, kStitchSideLabel[i],
+                          BTN_STITCH_SWITCH_BASE + i, i == cur, g_fontS);
+        }
         addButton(cx - 178, 510, 170, 48, "停 止", BTN_STREAM_STOP, BTN_V_DANGER);
         addButton(cx + 8,   510, 170, 48, "日志",  BTN_STREAM_LOG,  BTN_V_SECONDARY);
         break;
@@ -2926,6 +3200,7 @@ static std::string statLine2(const LiveStats &s)
     if (!s.mode.empty()) {
         /* the wire value is English; the rest of the UI is not */
         const std::string m = (s.mode == "extend") ? "扩展"
+                            : (s.mode == "stitch") ? "拼接"
                             : (s.mode == "mirror") ? "投屏"
                                                    : s.mode;
         out += (out.empty() ? "" : "   ") + m;
@@ -2946,6 +3221,13 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
     const int maxW = card.w - 40;
     drawText(ren, "实时状态", x, card.y + 20, THEME.textDim, g_fontBS);
 
+    /* A stitch session carries the live four-way switch. The hit rects come
+     * from buildButtons; only the caption is painted here, the chips draw
+     * themselves in the common button pass. */
+    const bool stitch_session = g_sender.active && g_child_mode == SEND_STITCH;
+    if (stitch_session)
+        drawText(ren, "方向", x, ST_DIR_CHIP_Y + 5, THEME.textDim, g_fontS);
+
     if (!s.valid) {
         drawText(ren, "等待统计数据…", x, card.y + 54, THEME.textDim, g_font);
         return;
@@ -2960,12 +3242,53 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
                  x, card.y + 54, THEME.text, g_font);
         return;
     }
+    if (s.event == "stitch") {
+        /* 拼接 has no fps/bitrate to report; what matters is where control
+         * currently is and which edge leads there. The sender emits one of
+         * these on every crossing and on every side switch. */
+        int side = kvmSideFromKey(s.side.c_str());
+        if (side < 0) side = stitchSideFromConfig();
+        std::string hint;
+        if (s.state == "waiting") {
+            hint = "等待对方确认…";
+        } else if (s.state == "remote") {
+            hint = std::string("已接管对方键鼠 · Ctrl+Alt+Shift+Q 或移出对方") +
+                   kStitchBackEdge[side] + "返回";
+        } else {
+            hint = std::string("光标移到屏幕") + kStitchEnterEdge[side] +
+                   "即可控制对方";
+        }
+        drawText(ren, "拼接中", x, card.y + 50, THEME.text, g_fontB);
+        drawText(ren, fitText(hint, g_fontS, maxW), x, card.y + 86,
+                 THEME.textDim, g_fontS);
+        return;
+    }
     drawText(ren, fitText(statLine1(s), g_fontB, maxW), x, card.y + 54,
              THEME.text, g_fontB);
     std::string l2 = statLine2(s);
     if (!l2.empty())
         drawText(ren, fitText(l2, g_fontS, maxW), x, card.y + 94,
                  THEME.textDim, g_fontS);
+}
+
+/* Modal scrim + card for the 拼接 direction question. The four pads are
+ * painted by the common button pass (they are BTN_V_CHOICE cells), so this
+ * only paints what has no hit area of its own: the backdrop, the title and
+ * the 本机 marker that makes the spatial arrangement readable. */
+static void drawStitchSideDialog(SDL_Renderer *ren)
+{
+    fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
+    const SDL_Rect card{SIDE_DLG_X, SIDE_DLG_Y, SIDE_DLG_W, SIDE_DLG_H};
+    drawCard(ren, card, CARD_R);
+    drawText(ren, "拼接到哪一侧？", SIDE_DLG_X + 24, SIDE_DLG_Y + 22,
+             THEME.text, g_fontB);
+    drawText(ren, "选择对方电脑相对本机的位置", SIDE_DLG_X + 24, SIDE_DLG_Y + 58,
+             THEME.textDim, g_fontS);
+    drawText(ren, "从该侧移出鼠标即可控制对方", SIDE_DLG_X + 24, SIDE_DLG_Y + 78,
+             THEME.textDim, g_fontS);
+    const SDL_Rect me = rcSideCenter();
+    fillRoundRect(ren, me, THEME.radius - 3, THEME.surfaceAlt);
+    drawTextIn(ren, "本机", me, THEME.textDim, g_fontS, ALIGN_CENTER);
 }
 
 /* ── screen rendering ────────────────────────────────────────────────────── */
@@ -3100,20 +3423,22 @@ static void renderScreen(int mousex, int mousey)
                     const HistEntry &e = g_hist[idx];
                     const SDL_Rect row = rcHistRow(i);
                     if (g_hot >= BTN_HIST_BASE + idx * 10 &&
-                        g_hot < BTN_HIST_BASE + idx * 10 + 4)
+                        g_hot < BTN_HIST_BASE + idx * 10 + 5)
                         fillRoundRect(g_ren, row, THEME.radius, THEME.hover);
                     if (idx + 1 < (int)g_hist.size())
                         drawHairline(g_ren, row.x, row.y + row.h, row.w, 1,
                                      THEME.border);
 
                     std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 10);
-                    drawText(g_ren, fitText(nm, g_fontS, 440), row.x + 12, row.y + 5,
+                    drawText(g_ren, fitText(nm, g_fontS, HIST_TEXT_W),
+                             row.x + 12, row.y + 5,
                              THEME.text, g_fontS);
                     std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
-                                      (e.mode == "extend" ? "扩展" : "投屏") + " · " +
+                                      sendModeLabel(sendModeFromKey(e.mode)) + " · " +
                                       relTime(e.last_used_unix) + " · ×" +
                                       std::to_string(e.use_count);
-                    drawText(g_ren, fitText(sub, g_fontS, 440), row.x + 12, row.y + 23,
+                    drawText(g_ren, fitText(sub, g_fontS, HIST_TEXT_W), row.x + 12,
+                             row.y + 23,
                              THEME.textDim, g_fontS);
                 }
                 if ((int)g_hist.size() > HIST_VISIBLE) {
@@ -3133,15 +3458,15 @@ static void renderScreen(int mousex, int mousey)
     case SCR_RECEIVING: {
         std::string ip = getLocalIPAddress();
         drawText(g_ren, "正在接收", cx, 162, THEME.success, g_fontL, true);
-        drawText(g_ren, "其他设备搜索到本机后即可开始投屏", cx, 210, THEME.textDim,
-                 g_font, true);
+        drawText(g_ren, "其他设备搜索到本机后即可开始投屏或拼接", cx, 210,
+                 THEME.textDim, g_font, true);
 
         const SDL_Rect card{BODY_X, 246, BODY_W, 256};
         drawCard(g_ren, card, CARD_R);
         const int lx = card.x + 20;
         drawText(g_ren, "本机 IP", lx, card.y + 24, THEME.textDim, g_fontS);
         drawText(g_ren, ip, lx, card.y + 48, THEME.text, g_fontB);
-        drawText(g_ren, "视频端口 8081    ·    计算端口 8082    ·    端口服务 8083    ·    发现服务 UDP 1900",
+        drawText(g_ren, "视频 8081  ·  计算 8082  ·  端口 8083  ·  拼接 8084  ·  发现 UDP 1900",
                  lx, card.y + 96, THEME.textDim, g_fontS);
         drawHairline(g_ren, lx, card.y + 132, card.w - 40, 1, THEME.border);
         drawText(g_ren, "状态：等待发送端连接…", lx, card.y + 150, THEME.text, g_font);
@@ -3172,7 +3497,7 @@ static void renderScreen(int mousex, int mousey)
         }
         drawText(g_ren, "发现 " + std::to_string(devs.size()) + " 台设备", BODY_X,
                  TITLE_Y, THEME.text, g_fontB);
-        drawTextV(g_ren, "选择投屏或扩展", BODY_R, TITLE_Y + 12, THEME.textDim,
+        drawTextV(g_ren, "选择投屏、扩展或拼接", BODY_R, TITLE_Y + 12, THEME.textDim,
                   g_fontS, ALIGN_RIGHT);
         for (size_t i = 0; i < devs.size() && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
@@ -3185,12 +3510,18 @@ static void renderScreen(int mousex, int mousey)
                                     ? devs[i].toString()
                                     : truncateUtf8(devs[i].name, 12) + "  ·  " +
                                           devs[i].toString();
-            drawTextIn(g_ren, fitText(label, g_font, BODY_R - 240 - BODY_X - 20),
+            drawTextIn(g_ren, fitText(label, g_font, DEV_BTN_X(0) - BODY_X - 40),
                        row, THEME.text, g_font, ALIGN_LEFT, 20);
         }
         if (devs.size() > 6)
             drawText(g_ren, "仅显示前 6 台", BODY_X, FOUND_ACTIONS_MAX_Y - 22,
                      THEME.textDim, g_fontS);
+        /* Launch failures (including "stitch needs Windows") are shown here
+         * because this screen has no other status line. */
+        if (!g_status_note.empty())
+            drawText(g_ren, g_status_note, cx,
+                     foundActionsY((int)devs.size()) - 26, THEME.danger,
+                     g_fontS, true);
         break;
     }
 
@@ -3227,7 +3558,8 @@ static void renderScreen(int mousex, int mousey)
             drawText(g_ren, g_status_note, cx, 258, THEME.text, g_font, true);
         drawText(g_ren, "会话进行中 · 关闭窗口不会中断，请点下方按钮结束", cx, 290,
                  THEME.textDim, g_fontS, true);
-        drawStatPanel(g_ren, SDL_Rect{BODY_X, 330, BODY_W, 148});
+        drawStatPanel(g_ren, SDL_Rect{ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W,
+                                      ST_PANEL_H});
         break;
 
     case SCR_SETTINGS: {
@@ -3325,6 +3657,10 @@ static void renderScreen(int mousex, int mousey)
     }
     }
 
+    /* Modal last: it dims whatever screen is underneath, and the chooser's own
+     * cells live in g_buttons, so they paint on top of the scrim. */
+    if (g_stitch_ask.open) drawStitchSideDialog(g_ren);
+
     for (auto &b : g_buttons) drawButton(g_ren, b);
 
     /* dot on the 设置 nav item while an update is pending */
@@ -3367,6 +3703,44 @@ static void startInstall()
 
 static void onButton(int id)
 {
+    /* 拼接 direction chooser: modal, so nothing else may act while it is up */
+    if (g_stitch_ask.open) {
+        if (id >= BTN_STITCH_SIDE_BASE && id < BTN_STITCH_SIDE_BASE + 4)
+            chooseStitchSide(id - BTN_STITCH_SIDE_BASE);
+        else if (id == BTN_STITCH_SIDE_CANCEL)
+            g_stitch_ask.open = false;
+        return;
+    }
+    /* Live side switch on the session screen */
+    if (id >= BTN_STITCH_SWITCH_BASE && id < BTN_STITCH_SWITCH_BASE + 4) {
+        const int side = id - BTN_STITCH_SWITCH_BASE;
+        const std::string key = kStitchSideKey[side];
+        /* A 50 ms STAT echo confirms the switch; persist immediately so the
+         * next session starts on the same edge even if the echo is missed. */
+        g_cfg.stitch_side = key;
+        g_cfg_edit.stitch_side = key;
+        configSave(g_cfg);
+        if (sendToChild(g_sender, std::string("STITCH|side=") + key)) {
+            g_status_note = std::string("拼接方向：") + kStitchSideLabel[side];
+        } else if (g_child_mode == SEND_STITCH && g_sender.active) {
+            /* Classic console mode has no stdin pipe, so the only way to move
+             * the edge is to restart the controller — a new TCP connection,
+             * so the target shows its consent dialog again. Say so instead of
+             * claiming the switch is already live. */
+            const std::string ip = g_last_ip, nm = g_last_name;
+            const int port = g_last_port;
+            stopChild(g_sender, g_child_extend);
+            launchStream(ip, port, SEND_STITCH, nm, key.c_str());
+            /* launchStream leaves its own failure note (and screen) alone. */
+            if (g_sender.active)
+                g_status_note = std::string("已按新方向重连：") +
+                                kStitchSideLabel[side] + "（对方需再次确认）";
+        } else {
+            g_status_note = "切换失败：发送进程无响应";
+        }
+        return;
+    }
+
     if (id >= BTN_SET_CODEC_BASE && id < BTN_SET_CODEC_BASE + 6) {
         const char *ids[] = {"auto", "h264", "h265", "av1", "raw", "rle"};
         g_cfg_edit.codec = ids[id - BTN_SET_CODEC_BASE];
@@ -3606,8 +3980,10 @@ static void onButton(int id)
             else
                 g_status_note.clear();
         }
-        /* Live-apply transfer params to a running sender session. */
-        if (g_sender.active) {
+        /* Live-apply transfer params to a running sender session. A stitch
+         * child has no encoder and does not read SETP lines, so applying to
+         * it would only report a change that never happens. */
+        if (g_sender.active && g_child_mode != SEND_STITCH) {
             std::string setp = buildSetpLine(g_cfg, g_live_params);
             if (setp.size() > 4) {           /* something actually changed */
 #ifdef _WIN32
@@ -3625,12 +4001,12 @@ static void onButton(int id)
                 } else {
                     /* Console-mode child has no stdin channel – restart the
                      * session with the new params instead. */
-                    const bool ext = g_child_extend;
+                    const int mode = g_child_mode;
                     const std::string ip = g_last_ip, nm = g_last_name;
                     const int port = g_last_port;
                     stopChild(g_sender, g_child_extend);
                     g_status_note = "控制台模式：已按新参数重启会话";
-                    launchStream(ip, port, ext, nm);
+                    launchStream(ip, port, mode, nm);
                     return;
                 }
             }
@@ -3654,7 +4030,7 @@ static void onButton(int id)
         break;
 
     default:
-        /* device rows: BTN_DEV_BASE + idx*10 + 1(投屏) / +2(扩展) */
+        /* device rows: BTN_DEV_BASE + idx*10 + 1(投屏) / +2(扩展) / +3(拼接) */
         if (id >= BTN_DEV_BASE && id < BTN_HIST_BASE) {
             int rel = id - BTN_DEV_BASE;
             int idx = rel / 10;
@@ -3664,19 +4040,19 @@ static void onButton(int id)
                 std::lock_guard<std::mutex> lk(g_dev_mtx);
                 devs = g_devices;
             }
-            if (idx >= 0 && idx < (int)devs.size() && (kind == 1 || kind == 2))
-                launchStream(devs[idx].ip_address, devs[idx].tcp_port,
-                             kind == 2, devs[idx].name);
+            if (idx >= 0 && idx < (int)devs.size() && kind >= 1 && kind <= 3)
+                startSendMode(devs[idx].ip_address, devs[idx].tcp_port,
+                              kind - 1, devs[idx].name);
             break;
         }
-        /* history rows: BTN_HIST_BASE + idx*10 + 0(row) / 1 / 2 / 3 */
+        /* history rows: BTN_HIST_BASE + idx*10 + 0(row) / 1 / 2 / 3 / 4(删除) */
         if (id >= BTN_HIST_BASE && id < BTN_HIST_CLEAR) {
             int rel = id - BTN_HIST_BASE;
             int idx = rel / 10;
             int kind = rel % 10;
             if (idx >= 0 && idx < (int)g_hist.size()) {
                 const HistEntry &e = g_hist[idx];
-                if (kind == 3) {
+                if (kind == 4) {
                     historyDelete(e.ip, e.port);
                     g_hist = historyLoad();
                     /* Clamp to the last full page, not to the entry count —
@@ -3684,11 +4060,11 @@ static void onButton(int id)
                     const int maxScroll =
                         std::max(0, (int)g_hist.size() - HIST_VISIBLE);
                     if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
-                } else if (kind == 1 || kind == 2) {
-                    launchStream(e.ip, e.port, kind == 2, e.name);
+                } else if (kind >= 1 && kind <= 3) {
+                    startSendMode(e.ip, e.port, kind - 1, e.name);
                 } else {
                     /* row body click: reconnect with the entry's last mode */
-                    launchStream(e.ip, e.port, e.mode == "extend", e.name);
+                    startSendMode(e.ip, e.port, sendModeFromKey(e.mode), e.name);
                 }
             }
             break;
@@ -3866,7 +4242,9 @@ int main(int argc, char *argv[])
             }
             else if (ev.type == SDL_KEYDOWN) {
                 if (ev.key.keysym.sym == SDLK_ESCAPE) {
-                    if (g_screen == SCR_MANUAL_IP) {
+                    if (g_stitch_ask.open) {
+                        g_stitch_ask.open = false;   /* dismiss the chooser only */
+                    } else if (g_screen == SCR_MANUAL_IP) {
                         SDL_StopTextInput();
                         setScreen(SCR_HOME);
                     } else if (g_screen == SCR_SETTINGS) {
@@ -3948,6 +4326,7 @@ int main(int argc, char *argv[])
         /* child exit tracking */
         if (g_sender.active && childExited(g_sender, "sender")) {
             g_child_extend = false;
+            g_child_mode = SEND_MIRROR;
             if (g_screen == SCR_STREAMING) {
                 g_status_note = "会话已结束";
                 setScreen(SCR_HOME);

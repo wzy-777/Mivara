@@ -17,11 +17,11 @@ The list below tracks shipped and planned features in order; `[x]` means shipped
 - [x] Optional encoders: RLE / H.264 / H.265 / AV1 as a selectable option
 - [x] GUI advanced settings (encoder picker, connection history)
 - [x] In-app update check + one-click download/install (Windows, SHA-256 verified, admin-only staging directory)
-- [ ] GUI advanced settings: extend-resolution choice (currently fixed at the 1920x1080 default in the GUI)
+- [x] Extend-resolution choice (auto-matches the receiver; `extend_res` in `config.ini` overrides it; no GUI control yet)
 - [ ] Audio capture and streaming
 - [ ] TLS encryption
-- [ ] Virtual display resolution adapts to the receiver (post-handshake negotiation)
+- [x] Virtual display resolution adapts to the receiver (pre-connection probe; exact mode added to `vdd_settings.xml` when permitted, otherwise letterboxed)
 - [ ] Adaptive frame rate
 - [ ] Wayland support
 - [ ] Virtual display solutions for macOS/Linux
-- [ ] Screen stitching
+- [x] Screen stitching (pure software KVM: one keyboard/mouse drives two PCs, each keeping its own monitor; Windows ↔ Windows)

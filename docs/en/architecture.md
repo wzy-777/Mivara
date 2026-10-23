@@ -37,9 +37,9 @@ Mivara/
 
 | Program | Responsibility |
 |---------|----------------|
-| `app` | GUI launcher: left nav (Home/Settings), receive/send choice, connection history on Home, SSDP search, device list (cast/extend), manual IP, live reconfigure |
-| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode via the vdd module |
-| `receiver` | SSDP broadcast, fullscreen rendering, hosts the two sidecar services |
+| `app` | GUI launcher: left nav (Home/Settings), receive/send choice, connection history on Home, SSDP search, device list (cast/extend/stitch), manual IP, live reconfigure |
+| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode via the vdd module; with `--mode stitch` it runs the stitch controller (kvm module) and never captures |
+| `receiver` | SSDP broadcast, fullscreen rendering, hosts the compute-offload, port-inspector and stitch-input sidecar services |
 
 ## Network Ports
 
@@ -49,8 +49,9 @@ Mivara/
 | 8081 | TCP | Video frame stream |
 | 8082 | TCP | CPU compute offload service |
 | 8083 | TCP | Remote port inspection service |
+| 8084 | TCP | Stitch (software KVM) keyboard/mouse input channel |
 
-All four ports must be allowed on the receiver; see [Network & Firewall](network.md) for firewall rules and network requirements.
+All of these ports must be allowed on the receiver; see [Network & Firewall](network.md) for firewall rules and network requirements.
 
 ## How It Works
 
@@ -73,13 +74,16 @@ If network policy blocks even broadcast, use direct connect:
 bin/sender 192.168.1.105        # skip discovery, connect straight to 8081
 bin/sender 192.168.1.105 8081   # or specify the port
 bin/sender 192.168.1.105 --mode extend    # non-interactive: set mirror / extend (used by the GUI)
+bin/sender 192.168.1.105 --mode stitch    # stitch: only the 8084 input channel, no video (used by the GUI)
 ```
 
 For more on multicast, subnets and firewalls, see [Network & Firewall](network.md).
 
 ### 2 — Extend Handshake
 
-After the receiver and display mode are chosen, the sender connects over TCP 8081 and exchanges a handshake (protocol v2, all fields network byte order):
+After the receiver and display mode are chosen, **extend mode** first sends an `HsRequestV2` probe with `width = height = 0`: the receiver answers with its current display resolution in `HsResponseV2.recv_width / recv_height` and `status = 3` (bad dimensions), then closes the connection before creating a SDL window or opening a decoder — so nothing flashes on screen. The sender uses this to size the virtual display before starting it. This is a valid request under the existing protocol; the protocol version does not change.
+
+The sender then connects over TCP 8081 and exchanges the real handshake (protocol v2, all fields network byte order):
 
 ```
 Sender → Receiver   HsRequestV2 (48 bytes, 12 x uint32)
@@ -110,9 +114,14 @@ Both ends must run the same version. A legacy peer (old 16-byte handshake) is de
 Extend mode selected
   → vddStartup():
       enable the Root\MttVDD device (if disabled; SetupAPI, needs admin)
+      → the driver reads vdd_settings.xml only at start-up; if the target
+        size is missing and the user agreed, the exact mode is appended
+        (backup to .mivara.bak, read-back verified) and the device is
+        restarted once when needed
       → CCD SetDisplayConfig activates the virtual display (takes it over
         if left over from a previous session)
-      → positioned right of the existing desktop, 1920x1080@60
+      → positioned right of the existing desktop, at the receiver's
+        resolution when available, otherwise the closest aspect ratio
       → locked as the capture source
   → handshake, stream (windows/mouse can cross into the virtual screen)
   → session end / Ctrl+C / peer disconnect / console window closed
@@ -162,6 +171,7 @@ Sender    →  capture (extend mode = virtual screen; mirror = primary screen)
 Receiver  →  read frame header, read frame body
           →  coded → FFmpeg decode → YUV/NV12 texture render
           →  RLE → decompress → RGB24 texture
+          →  aspect-fit the capture size into the window, centred with black bars (never stretched)
           →  SDL_UpdateTexture/YUVTexture → RenderCopy → RenderPresent
 ```
 
@@ -175,6 +185,41 @@ Actual bandwidth use per codec is covered in [Performance](performance.md).
 - **Port inspector (8083)**: LIST_TCP / LIST_UDP / LIST_ALL / GET_PORT / KILL_PORT. Port data is collected natively per platform: Linux reads `/proc/net/*` + inode→PID mapping; macOS shells out to `lsof`; Windows uses `GetExtendedTcpTable`/`GetExtendedUdpTable` + `CreateToolhelp32Snapshot`.
 
 > Security note: TCP 8083 has **no authentication whatsoever** — any LAN peer that can reach the port can list, query and even kill processes on the receiver. Keep it LAN-only.
+
+### 6 — Stitch Channel (software KVM, 8084)
+
+Stitch is **not a display mode**: both ends keep their own physical monitor and desktop, and only keyboard/mouse events travel over TCP 8084, so capture, encoding, the virtual display and the 8081 video protocol are not involved (`HsRequestV2.mode` still only accepts 0/1; a stitch value never appears on 8081). The implementation lives in `src/kvm.cpp` / `src/kvm.h`.
+
+**Handshake (all network-byte-order `uint32`)**
+
+```
+controller → target   KvmHello (16 bytes: magic 'MVK1', version, reserved; reserved[0] = peer side)
+target → controller   KvmReply (32 bytes: magic, version, status, target virtual-desktop x/y/w/h, reserved)
+controller → target   KvmEvent (16 bytes: type, a, b, c) × N
+```
+
+Status values: `0`=OK, `1`=version mismatch, `2`=declined, `3`=busy. Event types: `1`=move (target virtual-desktop px), `2`=button (1/2/3/4/5, b=down), `3`=wheel (a=signed delta, b=horizontal), `4`=key (a=down, b=VK, c=scan | extended<<16), `5`=release-all.
+
+`KvmHello.reserved[0]` carries **where the target sits from the controller's point of view** (1=left, 2=right, 3=top, 4=bottom; 0 or any other value means unspecified and falls back to right) purely so the target's consent dialog can name the entry edge; an older target ignores it and behaves as the default right side, with no protocol version bump. The side itself is controller-only state — the target just injects the absolute coordinates it receives — so switching mid-session needs no protocol message at all.
+
+**Controller side (sender --mode stitch)**
+
+- `WH_MOUSE_LL` / `WH_KEYBOARD_LL` capture local input. The hook callbacks **never do network I/O** (overrunning the system's `LowLevelHooksTimeout` silently removes the hook); they only append to a lock-free SPSC ring drained by a dedicated thread.
+- Once Windows clamps the cursor at the virtual-desktop edge, the hook's coordinates stop changing; `RIDEV_INPUTSINK` Raw Input deltas are used instead to detect "still pushing toward the chosen side" and to drive the remote cursor. Three pixels of overshoot enter the remote state and local input is swallowed; motion in any other direction resets the accumulator.
+- While remote, moving the peer's cursor back out of **the edge it entered from**, or `Ctrl+Alt+Shift+Q`, hands control back. Enter/leave re-syncs physically held modifiers and mouse buttons so the peer never holds a stuck key. The four layouts: right → leave the local right edge, enter/leave at the peer's left edge; left → local left edge, the peer's right edge; top → local top edge, the peer's bottom edge; bottom → local bottom edge, the peer's top edge.
+- The side is set by `--stitch-side left|right|top|bottom` (default `right`); the GUI asks before launching and stores the answer as `stitch_side` in `config.ini`, which preselects the next dialog. A live switch travels over the GUI→sender stdin channel as `STITCH|side=…`: the stdin thread calls `kvmSetControllerSide()`, which queues the request, and the message loop applies it on its 50 ms timer — handing control back and releasing held keys first if the peer currently has it.
+- Connection/handshake failure, refusal and disconnect each emit their own `STAT|event=error`; state changes emit `STAT|event=stitch|state=local|remote|waiting|…|side=…`, which the GUI status panel renders and turns into the four-way switch.
+- Non-Windows platforms return an error immediately (stitch is Windows-only).
+
+**Target side (receiver's 8084 service)**
+
+- A dedicated thread listens on 8084, independent of the video listener; it polls the running flag while idle and during a session, and is joined on every exit path.
+- The session runs on its own thread so the listener stays responsive: while one is active a second controller receives `KVM_ERR_BUSY` immediately (its hello is read first — closing a socket with unread data turns the close into an RST). Both ends enable TCP keepalive (15 s idle, 3 s probes), so a controller that loses power or Wi-Fi ends the session — and releases the held keys — within about a minute.
+- After a valid `KvmHello` it shows a **topmost Yes/No dialog** (default No, auto-declined after 30 s, closed automatically on shutdown); its text names the target edge the controller will enter through, taken from `reserved[0]`. Only on Yes does it return the target virtual-desktop metrics and start injecting; after an explicit "No" the same source is rejected outright for 60 s to prevent prompt flooding (leaving the box unanswered for 30 s is a timeout, not a refusal, and arms no cooldown). While the box is up the watcher also `select`s the connection: if the controller has already stopped or disconnected, the dialog is closed and the session slot freed immediately instead of after the timeout. A non-blocking FIN check runs before the box is created, and a peer that cancels during the prompt is not treated as a refusal but delays the next prompt by 3 s (recorded per source in a bounded 8-entry table **and** in one global tick, so a rotating source address bypasses only the per-source half), with at least 1.5 s between any two dialogs regardless of source — so connect-then-close cannot flicker the topmost dialog. Only an actual "No" arms the cooldown: `MessageBoxW` returning 0 (no interactive window station, out of resources) is a failed prompt — the request is still refused, but no cooldown is armed. The backoff wait keeps polling the socket, so a peer that has already disconnected releases the session slot at once.
+- Events are injected with `SendInput`: absolute mouse coordinates + `MOUSEEVENTF_VIRTUALDESK` (normalised 0..65535), keyboard prefers scan codes (`KEYEVENTF_SCANCODE`, plus the extended flag when needed). On session end, disconnect or a clean shutdown every key/button recorded as held is released (a force-terminated process cannot run this — a known limit of "Stop" in receive mode under the GUI's default hidden-console launch).
+- Injection is serial on the session thread. `SendInput` cannot cross UIPI into **higher**-integrity windows and cannot target the secure desktop (so Ctrl+Alt+Del cannot be synthesised). A standalone `receiver` is unelevated, so elevated windows receive no stitch input; a receiver launched by the GUI inherits the GUI's administrator token and can type into them.
+
+> Security note: the 8084 channel is **unencrypted** and does not authenticate the peer — security rests entirely on the target's per-session human confirmation. As with 8083, keep it LAN-only.
 
 ## Protocol Reference
 
@@ -192,7 +237,7 @@ Actual bandwidth use per codec is covered in [Performance](performance.md).
 
 | Field | Values |
 |-------|--------|
-| `mode` | `0`=mirror　`1`=extend |
+| `mode` | `0`=mirror　`1`=extend (stitch does not use this protocol; see the [8084 channel](#6--stitch-channel-software-kvm-8084)) |
 | `codec` | `0`=raw　`1`=RLE　`2`=H.264　`3`=H.265　`4`=AV1 |
 | `codec_flags` | `bit0` = sender wants hardware encode |
 | `status` | `0`=OK　`1`=version　`2`=codec　`3`=dims　`4`=decoder　`5`=legacy |

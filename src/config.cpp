@@ -89,6 +89,28 @@ int clampInt(int v, int lo, int hi)
     return v;
 }
 
+/* extend_res: "auto", or WxH with whole decimal tokens in the same range the
+ * sender and the virtual display driver accept. */
+bool validExtendRes(const std::string &v)
+{
+    if (v == "auto")
+        return true;
+    size_t x = v.find_first_of("xX");
+    if (x == std::string::npos || x == 0 || x + 1 >= v.size())
+        return false;
+    std::string ws = v.substr(0, x), hs = v.substr(x + 1);
+    if (ws.find_first_not_of("0123456789") != std::string::npos ||
+        hs.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    if (ws.size() > 4 || hs.size() > 4)
+        return false;
+    long w = strtol(ws.c_str(), nullptr, 10);
+    long h = strtol(hs.c_str(), nullptr, 10);
+    /* Same bounds as the sender/driver path: even, sane, in range. */
+    return w >= 320 && w <= 7680 && h >= 240 && h <= 4320 &&
+           (w % 2) == 0 && (h % 2) == 0;
+}
+
 void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
 {
     if (key == "codec") {
@@ -128,6 +150,16 @@ void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
         /* unknown value → keep the default (system) rather than a broken mode */
         if (val == "light" || val == "dark" || val == "system")
             cfg.theme = val;
+    } else if (key == "extend_res") {
+        if (validExtendRes(val))
+            cfg.extend_res = val;
+    } else if (key == "vdd_mode_write") {
+        if (val == "ask" || val == "always" || val == "never")
+            cfg.vdd_mode_write = val;
+    } else if (key == "stitch_side") {
+        /* unknown value → keep the default (right) rather than a broken edge */
+        if (val == "left" || val == "right" || val == "top" || val == "bottom")
+            cfg.stitch_side = val;
     } else if (key == "last_update_check") {
         /* runtime metadata: reject garbage and future clock skew */
         long long v = strtoll(val.c_str(), nullptr, 10);
@@ -225,6 +257,9 @@ bool configSave(const AppConfig &cfg)
     fprintf(f, "auto_receive=%d\n", cfg.auto_receive ? 1 : 0);
     fprintf(f, "auto_check_update=%d\n", cfg.auto_check_update ? 1 : 0);
     fprintf(f, "theme=%s\n", cfg.theme.c_str());
+    fprintf(f, "extend_res=%s\n", cfg.extend_res.c_str());
+    fprintf(f, "vdd_mode_write=%s\n", cfg.vdd_mode_write.c_str());
+    fprintf(f, "stitch_side=%s\n", cfg.stitch_side.c_str());
     fprintf(f, "last_update_check=%lld\n", cfg.last_update_check);
     fprintf(f, "ignored_version=%s\n", cfg.ignored_version.c_str());
     fclose(f);

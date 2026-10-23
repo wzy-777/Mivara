@@ -36,7 +36,9 @@
 
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -171,6 +173,25 @@ bool vddInstalled()
     });
 }
 
+/* Is a VDD path ACTIVE, i.e. attached to the desktop right now? Writing the
+ * settings file or restarting the device in that state would yank a display
+ * a live session may be showing, so both are deferred until no path is
+ * active (the next session after a clean shutdown). */
+static bool vddHasActivePath()
+{
+    bool active = false;
+    vddForEachPath([&](DISPLAYCONFIG_PATH_INFO &p,
+                       UINT32, std::vector<DISPLAYCONFIG_PATH_INFO> &,
+                       UINT32, std::vector<DISPLAYCONFIG_MODE_INFO> &) {
+        if (p.flags & DISPLAYCONFIG_PATH_ACTIVE) {
+            active = true;
+            return false;             /* stop scanning */
+        }
+        return true;
+    });
+    return active;
+}
+
 /* Activate / deactivate every VDD path via the CCD topology. */
 static bool vddApplyTopology(bool active)
 {
@@ -254,6 +275,322 @@ static bool vddConfigure(const std::string &device, int x, int y,
     return r == DISP_CHANGE_SUCCESSFUL;
 }
 
+/* ── Driver mode list (vdd_settings.xml) ────────────────────────────────
+ * The UMDF stack reads its mode list once at start-up; a size that is not
+ * in the file simply cannot be applied. Extend mode can therefore append
+ * the receiver's exact size (backed up first) and restart the device. */
+
+static bool vddReadFile(const std::string &path, std::string &out)
+{
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE |
+                               FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz = {};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 ||
+        sz.QuadPart > 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize((size_t)sz.QuadPart);
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got != out.size()) { out.clear(); return false; }
+    return true;
+}
+
+static bool vddWriteFile(const std::string &path, const std::string &data)
+{
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data.data(), (DWORD)data.size(), &written, nullptr);
+    if (ok) FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok && written == data.size();
+}
+
+static std::string vddLower(std::string s)
+{
+    for (char &c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
+/* Locate the <resolutions> element. Matching only inside it keeps the scan
+ * out of comments or unrelated elements that happen to contain <width>. */
+static bool vddResolutionsRegion(const std::string &xml, size_t &open,
+                                 size_t &close)
+{
+    const std::string low = vddLower(xml);
+    open  = low.find("<resolutions>");
+    close = low.rfind("</resolutions>");
+    return open != std::string::npos && close != std::string::npos &&
+           close > open;
+}
+
+/* Does the <resolutions> element contain this exact width/height pair? */
+static bool vddXmlHasMode(const std::string &xml, size_t open, size_t close,
+                          int w, int h)
+{
+    const std::string low = vddLower(xml);
+    size_t pos = open;
+    while ((pos = low.find("<resolution>", pos)) != std::string::npos &&
+           pos < close) {
+        size_t end = low.find("</resolution>", pos);
+        if (end == std::string::npos || end > close) break;
+        size_t wp = low.find("<width>", pos);
+        size_t hp = low.find("<height>", pos);
+        if (wp != std::string::npos && hp != std::string::npos &&
+            wp < end && hp < end) {
+            long mw = strtol(xml.c_str() + wp + 7, nullptr, 10);
+            long mh = strtol(xml.c_str() + hp + 8, nullptr, 10);
+            if (mw == w && mh == h) return true;
+        }
+        pos = end + 13;                 /* strlen("</resolution>") */
+    }
+    return false;
+}
+
+/* Serialise writers of the driver settings file (two Mivara instances may
+ * start an extend session at the same time). Session-local name: both
+ * processes run in the interactive session. */
+struct VddSettingsLock
+{
+    HANDLE h = nullptr;
+    bool held = false;
+    VddSettingsLock()
+    {
+        h = CreateMutexA(nullptr, FALSE, "MivaraVddSettings");
+        if (!h) return;
+        DWORD r = WaitForSingleObject(h, 10000);
+        held = (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED);
+    }
+    ~VddSettingsLock()
+    {
+        if (held) ReleaseMutex(h);
+        if (h) CloseHandle(h);
+    }
+};
+
+/* Atomic in-place replace through a same-directory temp file. ReplaceFile
+ * keeps the destination's ACL/attributes (important for a System32 file);
+ * a unique temp name keeps concurrent writers from clobbering each other. */
+static bool vddReplaceWith(const std::string &path, const std::string &data,
+                           std::string &err)
+{
+    const std::string tmp = path + ".mivara." +
+                            std::to_string((unsigned long)GetCurrentProcessId()) +
+                            ".tmp";
+    if (!vddWriteFile(tmp, data)) {
+        DeleteFileA(tmp.c_str());
+        err = "cannot write " + tmp + " (not elevated?)";
+        return false;
+    }
+    if (!ReplaceFileA(path.c_str(), tmp.c_str(), nullptr,
+                      REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
+        const DWORD e = GetLastError();
+        DeleteFileA(tmp.c_str());
+        err = "cannot replace " + path + " (error " +
+              std::to_string((int)e) + ")";
+        return false;
+    }
+    return true;
+}
+
+static bool vddRegString(HKEY root, const char *sub, const char *name,
+                         std::string &out)
+{
+    char buf[MAX_PATH * 2] = {};
+    DWORD cb = sizeof(buf), type = 0;
+    if (RegGetValueA(root, sub, name, RRF_RT_REG_SZ, &type,
+                     buf, &cb) != ERROR_SUCCESS)
+        return false;
+    if (!buf[0]) return false;
+    out = buf;
+    return true;
+}
+
+/* The vendor driver can relocate its settings file via HKLM. Support both
+ * the file and directory forms; fall back to the shipped location. */
+static std::string vddSettingsPath()
+{
+    static const char *kKeys[] = {
+        "SOFTWARE\\MikeTheTech\\VirtualDisplayDriver",
+        "SOFTWARE\\WOW6432Node\\MikeTheTech\\VirtualDisplayDriver",
+    };
+    static const char *kValues[] = { "SettingsPath", "VDDPATH", "VddSettingsPath" };
+    for (const char *key : kKeys) {
+        for (const char *name : kValues) {
+            std::string v;
+            if (!vddRegString(HKEY_LOCAL_MACHINE, key, name, v)) continue;
+            /* Only absolute drive paths: a relative value would resolve
+             * against whatever CWD the elevated sender happens to have. */
+            const bool absolute = v.size() >= 3 && v[1] == ':' &&
+                                  (v[2] == '\\' || v[2] == '/');
+            if (!absolute) continue;
+            if (v.size() > 4 && vddLower(v.substr(v.size() - 4)) == ".xml")
+                return v;
+            while (!v.empty() && (v.back() == '\\' || v.back() == '/'))
+                v.pop_back();
+            return v + "\\vdd_settings.xml";
+        }
+    }
+    char sys[MAX_PATH] = {};
+    UINT n = GetSystemDirectoryA(sys, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return std::string();
+    return std::string(sys) + "\\drivers\\UMDF\\vdd_settings.xml";
+}
+
+VddModeResult vddEnsureMode(int w, int h, bool allowWrite, std::string &err)
+{
+    err.clear();
+    /* Dimensions arrive over the LAN. Require even, sane, in-bounds values:
+     * odd sizes break the encoder's even-dimension path, and a bogus peer
+     * must not be able to add a 1x1 or 7680x4320 mode to a system file. */
+    if (w < 320 || w > 7680 || h < 240 || h > 4320 ||
+        (w & 1) || (h & 1)) {
+        err = "invalid resolution";
+        return VDD_MODE_ABSENT;
+    }
+    const std::string path = vddSettingsPath();
+    if (path.empty()) {
+        err = "vdd_settings.xml path not found";
+        return VDD_MODE_ABSENT;
+    }
+
+    VddSettingsLock lock;
+    if (!lock.held) {
+        err = "another Mivara instance is updating " + path;
+        return VDD_MODE_ABSENT;
+    }
+
+    std::string xml;
+    if (!vddReadFile(path, xml)) {
+        err = "cannot read " + path;
+        return VDD_MODE_ABSENT;
+    }
+    if (xml.size() >= 2 &&
+        (((unsigned char)xml[0] == 0xFF && (unsigned char)xml[1] == 0xFE) ||
+         ((unsigned char)xml[0] == 0xFE && (unsigned char)xml[1] == 0xFF))) {
+        err = "UTF-16 vdd_settings.xml is not supported";
+        return VDD_MODE_ABSENT;
+    }
+
+    size_t open = 0, close = 0;
+    if (!vddResolutionsRegion(xml, open, close)) {
+        err = "unexpected vdd_settings.xml layout";
+        return VDD_MODE_ABSENT;
+    }
+    if (vddXmlHasMode(xml, open, close, w, h)) return VDD_MODE_PRESENT;
+    if (!allowWrite) {
+        err = "mode not listed; adding disabled";
+        return VDD_MODE_ABSENT;
+    }
+    /* Never touch the file (or restart the device) under a live VDD: a
+     * leftover session may still be showing it. A mode added now would not
+     * be loaded anyway; it becomes available at the next session. */
+    if (vddHasActivePath()) {
+        err = "virtual display is active; not modifying settings";
+        return VDD_MODE_ABSENT;
+    }
+
+    const char *nl = xml.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    /* Insert right after the <resolutions> open tag: always inside the
+     * element, whatever the driver's formatting (a minified file used to
+     * send the block before the XML declaration). Numeric values only –
+     * the size comes from the wire and is range-checked above. */
+    std::string block;
+    block += nl;
+    block += "        <resolution>";
+    block += nl; block += "            <width>" + std::to_string(w) + "</width>";
+    block += nl; block += "            <height>" + std::to_string(h) + "</height>";
+    block += nl; block += "            <refresh_rate>60</refresh_rate>";
+    block += nl; block += "        </resolution>";
+    block += nl;
+
+    const size_t at = open + strlen("<resolutions>");
+    const std::string updated =
+        xml.substr(0, at) + block + xml.substr(at);
+
+    /* Structural sanity before touching the real file. */
+    size_t uo = 0, uc = 0;
+    if (updated.find("</vdd_settings>") == std::string::npos ||
+        !vddResolutionsRegion(updated, uo, uc) ||
+        !vddXmlHasMode(updated, uo, uc, w, h)) {
+        err = "insertion would corrupt " + path + "; not written";
+        return VDD_MODE_ABSENT;
+    }
+
+    /* Keep the pristine original once, for manual recovery. Rollback below
+     * uses the in-memory pre-write copy, so a backup left over from an older
+     * driver install can never clobber a newer file. */
+    const std::string bak = path + ".mivara.bak";
+    if (GetFileAttributesA(bak.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        !CopyFileA(path.c_str(), bak.c_str(), TRUE)) {
+        err = "cannot back up " + path;
+        return VDD_MODE_ABSENT;
+    }
+
+    if (!vddReplaceWith(path, updated, err))
+        return VDD_MODE_ABSENT;
+
+    std::string verify;
+    size_t vo = 0, vc = 0;
+    if (!vddReadFile(path, verify) ||
+        !vddResolutionsRegion(verify, vo, vc) ||
+        !vddXmlHasMode(verify, vo, vc, w, h)) {
+        std::string rerr;
+        if (!vddReplaceWith(path, xml, rerr))
+            std::cerr << "VDD: rollback failed: " << rerr << "\n";
+        err = "verification failed; original restored";
+        return VDD_MODE_ABSENT;
+    }
+
+    std::cout << "Added " << w << "x" << h << " to " << path
+              << " (backup: " << bak << ")\n";
+    return VDD_MODE_ADDED;
+}
+
+/* Enumerate the modes the driver currently exposes for this device and pick
+ * the closest aspect ratio (area proximity breaks ties). Used when the
+ * requested size could not be added to the settings file. */
+static bool vddPickClosestMode(const std::string &dev, int wantW, int wantH,
+                               int &outW, int &outH)
+{
+    int bestW = 0, bestH = 0;
+    double best = 1e300;
+    const double wantAR   = (double)wantW / (double)wantH;
+    const double wantArea = (double)wantW * (double)wantH;
+
+    DEVMODEA dm = {};
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; i < 4096; i++) {
+        if (!EnumDisplaySettingsA(dev.c_str(), i, &dm)) break;
+        const int mw = (int)dm.dmPelsWidth, mh = (int)dm.dmPelsHeight;
+        if (mw < 1 || mh < 1) continue;
+        if (mw == wantW && mh == wantH) { outW = mw; outH = mh; return true; }
+        const double ar = (double)mw / (double)mh;
+        const double score =
+            std::fabs(std::log(ar / wantAR)) * 10.0 +
+            std::fabs(std::log(((double)mw * mh) / wantArea));
+        if (score < best) { best = score; bestW = mw; bestH = mh; }
+    }
+    if (!bestW) return false;
+    outW = bestW;
+    outH = bestH;
+    return true;
+}
+
+static bool vddModeAvailable(const std::string &dev, int w, int h)
+{
+    int mw = 0, mh = 0;
+    return vddPickClosestMode(dev, w, h, mw, mh) && mw == w && mh == h;
+}
+
 /* Is this GDI display device backed by the virtual display driver? */
 static bool isVddMonitorDevice(const char *gdiDevice)
 {
@@ -319,8 +656,26 @@ bool vddFindMonitorRect(const std::string &dev, int &x, int &y, int &w, int &h)
 
 /* Full startup: enable device, attach VDD, place it right of the desktop,
  * report the rect. w/h = requested virtual display resolution. */
-bool vddStartup(int w, int h, VddInfo &out)
+bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
 {
+    if (w < 1 || w > 7680) w = 1920;
+    if (h < 1 || h > 4320) h = 1080;
+
+    /* vddEnsureMode() appended a mode to vdd_settings.xml while the driver
+     * may still be loaded with the old list (leftover from a crashed
+     * session). One bounded disable/enable cycle makes the UMDF stack
+     * re-read the file; disabling an already-disabled device is a no-op and
+     * the re-enable below is what performs the reload. Never restart while
+     * a VDD path is active – that would yank a display a live session owns. */
+    if (reloadFirst && !vddHasActivePath()) {
+        std::cout << "Restarting virtual display driver to load the new mode...\n";
+        vddEnableDevice(false);
+        vddWaitFor([] { return !vddInstalled(); }, 4000);
+    } else if (reloadFirst) {
+        std::cout << "Virtual display is in use; the new mode will load at "
+                     "the next session.\n";
+    }
+
     /* Re-enable the Root\MttVDD device first: a disabled device exposes no
      * CCD path, so vddInstalled() would wrongly report "not installed".
      * No-op when the device is already enabled (leftover / first run). */
@@ -372,6 +727,28 @@ bool vddStartup(int w, int h, VddInfo &out)
         return false;
     }
 
+    /* If the requested size is not in the driver's mode list (the XML could
+     * not be extended), switch to the closest advertised mode. Scaling a
+     * slightly different size uniformly looks far better than a rejected
+     * mode, and the receiver aspect-fits whatever we send. */
+    /* A freshly (re)loaded driver may take a moment to refresh the mode list
+     * exposed through EnumDisplaySettings; polling briefly avoids a needless
+     * downgrade to a different size. */
+    if (!vddModeAvailable(dev, w, h)) {
+        for (int t = 0; t < 3 && !vddModeAvailable(dev, w, h); t++)
+            Sleep(300);
+    }
+    if (!vddModeAvailable(dev, w, h)) {
+        int aw = 0, ah = 0;
+        if (vddPickClosestMode(dev, w, h, aw, ah)) {
+            std::cerr << "Mode " << w << "x" << h
+                      << " is not exposed by the driver - using closest "
+                      << aw << "x" << ah << "\n";
+            w = aw;
+            h = ah;
+        }
+    }
+
     /* Deterministic placement: requested mode @60 right of the real desktop.
      * A freshly attached display may reject mode changes for a moment,
      * so retry a few times before falling back. */
@@ -379,6 +756,14 @@ bool vddStartup(int w, int h, VddInfo &out)
     for (int attempt = 0; attempt < 4 && !ok; attempt++) {
         ok = vddConfigure(dev, x, 0, w, h, 60);
         if (!ok) Sleep(600);
+    }
+    /* Some driver lists use 30 Hz for a mode while the global list adds 60;
+     * a 60 Hz rejection is not necessarily a rejected size. */
+    if (!ok) {
+        for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+            ok = vddConfigure(dev, x, 0, w, h, 30);
+            if (!ok) Sleep(600);
+        }
     }
     if (!ok && (w != 1920 || h != 1080)) {
         std::cerr << "Requested mode " << w << "x" << h

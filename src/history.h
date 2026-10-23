@@ -14,7 +14,7 @@ struct HistEntry
     std::string ip;
     int port = 8081;
     std::string name;              /* friendly name; empty → display falls back to ip */
-    std::string mode;              /* "mirror" | "extend" */
+    std::string mode;              /* "mirror" | "extend" | "stitch" */
     long long last_used_unix = 0;
     int use_count = 1;
 };

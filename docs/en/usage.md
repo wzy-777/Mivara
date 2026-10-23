@@ -4,10 +4,11 @@
 
 Mivara is a lightweight, cross-platform **screen extension / casting** tool. The sender captures the local screen and streams it over the network to the receiver, which displays it fullscreen.
 
-Two modes are provided:
+Two display modes are provided, plus a "stitch" mode that sends no picture at all:
 
 1. **Mirror** — the receiver shows the sender's primary screen in full (demos and presentations).
 2. **Extend** — the sender **automatically activates a virtual display**, creating a real desktop workspace; windows and the mouse can be dragged into this "invisible screen" and the receiver shows it in real time. The virtual display is detached when the session ends.
+3. **Stitch (software KVM)** — both PCs keep their own monitors and **share one keyboard and mouse**: choose which side of this PC the peer sits on (left / right / top / bottom) when starting, push the cursor out of that edge to take over the peer, and move back out of the peer's facing edge (or press Ctrl+Alt+Shift+Q) to hand control back. The side can be switched at any time during the session. No capture, no encoder, no virtual display; Windows ↔ Windows only.
 
 Extend mode requires a Windows indirect display driver (IddCx); see [Virtual Display Driver](virtual-display.md) for installation. The driver only needs to be installed once — attaching/detaching the virtual display is managed automatically during the session.
 
@@ -37,7 +38,8 @@ The GUI is Chinese-only; the screenshots below show the Home screen (light/dark)
 | **Direct connect** | `sender <IP>` skips discovery — works when SSDP multicast is blocked by network policy |
 | **Discovery** | Zero-config SSDP discovery (UDP 1900 multicast + broadcast fallback), shows hostnames |
 | **Connection history** | Last 20 connections embedded on the Home screen — one-click direct connect, no search needed |
-| **GUI** | SDL2_ttf interface: left nav (Home / Settings), receive/send, connection history, automatic search, device list (cast/extend), manual IP entry, live status panel, independent log window |
+| **Stitch (software KVM)** | One keyboard/mouse drives two Windows PCs: low-level input hooks + Raw Input, forwarded over TCP 8084 and injected on the peer with `SendInput`; the peer must confirm every session in a local dialog, and a refusal suppresses further prompts for 60 s (Windows only) |
+| **GUI** | SDL2_ttf interface: left nav (Home / Settings), receive/send, connection history, automatic search, device list (cast/extend/stitch), manual IP entry, live status panel, independent log window |
 | **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt); auto-receive opens the app directly in receive mode when enabled (off by default) |
 | **Update check** | A "Check for updates" button in Settings plus an automatic check at launch (on by default, at most once per 24 h per machine, can be turned off). A new release can be downloaded in-app (size + SHA-256 verified) and installed with one click, or opened on the release page for a manual download. Only the GitHub release source is contacted; no local data is uploaded |
 | **Performance** | Up to 120 FPS streaming, 4 MB socket buffers, TCP_NODELAY |
@@ -53,10 +55,24 @@ For the protocol and implementation behind each capability, see [Architecture & 
 |------|------------------|----------|
 | Mirror | "Cast" / `--mode mirror` (default) | Receiver shows the sender's primary screen in a resizable window |
 | Extend | "Extend" / `--mode extend` | Sender auto-activates a virtual display; receiver shows it borderless fullscreen as a **real desktop workspace** — windows can be dragged in, the mouse crosses over |
+| Stitch | "Stitch" / `--mode stitch` | No picture is sent: both PCs use their own monitors and share one keyboard/mouse (Windows only) |
 
 > Earlier "simulated extend" variants (extend-right/below/left: fullscreen mirror with a blue seam line) were removed — they never created a real desktop workspace. Extend always uses `--mode extend` (protocol mode 1).
 
-Extend mode relies on the Windows virtual display driver; installation and resolution configuration are covered in [Virtual Display Driver](virtual-display.md).
+Extend mode relies on the Windows virtual display driver; installation and resolution configuration are covered in [Virtual Display Driver](virtual-display.md). Before connecting, the sender probes the receiver's current resolution and matches the virtual display to it. If the driver's mode list lacks that size, the first extend session asks for consent to add it (which can be declined); if declined or unwritable, the receiver centres the picture with black bars instead of stretching it.
+
+### Stitch (software KVM)
+
+Stitch turns two Windows PCs sitting side by side into one workspace **without duplicating any picture**: machine A's desktop stays on A's monitor and B's on B's monitor — only the keyboard and mouse cross over.
+
+- **Entry point**: click "Stitch" on a device row or in the connection history — a dialog first asks which side of this PC the peer sits on (left / right / top / bottom, preselected from the last answer); the CLI equivalent is `bin/sender <IP> --mode stitch --stitch-side left|right|top|bottom` (port 8084 — never point it at the video port).
+- **Requirements**: both ends must be Windows and run the same Mivara version; the target must be serving (click "Receive" in the GUI or run `bin/receiver`).
+- **Consent**: on every connection the target shows a topmost Yes/No dialog (default No, auto-declined after 30 s); its text names the edge the controller will enter through for the chosen side. After a refusal, the same source is rejected outright for 60 s instead of prompting again.
+- **Choosing a side**: the side means **where the peer sits relative to this PC**, and it decides both the local edge the cursor leaves through and the peer's edge it enters from. Right: leave the local right edge, enter at the peer's left edge, return by leaving its left edge. Left: leave the local left edge, enter at the peer's right edge, return through its right edge. Top: leave the local top edge, enter at the peer's bottom edge, return through its bottom edge. Bottom: leave the local bottom edge, enter at the peer's top edge, return through its top edge. `Ctrl+Alt+Shift+Q` always hands control back immediately.
+- **Switching mid-session**: the status panel's "Direction" row offers the four sides; a click takes effect immediately. If control is currently on the peer it is handed back first, and the new side becomes the default for the next session. With "Status console" enabled there is no stdin channel, so a switch restarts the sender and reconnects — the peer has to confirm the new session.
+- **Stopping**: "Stop" in the status panel ends the session; closing the receiver window (or ESC/Q) disconnects immediately and releases every held key. Stopping receive mode from the GUI ends the receiver process directly, so a key or mouse button held at that instant may stay down on that PC until tapped once. If the controller loses power or Wi-Fi, TCP keepalive ends the session within about a minute and releases the held input.
+- **Permissions**: a receiver launched from the GUI inherits the GUI's administrator token (the GUI needs elevation for extend mode), so stitch input can reach elevated windows; a standalone `bin/receiver` runs unelevated and cannot type into administrator windows.
+- **Security**: the stitch channel is unencrypted and intended for a trusted LAN only; either side can hand control back at any time, and the target never accepts a connection without a local confirmation.
 
 ## GUI
 
@@ -70,8 +86,8 @@ The top-right of the header holds the **appearance switcher** — three icons: s
 
 - **Appearance**: three icons in the header (sun = Light, moon = Dark, monitor = Follow system); one click recolours the window and writes `theme` to `config.ini`, with no OK needed. The same setting appears as a labelled three-way switch under Settings · Appearance, for anyone who does not read the icons. For "Follow system", see the platform note in [Settings & History](#settings--history)
 - **Home · Receive**: shows the local IP, ports and a "receiving" status while launching the receiver to wait for connections; "Stop" ends it
-- **Home · Send**: shows "searching"; once devices are found (with hostnames), each row offers "Cast" (mirror) or "Extend"; streaming can be stopped at any time
-- **Home · Connection history**: the last 20 connections are listed under the receive/send cards — click to connect directly (no search); delete single entries or clear all; mouse wheel scrolls
+- **Home · Send**: shows "searching"; once devices are found (with hostnames), each row offers "Cast" (mirror), "Extend" or "Stitch" (stitch first asks which side the peer is on); streaming can be stopped at any time
+- **Home · Connection history**: the last 20 connections are listed under the receive/send cards — click to connect directly (no search, all three modes); delete single entries or clear all; mouse wheel scrolls
 - **Home · In session**: while casting/receiving you can switch to Settings (the session keeps running); "Back to session" or ESC in Settings returns to the live status, while "Home" goes to the Home screen (shows the session running, with Stop)
 - **Settings**: the left column is "Quality & codec" (codec auto/H.264/H.265/AV1/raw/RLE, quality/FPS/bitrate/scale/chroma); the right column is "Connection & startup" (hardware accel / status console / log window / auto-start / auto-receive / auto update check) and "Appearance"; the "Software update" card sits below. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
 - **Settings · Update**: the bottom "Update" row shows the current version and the check result; a new release offers "Download update" (with progress) → "Install now" (Windows: after verification the app quits and starts the installer; Linux/macOS: opens the release page). You can "Ignore this version"; a new release also shows a banner at the top of Home and a dot on the Settings tab
@@ -94,7 +110,8 @@ On Windows you can also use the convenience scripts in `scripts/`: `start_receiv
 | Input | Action |
 |-------|--------|
 | Ctrl+C | Graceful exit (virtual display detached + device disabled) |
-| Mode prompt 1/2 | Mirror / Extend (interactive CLI only) |
+| Mode prompt 1/2/3 | Mirror / Extend / Stitch (interactive CLI only) |
+| Ctrl+Alt+Shift+Q | Stitch mode: hand the keyboard/mouse back immediately |
 
 ## Settings & History
 
@@ -113,6 +130,8 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 | Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); cleaned up on uninstall |
 | Auto-receive | off | Enter receive mode as soon as the app opens |
 | Auto update check | on | Checks for a new release ~3 s after launch (at most once per 24 h per machine); when off, only the manual button goes online |
+
+A few options exist only in `config.ini`: `extend_res` (`auto` or `WxH`, default `auto`) forces the virtual-display size; `vdd_mode_write` (`ask` / `always` / `never`, default `ask`) controls whether the receiver's resolution may be added to `vdd_settings.xml`; and `stitch_side` (`left` / `right` / `top` / `bottom`, default `right`) stores the stitch direction, rewritten whenever it is chosen in the launch dialog or switched mid-session.
 
 > "Follow system" reads the OS light/dark preference. Windows reads the `AppsUseLightTheme` registry value and re-checks it every 2 s, so flipping the OS theme is followed immediately; macOS (`AppleInterfaceStyle`) and Linux (GNOME `color-scheme`) are sampled once at startup, so an OS theme change needs a restart of the app there. A failed probe always falls back to light.
 

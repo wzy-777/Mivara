@@ -24,6 +24,14 @@ struct AppConfig
     int auto_receive = 0;            /* 1 = enter receive mode on app open */
     int auto_check_update = 1;       /* 1 = check for updates on app open */
     std::string theme = "system";    /* light|dark|system (GUI appearance) */
+    std::string extend_res = "auto"; /* extend mode VDD size: auto|WxH
+                                        (auto = the receiver's resolution) */
+    std::string vdd_mode_write = "ask"; /* extend mode: ask|always|never –
+                                           may Mivara add the receiver's
+                                           resolution to vdd_settings.xml? */
+    std::string stitch_side = "right";  /* 拼接: left|right|top|bottom –
+                                           which edge the peer sits on (the
+                                           GUI preselects it in the dialog) */
     long long last_update_check = 0; /* unix seconds of the last attempt (runtime metadata) */
     std::string ignored_version;     /* e.g. "v0.9.2"; runtime metadata */
 };

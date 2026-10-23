@@ -31,10 +31,12 @@
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #endif
@@ -56,6 +58,9 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <memory>
+#include <system_error>
 
 /* ─── Global debug flag ──────────────────────────────────────── */
 static bool g_debug = false;
@@ -125,6 +130,141 @@ static int recv_all(int sock, void *buf, size_t size)
             return -1;
         }
         got += (size_t)n;
+    }
+    return 0;
+}
+
+/* ─── Stop-aware I/O (receiver-side service only) ───────────────
+ *
+ * Same shape as the helpers above, but every blocking call is gated by
+ * a 1 s select() that re-checks the stop callback on timeout, so an
+ * idle persistent client cannot pin the service thread at shutdown.
+ * The client-side helpers stay unchanged.                          */
+
+#ifdef _WIN32
+#define PORTS_FD_SET(s, set) FD_SET((SOCKET)(s), (set))
+#else
+#define PORTS_FD_SET(s, set) FD_SET((s), (set))
+#endif
+
+static int ports_wait(int sock, int for_write, ports_stop_fn stop)
+{
+    for (;;)
+    {
+        fd_set fds;
+        struct timeval tv;
+        int r;
+
+        if (stop && stop())
+            return -1;
+
+        FD_ZERO(&fds);
+#ifndef _WIN32
+        if (sock >= FD_SETSIZE)
+            return -1;
+#endif
+        PORTS_FD_SET(sock, &fds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+#ifdef _WIN32
+        r = select(0, for_write ? nullptr : &fds,
+                   for_write ? &fds : nullptr, nullptr, &tv);
+#else
+        r = select(sock + 1, for_write ? nullptr : &fds,
+                   for_write ? &fds : nullptr, nullptr, &tv);
+#endif
+        if (r > 0)
+            return 0;
+        if (r < 0)
+        {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR)
+                continue;
+#else
+            if (errno == EINTR)
+                continue;
+#endif
+            return -1;
+        }
+        /* timeout: loop and re-check the stop flag */
+    }
+}
+
+/* Accepted sockets are non-blocking: select-for-write only promises some
+ * space, so a blocking send() could still outlive the stop flag. */
+static void ports_set_nonblocking(int sock)
+{
+#ifdef _WIN32
+    u_long one = 1;
+    ioctlsocket((SOCKET)sock, FIONBIO, &one);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+static int recv_all_stop(int sock, void *buf, size_t size, ports_stop_fn stop)
+{
+    char *p = (char *)buf;
+    size_t got = 0;
+    while (got < size)
+    {
+        int n;
+        if (ports_wait(sock, 0, stop) < 0)
+            return -1;
+#ifdef _WIN32
+        n = recv(sock, p + got, (int)(size - got), 0);
+#else
+        n = (int)recv(sock, p + got, size - got, 0);
+#endif
+        if (n <= 0)
+        {
+#ifdef _WIN32
+            if (n < 0 && (WSAGetLastError() == WSAEINTR ||
+                          WSAGetLastError() == WSAEWOULDBLOCK))
+                continue;
+#else
+            if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                          errno == EWOULDBLOCK))
+                continue;
+#endif
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+static int send_all_stop(int sock, const void *buf, size_t size, ports_stop_fn stop)
+{
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    while (sent < size)
+    {
+        int n;
+        if (ports_wait(sock, 1, stop) < 0)
+            return -1;
+#ifdef _WIN32
+        n = send(sock, p + sent, (int)(size - sent), 0);
+#else
+        n = (int)send(sock, p + sent, size - sent, 0);
+#endif
+        if (n <= 0)
+        {
+#ifdef _WIN32
+            if (n < 0 && (WSAGetLastError() == WSAEINTR ||
+                          WSAGetLastError() == WSAEWOULDBLOCK))
+                continue;
+#else
+            if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                          errno == EWOULDBLOCK))
+                continue;
+#endif
+            return -1;
+        }
+        sent += (size_t)n;
     }
     return 0;
 }
@@ -834,7 +974,7 @@ static std::vector<PortEntry> collect_ports(uint8_t proto_filter)
  * RECEIVER-SIDE SERVER
  * ════════════════════════════════════════════════════════════════ */
 
-void ports_service_handle_client(int client_sock)
+void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
 {
     char client_ip[INET_ADDRSTRLEN] = "unknown";
     struct sockaddr_in addr;
@@ -851,7 +991,10 @@ void ports_service_handle_client(int client_sock)
         PortRequest req;
         memset(&req, 0, sizeof(req));
 
-        if (recv_all(client_sock, &req, sizeof(req)) < 0)
+        if (should_stop && should_stop())
+            break;
+
+        if (recv_all_stop(client_sock, &req, sizeof(req), should_stop) < 0)
         {
             DEBUG_PRINT("Client disconnected or recv failed");
             break;
@@ -875,7 +1018,7 @@ void ports_service_handle_client(int client_sock)
             resp.magic = htonl(PORTS_MAGIC);
             resp.status = 0;
             resp.operation = PORTS_OP_PING;
-            if (send_all(client_sock, &resp, sizeof(resp)) < 0)
+            if (send_all_stop(client_sock, &resp, sizeof(resp), should_stop) < 0)
                 break;
             printf("[PORTS-SVC] Ping OK from %s\n", client_ip);
             continue;
@@ -947,7 +1090,7 @@ void ports_service_handle_client(int client_sock)
             resp.status = killed ? 0 : 1;
             resp.operation = op;
             resp.entry_count = 0;
-            if (send_all(client_sock, &resp, sizeof(resp)) < 0)
+            if (send_all_stop(client_sock, &resp, sizeof(resp), should_stop) < 0)
                 break;
             continue;
         }
@@ -959,7 +1102,7 @@ void ports_service_handle_client(int client_sock)
         resp.operation = op;
         resp.entry_count = htonl((uint32_t)entries.size());
 
-        if (send_all(client_sock, &resp, sizeof(resp)) < 0)
+        if (send_all_stop(client_sock, &resp, sizeof(resp), should_stop) < 0)
         {
             DEBUG_PRINT("Failed to send response header");
             break;
@@ -973,7 +1116,7 @@ void ports_service_handle_client(int client_sock)
             e.process[sizeof(e.process) - 1] = '\0';
             e.cmdline[sizeof(e.cmdline) - 1] = '\0';
 
-            if (send_all(client_sock, &e, sizeof(e)) < 0)
+            if (send_all_stop(client_sock, &e, sizeof(e), should_stop) < 0)
             {
                 DEBUG_PRINT("Failed to send entry %zu", sent);
                 goto client_done;
@@ -992,7 +1135,7 @@ void ports_service_handle_client(int client_sock)
     printf("[PORTS-SVC] Client %s disconnected\n", client_ip);
 }
 
-void ports_service_run(void)
+void ports_service_run(ports_stop_fn should_stop)
 {
 #ifdef _WIN32
     if (!ensure_winsock())
@@ -1063,14 +1206,57 @@ void ports_service_run(void)
     printf("[PORTS-SVC] ✓ Port service listening on TCP %d\n", PORTS_SERVICE_PORT);
     printf("[PORTS-SVC] Press Ctrl+C to stop\n");
 
+#ifndef _WIN32
+    struct PortsClientTracker
+    {
+        std::mutex mtx;
+        std::condition_variable cv;
+        int active = 0;
+    };
+    auto tracker = std::make_shared<PortsClientTracker>();
+#endif
+
     for (;;)
     {
+        fd_set fds;
+        struct timeval tv;
+        int ready;
+
+        if (should_stop && should_stop())
+            break;
+
+        FD_ZERO(&fds);
+        PORTS_FD_SET(server, &fds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+#ifdef _WIN32
+        ready = select(0, &fds, nullptr, nullptr, &tv);
+#else
+        ready = select((int)server + 1, &fds, nullptr, nullptr, &tv);
+#endif
+        if (ready < 0)
+        {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR)
+                continue;
+#else
+            if (errno == EINTR)
+                continue;
+#endif
+            fprintf(stderr, "[PORTS-SVC] select() failed\n");
+            break;
+        }
+        if (ready == 0)
+            continue; /* timeout: re-check the stop flag */
+
         struct sockaddr_in ca = {};
 #ifdef _WIN32
         int calen = sizeof(ca);
         SOCKET client = accept(server, (struct sockaddr *)&ca, &calen);
         if (client == INVALID_SOCKET)
         {
+            if (should_stop && should_stop())
+                break;
             if (WSAGetLastError() == WSAEINTR)
                 continue;
             fprintf(stderr, "[PORTS-SVC] accept() failed: %d\n", WSAGetLastError());
@@ -1081,6 +1267,8 @@ void ports_service_run(void)
         int client = accept(server, (struct sockaddr *)&ca, &calen);
         if (client < 0)
         {
+            if (should_stop && should_stop())
+                break;
             if (errno == EINTR)
                 continue;
             fprintf(stderr, "[PORTS-SVC] accept() failed: %s\n", strerror(errno));
@@ -1089,19 +1277,40 @@ void ports_service_run(void)
 #endif
 
         printf("[PORTS-SVC] Connection from %s\n", inet_ntoa(ca.sin_addr));
+        ports_set_nonblocking((int)client);
 
         // Handle client in a separate thread for concurrent connections
 #ifdef _WIN32
         // On Windows, we'll handle synchronously for simplicity
-        ports_service_handle_client((int)client);
+        ports_service_handle_client((int)client, should_stop);
         closesocket(client);
 #else
-        // On Unix, fork or thread (using thread here)
-        std::thread client_thread([client]()
-                                  {
-            ports_service_handle_client(client);
-            close(client); });
-        client_thread.detach();
+        // On Unix, one worker thread per client
+        {
+            std::lock_guard<std::mutex> lk(tracker->mtx);
+            tracker->active++;
+        }
+        try
+        {
+            std::thread client_thread([client, should_stop, tracker]()
+                                      {
+                ports_service_handle_client(client, should_stop);
+                close(client);
+                {
+                    std::lock_guard<std::mutex> lk(tracker->mtx);
+                    tracker->active--;
+                }
+                tracker->cv.notify_one(); });
+            client_thread.detach();
+        }
+        catch (const std::system_error &)
+        {
+            {
+                std::lock_guard<std::mutex> lk(tracker->mtx);
+                tracker->active--;
+            }
+            close(client);
+        }
 #endif
     }
 
@@ -1109,6 +1318,18 @@ void ports_service_run(void)
     closesocket(server);
     WSACleanup();
 #else
+    {
+        /* Detached workers must observe the stop flag before we return. */
+        std::unique_lock<std::mutex> lk(tracker->mtx);
+        if (!tracker->cv.wait_for(lk, std::chrono::seconds(2),
+                                  [&tracker] { return tracker->active == 0; }))
+        {
+            fprintf(stderr,
+                    "[PORTS-SVC] %d client worker(s) still active after 2 s; "
+                    "exiting anyway\n",
+                    tracker->active);
+        }
+    }
     close(server);
 #endif
 }
@@ -1431,6 +1652,10 @@ std::string ports_entry_to_string(const PortEntry &e)
  * ════════════════════════════════════════════════════════════════ */
 
 #ifdef PORTS_MAIN
+/* Standalone CLI server: no external stop source, match historical
+   "runs until killed" behaviour. */
+extern "C" int ports_never_stop(void) { return 0; }
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr, "Remote Port Inspection Tool\n");
@@ -1472,7 +1697,7 @@ int main(int argc, char *argv[])
     if (cmd == "server")
     {
         printf("Starting port inspection service on port %d...\n", PORTS_SERVICE_PORT);
-        ports_service_run();
+        ports_service_run(ports_never_stop);
     }
     else if (cmd == "client" && argc >= 3)
     {

@@ -7,4 +7,16 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <!-- Per-monitor DPI awareness at process start. The sender captures via GDI
+       and positions the virtual display via GetMonitorInfo; without this the
+       OS virtualises those coordinates (e.g. 2560x1440 for a 3840x2160 VDD at
+       150 %), so the stream would be a scaled copy instead of 1:1. Declaring
+       it in the manifest applies before main(), unlike a SetProcessDpiAwareness
+       call that can fail once awareness has been fixed. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
 </assembly>

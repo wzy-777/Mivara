@@ -51,6 +51,7 @@
 #include <SDL2/SDL.h>
 #include "discover.h"
 #include "gpu_accelerate.h"
+#include "kvm.h"
 #include "ports.h"
 #include "proto.h"
 #include "codec.h"
@@ -350,6 +351,14 @@ static int MY_DISPLAY_HEIGHT = 1080;
 static std::atomic<bool> g_running{true};
 static GPUStats g_gpu_stats;
 
+/* Stop callback handed to the C sidecar services (8082 / 8083).  It reads
+   the one existing shutdown flag, so both services stay in sync with the
+   SDL loop, the console handler and the POSIX signal handler. */
+extern "C" int mivara_service_should_stop(void)
+{
+    return g_running ? 0 : 1;
+}
+
 /* ── Platform signal handler ─────────────────────────────────────────────── */
 #ifdef _WIN32
 static BOOL WINAPI consoleHandler(DWORD sig)
@@ -470,11 +479,22 @@ static void showLegacyPeerError()
  * ══════════════════════════════════════════════════════════════════════════ */
 static void queryMyDisplaySize()
 {
+    /* Ask SDL for physical pixels. Without this the process stays DPI
+     * virtualised (the receiver has no dpiAware manifest), so at 150 %
+     * scaling SDL_GetCurrentDisplayMode reports 1280x720 for a 1920x1080
+     * panel. The sender would then match the virtual display to the wrong
+     * size and the stream would be upscaled. The hint must be set before
+     * SDL_Init; queryMyDisplaySize() is the first SDL call in the process. */
+#ifdef _WIN32
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
     /* Temporarily init SDL just to get display bounds */
     if (SDL_Init(SDL_INIT_VIDEO) < 0)
         return;
     SDL_DisplayMode dm = {};
-    if (SDL_GetCurrentDisplayMode(0, &dm) == 0)
+    if (SDL_GetCurrentDisplayMode(0, &dm) != 0)
+        SDL_GetDesktopDisplayMode(0, &dm);   /* fallback */
+    if (dm.w > 0 && dm.h > 0)
     {
         MY_DISPLAY_WIDTH = dm.w;
         MY_DISPLAY_HEIGHT = dm.h;
@@ -619,7 +639,7 @@ static void ssdpAdvertisementThread()
  * ══════════════════════════════════════════════════════════════════════════ */
 static void gpuServiceThread()
 {
-    gpu_service_run();
+    gpu_service_run(mivara_service_should_stop);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -627,7 +647,7 @@ static void gpuServiceThread()
  * ══════════════════════════════════════════════════════════════════════════ */
 static void portServiceThread()
 {
-    ports_service_run();
+    ports_service_run(mivara_service_should_stop);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -639,7 +659,11 @@ static void gpuStatsWriterThread()
 
     while (g_running)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        /* Sleep in 1 s chunks so shutdown is not delayed by a full 10 s. */
+        for (int i = 0; i < 10 && g_running; ++i)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!g_running)
+            break;
 
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_print).count();
@@ -688,9 +712,6 @@ static bool handleClientConnection(plat_sock_t client)
     getpeername(client, (struct sockaddr *)&cli_addr, &addr_len);
     std::string client_ip = inet_ntoa(cli_addr.sin_addr);
 
-    /* Record client connection */
-    g_gpu_stats.recordClient(client_ip);
-
     /* ── Handshake v2 (proto.h) ──
      * The first u32 must be TVHS_MAGIC. Anything else is a legacy
      * (pre-v2) Mivara build: report it visibly and close – no silence. */
@@ -701,27 +722,54 @@ static bool handleClientConnection(plat_sock_t client)
     if (recv_all(client, &req.magic, 4) < 0)
     {
         std::cerr << "Handshake receive failed\n";
-        g_gpu_stats.recordClientDisconnect();
         return false;
     }
     if (ntohl(req.magic) != TVHS_MAGIC)
     {
         showLegacyPeerError();
-        g_gpu_stats.recordClientDisconnect();
         return false;
     }
     if (recv_all(client, ((char *)&req) + 4, sizeof(req) - 4) < 0)
     {
         std::cerr << "Handshake receive failed\n";
-        g_gpu_stats.recordClientDisconnect();
         return false;
     }
     hsReqFromWire(req);
 
+    /* Refresh the display mode for every connection: the receiver may have
+     * been hot-plugged or its desktop mode changed since the last session,
+     * and the sender now uses this value to size the virtual display. */
+    queryMyDisplaySize();
+
+    /* Display-size probe (see proto.h): width=height=0 means "tell me your
+     * current display size, do not start a session". Reply with the size and
+     * HS_ERR_DIMS, then close before SDL/window setup, so no window flashes.
+     * Old Mivara sent this shape too, so no protocol version bump is needed. */
+    if (req.version == TVHS_VERSION && req.width == 0 && req.height == 0)
+    {
+        HsResponseV2 probe = {};
+        probe.magic       = htonl(TVHS_MAGIC);
+        probe.version     = htonl(TVHS_VERSION);
+        probe.recv_width  = htonl((uint32_t)MY_DISPLAY_WIDTH);
+        probe.recv_height = htonl((uint32_t)MY_DISPLAY_HEIGHT);
+        probe.status      = htonl(HS_ERR_DIMS);
+        probe.codec       = htonl((uint32_t)CODEC_RAW);
+        if (send_all_p(client, &probe, sizeof(probe)) >= 0)
+            std::cout << "Display probe -> " << MY_DISPLAY_WIDTH << "x"
+                      << MY_DISPLAY_HEIGHT << "\n";
+        /* Not a session: no stats, no client history entry. */
+        return false;
+    }
+
+    /* Record the client only for real sessions (probes return above). */
+    g_gpu_stats.recordClient(client_ip);
+
     SCREEN_WIDTH = (int)req.width;
     SCREEN_HEIGHT = (int)req.height;
     TARGET_FPS = (int)req.fps;
-    DISPLAY_MODE = req.mode;
+    /* 拼接 is a separate KVM channel (port 8084, kvm.cpp) and never travels
+     * on 8081; anything but the documented extend value is a mirror session. */
+    DISPLAY_MODE = (req.mode == MODE_TRUE_EXTEND) ? MODE_TRUE_EXTEND : MODE_MIRROR;
 
     /* Validate dimensions / codec; coded streams need a working decoder
      * (reject, no silent downgrade – see plan §1). */
@@ -855,11 +903,10 @@ static bool handleClientConnection(plat_sock_t client)
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 
-    /* In extend mode: scale sender's stream to fill our display */
-    if (DISPLAY_MODE == MODE_TRUE_EXTEND)
-    {
-        SDL_RenderSetLogicalSize(ren, MY_DISPLAY_WIDTH, MY_DISPLAY_HEIGHT);
-    }
+    /* Note: no SDL_RenderSetLogicalSize(). The render loop below aspect-fits
+     * the texture into the real output rectangle, so a stream whose aspect
+     * ratio differs from this display gets black bars instead of being
+     * stretched. */
 
     /* Streaming texture. Raw/RLE = RGB24 at the sender's resolution.
      * Coded streams create whichever layout the decoder emits (I420/NV12/
@@ -1177,10 +1224,45 @@ static bool handleClientConnection(plat_sock_t client)
                               SCREEN_WIDTH * BYTES_PER_PIXEL);
         }
 
-        /* Render */
+        /* Render: preserve the stream's aspect ratio. A full-output blit
+         * stretches the picture whenever the sender's virtual-display mode
+         * and this panel differ (e.g. a 16:9 mode on a 16:10 laptop), which
+         * is exactly the reported "stretched extended screen". Fit the
+         * stream inside the output and centre it; the black clear supplies
+         * the bars. When the aspects match, this fills the screen as before.
+         * Use the stream's logical size (SCREEN_*) rather than the texture
+         * size so decoder row padding cannot skew the ratio. */
+        int out_w = 0, out_h = 0;
+        if (SDL_GetRendererOutputSize(ren, &out_w, &out_h) != 0 ||
+            out_w <= 0 || out_h <= 0)
+        {
+            out_w = MY_DISPLAY_WIDTH;
+            out_h = MY_DISPLAY_HEIGHT;
+        }
+        int src_w = SCREEN_WIDTH, src_h = SCREEN_HEIGHT;
+        if (src_w <= 0 || src_h <= 0) { src_w = tex_w; src_h = tex_h; }
+
+        SDL_Rect dst = { 0, 0, out_w, out_h };
+        if (src_w > 0 && src_h > 0)
+        {
+            double sc = std::min((double)out_w / (double)src_w,
+                                 (double)out_h / (double)src_h);
+            int dw = (int)((double)src_w * sc + 0.5);
+            int dh = (int)((double)src_h * sc + 0.5);
+            if (dw < 1) dw = 1;
+            if (dh < 1) dh = 1;
+            if (dw > out_w) dw = out_w;
+            if (dh > out_h) dh = out_h;
+            dst.x = (out_w - dw) / 2;
+            dst.y = (out_h - dh) / 2;
+            dst.w = dw;
+            dst.h = dh;
+        }
+
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
-        SDL_RenderCopy(ren, tex, nullptr, nullptr);
+        if (tex)
+            SDL_RenderCopy(ren, tex, nullptr, &dst);
 
         SDL_RenderPresent(ren);
         frames_rx++;
@@ -1262,9 +1344,10 @@ int main(int argc, char* argv[])
               << "  Stream TCP : " << TCP_STREAM_PORT << "\n"
               << "  Compute TCP: " << GPU_ACCEL_PORT << "\n"
               << "  Ports TCP  : " << PORTS_SERVICE_PORT << "\n"
+              << "  Stitch TCP : " << KVM_PORT << "\n"
               << "  SSDP UDP   : " << SSDP_ADDR << ":" << SSDP_PORT << "\n"
               << "  GPU Stats  : " << GPU_STATS_FILE << "\n"
-              << "  Modes      : extend | mirror\n"
+              << "  Modes      : extend | mirror | stitch (TCP " << KVM_PORT << ")\n"
               << "========================================\n";
 
     if (!initSockets())
@@ -1277,6 +1360,10 @@ int main(int argc, char* argv[])
     std::thread port_thread(portServiceThread);
     std::thread ssdp_thread(ssdpAdvertisementThread);
     std::thread stats_thread(gpuStatsWriterThread);
+    /* 拼接 (stitch) input channel. It is independent of the video listener:
+     * the receiver can be idle (no window) and still hand control to a peer.
+     * The thread polls g_running, so it joins on every shutdown path below. */
+    std::thread kvm_thread(kvmServiceRun, std::ref(g_running));
 
     /* TCP stream server */
     plat_sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -1288,6 +1375,7 @@ int main(int argc, char* argv[])
         gpu_thread.join();
         port_thread.join();
         stats_thread.join();
+        kvm_thread.join();
         cleanupSockets();
         return 1;
     }
@@ -1310,6 +1398,7 @@ int main(int argc, char* argv[])
         gpu_thread.join();
         port_thread.join();
         stats_thread.join();
+        kvm_thread.join();
         cleanupSockets();
         return 1;
     }
@@ -1348,6 +1437,7 @@ int main(int argc, char* argv[])
     gpu_thread.join();
     port_thread.join();
     stats_thread.join();
+    kvm_thread.join();
     cleanupSockets();
 
     // Final stats write

@@ -33,4 +33,15 @@ pnputil /scan-devices
 
 ### 分辨率说明
 
-虚拟显示器激活后由 sender 自动配置为 **1920x1080@60** 并置于现有桌面右侧。分辨率可在会话开始时选择（交互模式）或默认 1920x1080；如需修改默认值，编辑 vdd.cpp 中 `vddStartup()` 里的 `vddConfigure(dev, x, 0, w, h, 60)` 调用，或编辑驱动的 `vdd_settings.xml` 添加模式后重新编译。
+扩展模式会**先询问接收端当前的分辨率**（一次零窗口探测），再把虚拟显示器配置成相同尺寸，因此扩展屏可以 1:1 显示、不会因为两边比例不同而拉伸。虚拟显示器始终置于现有桌面右侧。
+
+驱动只在启动时读取一次 `vdd_settings.xml` 中的模式列表，列表里没有的尺寸无法应用。因此：
+
+- 列表里已有接收端尺寸时直接使用（内置 800x600、1366x768、1920x1080、2560x1440、3840x2160）。
+- 列表里没有时，sender 可以在**用户明确同意后**把该尺寸追加进 `vdd_settings.xml`（首次写入前备份为 `vdd_settings.xml.mivara.bak`，写入后回读校验），并重启一次虚拟显示设备让驱动重新加载。GUI 会在首次扩展连接时询问一次，选择保存在 `config.ini` 的 `vdd_mode_write`（`ask` / `always` / `never`）。若此时虚拟屏正被占用（例如上次异常退出遗留的会话），本次不会改动文件，新模式会在下一次会话开始时加载。
+- 如果既没有精确模式、也没有获得写入授权，sender 会选择驱动中**最接近的比例**，接收端再把画面按比例居中显示——多出来的部分是黑边，而不是拉伸。
+- 自动匹配会把虚拟显示器设成接收端的完整分辨率：接收端是 4K 时，采集、编码和带宽也会随之增加。若想省资源，可在 `config.ini` 用 `extend_res` 指定较小的尺寸，接收端会黑边居中，仍然不会拉伸。
+
+手动指定尺寸可用命令行 `--extend-res 2560x1600`，或在 `config.ini` 中设置 `extend_res=2560x1600`（默认 `auto`）。写入的模式会在扩展会话期间出现在发送端 Windows「设置 → 屏幕 → 显示器分辨率」列表中，可直接选择；之后每次扩展会话都仍然可用。
+
+> `vdd_settings.xml` 的路径优先取注册表 `HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver` 的 `SettingsPath` / `VDDPATH`，否则使用 `C:\Windows\System32\drivers\UMDF\vdd_settings.xml`。写入需要管理员权限（sender 自带 `requireAdministrator` 清单）。

@@ -19,6 +19,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 ## Highlights
 
 - **Extended desktop** — an extend session automatically enables a Windows virtual display that adds real desktop space; windows can be dragged onto it and the pointer crosses over. Every exit path detaches and disables the device, so nothing lingers in Settings > Display.
+- **Stitching (software KVM)** — two Windows PCs keep their own monitors and share one keyboard/mouse: choose which side of this PC the peer sits on (left / right / top / bottom) when starting, push the pointer out of that edge to take over the peer, and move back out of its facing edge (or press Ctrl+Alt+Shift+Q) to hand control back. The side can be switched mid-session and no picture is sent.
 - **Zero-config discovery** — SSDP finds receivers on the LAN and shows their hostnames; direct IP connection works when multicast is blocked by network policy.
 - **High quality, low latency** — H.264 / H.265 / AV1 with hardware encoding first (NVENC / QSV / AMF / VAAPI) and automatic software fallback; up to 120 FPS.
 - **Live reconfigure** — change codec, quality, bitrate, frame rate, scale or chroma mid-session; applied within seconds without dropping the stream.
@@ -32,7 +33,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 1. Download [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe) (or pick a version from [Releases](https://github.com/wzy-777/Mivara/releases)).
 2. Run the installer. It is not code-signed, so SmartScreen may prompt — see [below](#windows-smartscreen-notice).
-3. On the receiver, open Mivara and click "Receive"; on the sender click "Send", pick a device, then choose "Cast" or "Extend".
+3. On the receiver, open Mivara and click "Receive"; on the sender click "Send", pick a device, then choose "Cast", "Extend" or "Stitch" (stitch needs Windows on both ends — see the [User Guide](docs/en/usage.md#stitch-software-kvm)).
 
 > Extend mode requires the virtual display driver to be installed once — see [Virtual Display Driver](docs/en/virtual-display.md).
 

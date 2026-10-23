@@ -19,6 +19,7 @@
 ## 核心特性
 
 - **扩展桌面** —— 会话开始自动启用 Windows 虚拟显示器，创建真实桌面空间；窗口可拖入、鼠标可穿越，任何退出路径都会分离并禁用设备，不会残留在「设置 → 屏幕」。
+- **拼接（软件 KVM）** —— 两台 Windows 电脑各用各的显示器，只共享一套键鼠：启动时选择对方在本机的哪一侧（左/右/上/下），从该侧移出光标接管对方，移出对方屏幕的对应边缘或按 Ctrl+Alt+Shift+Q 交还；会话中可随时切换方向，不传画面。
 - **零配置发现** —— SSDP 自动找到局域网内的接收端并显示主机名；多播被网络策略拦截时可直连 IP。
 - **高画质低延迟** —— H.264 / H.265 / AV1，硬件编码优先（NVENC / QSV / AMF / VAAPI），自动回退软件编码；最高 120 FPS。
 - **运行时调参** —— 传输中修改编码、画质、码率、帧率、缩放、色度，秒级生效不断流。
@@ -32,7 +33,7 @@
 
 1. 下载 [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)（也可以到 [Releases](https://github.com/wzy-777/Mivara/releases) 选择版本）。
 2. 双击安装。安装包未做代码签名，可能出现 SmartScreen 提示，见[下文](#windows-smartscreen-提示说明)。
-3. 接收端打开 Mivara 点「接收」；发送端点「发送」，选择设备后点「投屏」或「扩展」。
+3. 接收端打开 Mivara 点「接收」；发送端点「发送」，选择设备后点「投屏」「扩展」或「拼接」（拼接需要两端都是 Windows，详见[使用指南](docs/zh/usage.md#拼接软件-kvm)）。
 
 > 扩展模式需要安装一次虚拟显示器驱动，详见[虚拟显示器驱动](docs/zh/virtual-display.md)。
 
