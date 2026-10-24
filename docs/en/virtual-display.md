@@ -14,20 +14,24 @@ The driver **only needs to be installed once**. Afterwards no manual steps are n
 
 ### Installation (Administrator PowerShell)
 
+The driver is bundled with the installer under `vdd\` (`C:\Program Files\Mivara\vdd` by default); a source checkout has the same layout. Run the bundled script from an elevated PowerShell — it stages the driver, creates the `Root\MttVDD` device, copies `vdd_settings.xml` and picks the x86/AMD64 or ARM64 package for the current machine:
+
 ```powershell
-# 1. Download from GitHub Releases (e.g. VDD.Control.25.7.23.zip) and extract
+cd "C:\Program Files\Mivara\vdd"   # adjust if installed elsewhere
+powershell -ExecutionPolicy Bypass -File .\install_vdd.ps1
 
-# 2. Stage the driver
-pnputil /add-driver MttVDD.inf /install
-# (note: the driver in the x86 directory actually targets NTamd64)
+# "Generic Monitor (VDD by MTT)" appearing in Settings > Display means success
+```
 
-# 3. Create the Root\MttVDD device
-devcon.exe install MttVDD.inf "Root\MttVDD"
+Manual equivalent, if you prefer to run the steps yourself:
 
-# 4. Copy the settings file (resolution/refresh-rate list lives there)
-Copy-Item vdd_settings.xml C:\Windows\System32\drivers\UMDF\vdd_settings.xml
+```powershell
+$drv = 'SignedDrivers\x86\VDD'   # ARM64 Windows: SignedDrivers\ARM64\VDD
+# (note: the x86 directory's INF actually targets NTamd64)
 
-# 5. Rescan; "Generic Monitor (VDD by MTT)" appearing means success
+pnputil /add-driver "$drv\MttVDD.inf" /install
+.\Dependencies\devcon.exe create "@Root\MttVDD"
+Copy-Item "$drv\vdd_settings.xml" C:\Windows\System32\drivers\UMDF\vdd_settings.xml
 pnputil /scan-devices
 ```
 

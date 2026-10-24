@@ -14,20 +14,24 @@
 
 ### 安装步骤（管理员 PowerShell）
 
+驱动已随安装包放在 `vdd\` 目录下（默认 `C:\Program Files\Mivara\vdd`），源码 checkout 的目录结构相同。请在管理员 PowerShell 中运行随附脚本——它会完成驱动入库、创建 `Root\MttVDD` 设备、拷贝 `vdd_settings.xml`，并按当前机器选择 x86/AMD64 或 ARM64 驱动包：
+
 ```powershell
-# 1. 从 GitHub Releases 下载（如 VDD.Control.25.7.23.zip）并解压
+cd "C:\Program Files\Mivara\vdd"   # 安装到其他位置时自行调整
+powershell -ExecutionPolicy Bypass -File .\install_vdd.ps1
 
-# 2. 驱动入库
-pnputil /add-driver MttVDD.inf /install
-# （注意：x86 目录内的驱动实际面向 NTamd64）
+# 「设置 → 屏幕」中出现 "Generic Monitor (VDD by MTT)" 即成功
+```
 
-# 3. 创建 Root\MttVDD 设备
-devcon.exe install MttVDD.inf "Root\MttVDD"
+若希望手动执行，等价步骤如下：
 
-# 4. 拷贝设置文件（分辨率/刷新率列表在此配置）
-Copy-Item vdd_settings.xml C:\Windows\System32\drivers\UMDF\vdd_settings.xml
+```powershell
+$drv = 'SignedDrivers\x86\VDD'   # ARM64 Windows 改为 SignedDrivers\ARM64\VDD
+# （注意：x86 目录内的 INF 实际面向 NTamd64）
 
-# 5. 扫描设备，出现 "Generic Monitor (VDD by MTT)" 即成功
+pnputil /add-driver "$drv\MttVDD.inf" /install
+.\Dependencies\devcon.exe create "@Root\MttVDD"
+Copy-Item "$drv\vdd_settings.xml" C:\Windows\System32\drivers\UMDF\vdd_settings.xml
 pnputil /scan-devices
 ```
 

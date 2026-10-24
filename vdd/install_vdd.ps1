@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Continue'
 $root = $PSScriptRoot
 Start-Transcript -Path (Join-Path $root 'install_log.txt') -Force
-$drv = Join-Path $root 'SignedDrivers\x86\VDD'
+$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { 'ARM64' } else { 'x86' }
+$drv = Join-Path $root "SignedDrivers\$arch\VDD"
 Set-Location $drv
 Write-Output "=== 1. Add driver to driver store ==="
 pnputil /add-driver MttVDD.inf /install

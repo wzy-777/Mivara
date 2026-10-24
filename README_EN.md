@@ -85,15 +85,21 @@ Get-FileHash "$HOME\Downloads\Mivara-Setup.exe" -Algorithm SHA256
 
 If it matches: browser download bar → "…" → "Keep"; then double-click the installer → "More info" → "Run anyway". Full details: [Troubleshooting · SmartScreen](docs/en/troubleshooting.md#windows-smartscreen-notice).
 
+## Security
+
+Mivara is designed for **trusted LANs**: ports 8081–8084 are unencrypted, and 8083 (port inspector) and 8084 (stitch keyboard/mouse) have no authentication. Never port-forward them to the public internet. See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerability.
+
 ## Acknowledgements
 
 The virtual display driver comes from **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**.
+
+Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 Windows installer code signing (application in progress): provided free of charge by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org) — see the [Code signing policy](CODE_SIGNING_POLICY.md).
 
 ## License
 
-[MIT](LICENSE) © 2026 wzy-777
+The **source code** is released under the [MIT License](LICENSE) © 2026 wzy-777. The released `sender` / `receiver` binaries link FFmpeg under GPL-3.0-or-later, so **those two binaries are distributed under GPL-3.0-or-later** (full text: [LICENSES/GPL-3.0-or-later](LICENSES/GPL-3.0-or-later)); `app` does not link FFmpeg. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the component list and how to obtain FFmpeg's corresponding source.
 
 ---
 

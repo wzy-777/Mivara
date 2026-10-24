@@ -85,15 +85,21 @@ Get-FileHash "$HOME\Downloads\Mivara-Setup.exe" -Algorithm SHA256
 
 校验一致后：浏览器下载栏「…」→「保留」；双击安装包 →「更多信息」→「仍要运行」。完整说明见[故障排除 · SmartScreen](docs/zh/troubleshooting.md#windows-smartscreen-提示说明)。
 
+## 安全
+
+Mivara 面向**可信局域网**设计：8081–8084 端口没有加密，8083（端口检查）与 8084（拼接键鼠）没有身份认证。请勿把端口映射到公网。漏洞报告方式与完整威胁模型见 [SECURITY.md](SECURITY.md)。
+
 ## 致谢
 
 虚拟显示器驱动来自 **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**。
+
+第三方组件及其许可证见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 Windows 安装包代码签名（申请中）：由 [SignPath.io](https://signpath.io) 免费提供、证书由 [SignPath Foundation](https://signpath.org) 持有——详见 [Code signing policy](CODE_SIGNING_POLICY.md)。
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 wzy-777
+**源码**以 [MIT](LICENSE) 发布 © 2026 wzy-777。发布版的 `sender` / `receiver` 链接了 GPL-3.0-or-later 的 FFmpeg，因此这两个二进制按 **GPL-3.0-or-later** 分发（全文见 [LICENSES/GPL-3.0-or-later](LICENSES/GPL-3.0-or-later)）；`app` 不链接 FFmpeg。第三方组件清单与 FFmpeg 对应源码的获取方式见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ---
 

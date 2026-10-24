@@ -350,7 +350,7 @@ if [ "${#PUBLISHED[@]}" -eq 0 ]; then
 else
   TITLE="Update: $PACKAGE_ID version $VER"
 fi
-BODY="Mivara (幻屏) is an MIT-licensed open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (\`/VERYSILENT\`) is supported. Installer SHA-256 matches the GitHub release asset digest."
+BODY="Mivara (幻屏) is an open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The source is MIT-licensed; the released sender/receiver binaries link GPL-3.0-or-later FFmpeg and are distributed under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (\`/VERYSILENT\`) is supported. Installer SHA-256 matches the GitHub release asset digest."
 
 if [ -z "$OPEN_PR" ]; then
   step "创建 PR"

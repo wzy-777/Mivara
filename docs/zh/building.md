@@ -86,10 +86,11 @@ make run          # 构建并启动图形启动器（另有 run-sender / run-rec
 用 Inno Setup 编译安装包：
 
 ```powershell
-& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss
+& ISCC.exe installer\Mivara.iss
+# 若 ISCC 不在 PATH，请使用完整路径或先把它加入 PATH
 # 产物：dist\Mivara-Setup-<版本>.exe
 ```
 
 发布时需**同时**上传固定名副本 `dist\Mivara-Setup.exe`（应用内「下载更新」与 README 的下载徽章都用这个固定名地址），以及 `SHA256SUMS.txt`（应用内安装的校验依据，缺失时只提供浏览器下载）。CI 打包会自动生成这三个文件；本地打包可手动复制：`copy dist\Mivara-Setup-<版本>.exe dist\Mivara-Setup.exe`。
 
-安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（不含体积超限的厂商 GUI），以及离线文档（`README.md`、`README_EN.md`、`LICENSE`、`CODE_SIGNING_POLICY.md`、`docs/`），安装后 README 里的相对链接仍可打开；安装后在开始菜单/桌面创建快捷方式。完成页的「启动 Mivara」勾选项直接拉起管理员权限的 GUI（安装器以提权令牌启动，无二次 UAC 弹窗）。
+安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（x86/AMD64 与 ARM64；不含体积超限的厂商 GUI），以及离线文档（`README.md`、`README_EN.md`、`LICENSE`、`CODE_SIGNING_POLICY.md`、`SECURITY.md`、`THIRD-PARTY-NOTICES.md`、`LICENSES/GPL-3.0-or-later`、`vdd/LICENSE`、`docs/`），安装后 README 里的相对链接仍可打开；安装后在开始菜单/桌面创建快捷方式。完成页的「启动 Mivara」勾选项直接拉起管理员权限的 GUI（安装器以提权令牌启动，无二次 UAC 弹窗）。

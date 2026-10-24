@@ -279,7 +279,7 @@ void cleanupSockets()
 
 /**
  * Get the local IP address of this machine.
- * Prefers real LAN addresses over tunnel/VPN ranges (Clash TUN uses 198.18.x).
+ * Prefers real LAN addresses over tunnel/VPN adapter ranges (some TUN adapters use 198.18.x).
  */
 std::string getLocalIPAddress()
 {
@@ -511,8 +511,8 @@ std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
     int sock_buf_size = SOCKET_BUFFER_SIZE;
 
     /* One socket per local NIC: binding to INADDR_ANY lets a VPN/TUN
-       (e.g. Clash) steal the source address, and the receiver's reply
-       then never comes back. */
+       adapter (e.g. a proxy client) steal the source address, and the
+       receiver's reply then never comes back. */
     std::vector<std::string> local_ips = listLocalIPv4();
     if (local_ips.empty())
         local_ips.push_back(""); /* fall back to INADDR_ANY */

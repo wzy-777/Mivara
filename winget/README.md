@@ -29,7 +29,7 @@
 
 建议 PR 描述（英文参考，脚本用的就是这段）：
 
-> Mivara (幻屏) is an MIT-licensed open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (`/VERYSILENT`) is supported. Installer SHA-256 matches the GitHub release asset digest.
+> Mivara (幻屏) is an open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The source is MIT-licensed; the released sender/receiver binaries link GPL-3.0-or-later FFmpeg and are distributed under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (`/VERYSILENT`) is supported. Installer SHA-256 matches the GitHub release asset digest.
 
 版本目录由 release.sh 生成，其中 `InstallerUrl` **用带版本号的资产名**（不要用固定名 `Mivara-Setup.exe`），`InstallerSha256` 与 GitHub 上传后的 asset digest 一致。
 

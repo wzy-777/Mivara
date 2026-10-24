@@ -94,8 +94,8 @@ jobs:
           # in-app unless SHA256SUMS.txt in the same release carries a matching
           # sha256sum-style line for that file name. ATTACH THIS FILE TO EVERY
           # RELEASE (see the release checklist in AGENTS.md).
-          # If SignPath signing goes live the bytes change: regenerate this
-          # file from the SIGNED installer before publishing.
+          # If SignPath signing goes live the bytes change: the signed path
+          # below regenerates this file from the SIGNED installer.
           $setup = Get-ChildItem dist -Filter "Mivara-Setup-*.exe" | Select-Object -First 1
           if (-not $setup) { throw "no installer found in dist/" }
           $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
@@ -128,9 +128,28 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: signed
 
+      - name: Regenerate SHA256SUMS for the signed installer
+        if: vars.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          # Signing changes the bytes, so the unsigned hashes would make the
+          # in-app updater refuse the download (it is fail-closed on a mismatch).
+          $setup = Get-ChildItem signed -Filter "Mivara-Setup-*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "no signed installer found in signed/" }
+          # Fail closed: never upload an "unsigned" artifact from the signed path.
+          $sig = Get-AuthenticodeSignature $setup.FullName
+          if ($sig.Status -ne 'Valid') { throw "installer signature is $($sig.Status), expected Valid" }
+          Copy-Item $setup.FullName "signed/Mivara-Setup.exe" -Force
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          $lines = @("$hash  $($setup.Name)", "$hash  Mivara-Setup.exe")
+          [IO.File]::WriteAllText("$PWD/signed/SHA256SUMS.txt", ($lines -join "`n") + "`n")
+          Get-Content signed/SHA256SUMS.txt
+
       - name: Upload signed installer
         if: vars.SIGNPATH_ENABLED == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: installer-signed
-          path: signed/*.exe
+          path: |
+            signed/*.exe
+            signed/SHA256SUMS.txt

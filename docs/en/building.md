@@ -87,10 +87,11 @@ Builds use `-O3 -march=native -flto`; output goes to `bin/`.
 Build the installer with Inno Setup:
 
 ```powershell
-& "D:\Program Files\Inno Setup 6\ISCC.exe" installer\Mivara.iss
+& ISCC.exe installer\Mivara.iss
+# If ISCC is not on PATH, use its full path or add it to PATH first
 # Output: dist\Mivara-Setup-<version>.exe
 ```
 
 A release must also carry the fixed-name copy `dist/Mivara-Setup.exe` (the in-app "Download update" and the README download badge both use that fixed URL) **and** `SHA256SUMS.txt` (the checksum anchor the in-app install verifies; without it only the browser download is offered). CI produces all three; for a local build copy it by hand: `copy dist\Mivara-Setup-<version>.exe dist\Mivara-Setup.exe`.
 
-The installer bundles `bin/` (exes + DLLs), `scripts/`, the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and the documentation (`README.md`, `README_EN.md`, `LICENSE`, `CODE_SIGNING_POLICY.md`, `docs/`) so the relative links inside the installed READMEs resolve offline; it also creates Start-menu/desktop shortcuts. The "Launch Mivara" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).
+The installer bundles `bin/` (exes + DLLs), `scripts/`, the `vdd/` virtual display driver (x86/AMD64 and ARM64; the oversized vendor GUI is excluded), and the documentation (`README.md`, `README_EN.md`, `LICENSE`, `CODE_SIGNING_POLICY.md`, `SECURITY.md`, `THIRD-PARTY-NOTICES.md`, `LICENSES/GPL-3.0-or-later`, `vdd/LICENSE`, `docs/`) so the relative links inside the installed READMEs resolve offline; it also creates Start-menu/desktop shortcuts. The "Launch Mivara" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).

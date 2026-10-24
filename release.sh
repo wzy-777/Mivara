@@ -38,7 +38,7 @@ REPO_SLUG="${REPO_SLUG:-wzy-777/Mivara}"
 REPO_URL="https://github.com/${REPO_SLUG}"
 REMOTE="${REMOTE:-origin}"
 BRANCH="${BRANCH:-main}"
-PROXY="${PROXY:-http://127.0.0.1:7890}"   # FlClash; only used when a direct attempt fails
+PROXY="${PROXY:-}"   # optional; only tried after a direct attempt fails
 PORTABLE_FLAGS="-O3 -march=x86-64 -flto" # repository MUST be archived with this
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,16 @@ ROOT="$(pwd -P)"
 [ -f makefile ] && [ -d src ] || die "看起来不是 Mivara 仓库根目录: $ROOT"
 
 MSYS_BASH="${MSYS_BASH:-C:/msys64/usr/bin/bash.exe}"
-ISCC_BIN="${ISCC:-/d/Program Files/Inno Setup 6/ISCC.exe}"
+
+detect_iscc() {
+  if [ -n "${ISCC:-}" ]; then printf '%s' "$ISCC"; return; fi
+  if command -v iscc >/dev/null 2>&1; then command -v iscc; return; fi
+  for p in "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/c/Program Files/Inno Setup 6/ISCC.exe"; do
+    if [ -x "$p" ]; then printf '%s' "$p"; return; fi
+  done
+  printf ''
+}
+ISCC_BIN="$(detect_iscc)"
 
 detect_gh() {
   if [ -n "${GH:-}" ] && [ -x "${GH}" ]; then printf '%s' "$GH"; return; fi
@@ -105,20 +114,23 @@ gh() { "$GH_BIN" "$@"; }
 
 git_net() {
   if git "$@"; then return 0; fi
+  [ -n "$PROXY" ] || return 1
   warn "直接连接失败，改用代理 $PROXY 重试"
   git -c "http.proxy=$PROXY" "$@"
 }
 
 gh_net() {
   if gh "$@"; then return 0; fi
+  [ -n "$PROXY" ] || return 1
   warn "直接连接失败，改用代理 $PROXY 重试"
   HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" gh "$@"
 }
 
-# github.com is often unreachable directly on this network while the proxy works;
-# a verification step must not report a false failure after a good release.
+# Optional proxy fallback: only used when the direct attempt fails.
+# A verification step must not report a false failure after a good release.
 curl_net() {
-  curl "$@" && return 0
+  if curl "$@"; then return 0; fi
+  [ -n "$PROXY" ] || return 1
   warn "curl 直连失败，改用代理 $PROXY 重试"
   curl -x "$PROXY" "$@"
 }
