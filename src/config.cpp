@@ -154,8 +154,12 @@ void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
         if (validExtendRes(val))
             cfg.extend_res = val;
     } else if (key == "vdd_mode_write") {
-        if (val == "ask" || val == "always" || val == "never")
-            cfg.vdd_mode_write = val;
+        /* "ask" was the old default and prompted on the first extend
+         * session; the prompt is gone, so an old config upgrades to always. */
+        if (val == "always" || val == "ask")
+            cfg.vdd_mode_write = "always";
+        else if (val == "never")
+            cfg.vdd_mode_write = "never";
     } else if (key == "stitch_side") {
         /* unknown value → keep the default (right) rather than a broken edge */
         if (val == "left" || val == "right" || val == "top" || val == "bottom")

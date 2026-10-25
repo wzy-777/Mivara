@@ -1009,15 +1009,12 @@ static bool handleClientConnection(plat_sock_t client)
         if (!streaming)
             break;
 
-        /* 4-byte size header */
+        /* TCP may return a partial header; never parse uninitialised bytes. */
         uint32_t net_sz = 0;
-        int n = (int)recv(client, (char *)&net_sz, 4, 0);
-        if (n <= 0)
+        int n = 0;
+        if (recv_all(client, &net_sz, sizeof(net_sz)) < 0)
         {
-            if (n == 0)
-                std::cout << "Sender disconnected\n";
-            else
-                std::cerr << "Recv error (size)\n";
+            std::cout << "Sender disconnected or sent an incomplete frame header\n";
             break;
         }
         uint32_t frame_sz = ntohl(net_sz);
@@ -1190,31 +1187,42 @@ static bool handleClientConnection(plat_sock_t client)
              * payload is the raw fallback (GPU service unavailable).
              * Decompress: stream of [run r g b] tuples.
              */
-            bool was_compressed = (sess_codec == CODEC_RLE) &&
-                                  (frame_sz < (uint32_t)full_frame);
-
+            const bool was_compressed = sess_codec == CODEC_RLE && frame_sz < full_frame;
+            if ((sess_codec == CODEC_RAW && frame_sz != full_frame) ||
+                (sess_codec == CODEC_RLE && frame_sz > full_frame))
+            {
+                std::cerr << "Raw frame length does not match the negotiated dimensions\n";
+                emitRxStat("error", "msg=bad_raw_frame");
+                break;
+            }
             if (was_compressed)
             {
                 std::vector<uint8_t> decbuf;
                 decbuf.reserve(full_frame);
-                const uint8_t *src = frame.data();
-                const uint8_t *end = src + frame_sz;
-                while (src + 3 < end && decbuf.size() < full_frame)
+                bool valid = frame_sz % 4 == 0;
+                size_t off = 0;
+                while (valid && off < frame.size())
                 {
-                    uint8_t run = *src++;
-                    uint8_t r = *src++;
-                    uint8_t g = *src++;
-                    uint8_t b = *src++;
-                    for (uint8_t j = 0;
-                         j < run && decbuf.size() + 3 <= full_frame; j++)
+                    const uint8_t run = frame[off];
+                    if (run == 0 || decbuf.size() + (size_t)run * 3 > full_frame)
                     {
-                        decbuf.push_back(r);
-                        decbuf.push_back(g);
-                        decbuf.push_back(b);
+                        valid = false;
+                        break;
                     }
+                    for (uint8_t j = 0; j < run; j++)
+                    {
+                        decbuf.push_back(frame[off + 1]);
+                        decbuf.push_back(frame[off + 2]);
+                        decbuf.push_back(frame[off + 3]);
+                    }
+                    off += 4;
                 }
-                while (decbuf.size() < full_frame)
-                    decbuf.push_back(0);
+                if (!valid || decbuf.size() != full_frame)
+                {
+                    std::cerr << "Invalid or incomplete RLE frame\n";
+                    emitRxStat("error", "msg=bad_rle_frame");
+                    break;
+                }
                 frame = std::move(decbuf);
             }
 

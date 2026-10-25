@@ -14,6 +14,9 @@
  *                         virtual-desktop metrics and the consent verdict)
  *   controller → target : KvmEvent  (16 bytes, repeated)
  *
+ * After a KVM_FEATURE_HEARTBEAT negotiation, PING/PONG events travel in both
+ * directions (3 s interval, 9 s receive deadline). Older peers get no PING.
+ *
  * Which edge hands control over is a per-session choice: the peer can sit to
  * the left, right, above or below this machine. The side is decided by the
  * controller (the GUI asks before connecting) and is carried in the hello's
@@ -45,6 +48,7 @@
 #define KVM_PORT    8084
 #define KVM_MAGIC   0x4D564B31u   /* 'MVK1' on the wire */
 #define KVM_VERSION 1u
+#define KVM_FEATURE_HEARTBEAT 1u  /* KvmHello.reserved[1] / KvmReply.reserved */
 
 /* KvmReply.status */
 enum KvmStatus : uint32_t {
@@ -60,7 +64,9 @@ enum KvmEventType : uint32_t {
     KVM_EV_BUTTON      = 2,   /* a = 1 left 2 right 3 middle 4/5 X, b = down */
     KVM_EV_WHEEL       = 3,   /* a = signed delta, b = 1 horizontal        */
     KVM_EV_KEY         = 4,   /* a = down, b = vk, c = scan | ext << 16    */
-    KVM_EV_RELEASE_ALL = 5    /* release every key/button held on the target */
+    KVM_EV_RELEASE_ALL = 5,   /* release every key/button held on the target */
+    KVM_EV_PING        = 6,   /* negotiated heartbeat; empty payload         */
+    KVM_EV_PONG        = 7    /* reply to PING; never sent to older peers    */
 };
 
 /* Where the peer sits relative to the controller. KVM_SIDE_RIGHT is the
@@ -78,8 +84,8 @@ enum KvmSide : uint32_t {
 struct KvmHello {
     uint32_t magic;           /* KVM_MAGIC                                  */
     uint32_t version;         /* KVM_VERSION                                */
-    uint32_t reserved[2];     /* [0] = peer side + 1 (0 = unspecified), see
-                               * the file comment; [1] unused               */
+    uint32_t reserved[2];     /* [0] = peer side + 1 (0 = unspecified);
+                               * [1] = KVM_FEATURE_* capability bits         */
 };
 
 struct KvmReply {

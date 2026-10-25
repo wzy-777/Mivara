@@ -106,6 +106,22 @@ static bool vddEnableDevice(bool enable)
     return ok;
 }
 
+static bool vddDevicePresent()
+{
+    HDEVINFO hs = SetupDiGetClassDevsA(nullptr, nullptr, nullptr,
+                                       DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (hs == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    for (DWORD i = 0; ; i++) {
+        SP_DEVINFO_DATA dd = {};
+        dd.cbSize = sizeof(dd);
+        if (!SetupDiEnumDeviceInfo(hs, i, &dd)) break;
+        if (vddHwIdMatch(hs, dd)) { found = true; break; }
+    }
+    SetupDiDestroyDeviceInfoList(hs);
+    return found;
+}
+
 /* Poll pred() every 200 ms up to ms. Used to wait for the UMDF driver to
  * come up after enable and for the monitor to appear after CCD attach. */
 static bool vddWaitFor(const std::function<bool()> &pred, int ms)
@@ -679,12 +695,20 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
     /* Re-enable the Root\MttVDD device first: a disabled device exposes no
      * CCD path, so vddInstalled() would wrongly report "not installed".
      * No-op when the device is already enabled (leftover / first run). */
-    if (!vddEnableDevice(true))
-        std::cerr << "Warning: could not enable MttVDD device (not elevated?)\n";
+    const bool enabled = vddEnableDevice(true);
+    if (!enabled && !vddDevicePresent()) {
+        std::cerr << "Virtual display driver is not installed on the sender.\n"
+                     "  Reinstall Mivara with the virtual display driver task enabled,\n"
+                     "  or run vdd\\install_vdd.ps1 from an administrator PowerShell.\n";
+        return false;
+    }
+    if (!enabled)
+        std::cerr << "MttVDD is installed, but Windows could not enable it.\n"
+                     "  Check the Root\\MttVDD device status in Device Manager.\n";
     if (!vddWaitFor(vddInstalled, 8000)) {
-        std::cerr << "Virtual display driver not found.\n"
-                     "  Install VirtualDrivers/Virtual-Display-Driver (MttVDD)\n"
-                     "  first – see README.md.\n";
+        std::cerr << "MttVDD is installed, but no virtual monitor was exposed.\n"
+                     "  Check the device for a driver error, review vdd\\install_log.txt,\n"
+                     "  or reinstall the virtual display driver.\n";
         return false;
     }
 

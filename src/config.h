@@ -26,7 +26,7 @@ struct AppConfig
     std::string theme = "system";    /* light|dark|system (GUI appearance) */
     std::string extend_res = "auto"; /* extend mode VDD size: auto|WxH
                                         (auto = the receiver's resolution) */
-    std::string vdd_mode_write = "ask"; /* extend mode: ask|always|never –
+    std::string vdd_mode_write = "always"; /* extend mode: always|never (legacy ask→always) –
                                            may Mivara add the receiver's
                                            resolution to vdd_settings.xml? */
     std::string stitch_side = "right";  /* 拼接: left|right|top|bottom –

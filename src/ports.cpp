@@ -89,10 +89,10 @@ static int send_all(int sock, const void *buf, size_t size)
             if (n < 0)
             {
 #ifdef _WIN32
-                if (WSAGetLastError() == WSAEINTR || WSAGetLastError() == WSAEWOULDBLOCK)
+                if (WSAGetLastError() == WSAEINTR)
                     continue;
 #else
-                if (errno == EINTR || errno == EAGAIN)
+                if (errno == EINTR)
                     continue;
 #endif
             }
@@ -120,10 +120,10 @@ static int recv_all(int sock, void *buf, size_t size)
             if (n < 0)
             {
 #ifdef _WIN32
-                if (WSAGetLastError() == WSAEINTR || WSAGetLastError() == WSAEWOULDBLOCK)
+                if (WSAGetLastError() == WSAEINTR)
                     continue;
 #else
-                if (errno == EINTR || errno == EAGAIN)
+                if (errno == EINTR)
                     continue;
 #endif
             }
@@ -134,12 +134,8 @@ static int recv_all(int sock, void *buf, size_t size)
     return 0;
 }
 
-/* ─── Stop-aware I/O (receiver-side service only) ───────────────
- *
- * Same shape as the helpers above, but every blocking call is gated by
- * a 1 s select() that re-checks the stop callback on timeout, so an
- * idle persistent client cannot pin the service thread at shutdown.
- * The client-side helpers stay unchanged.                          */
+/* Receiver-side service I/O: non-blocking sockets, stop polling and an
+ * absolute 30 s deadline for each complete read/write operation. */
 
 #ifdef _WIN32
 #define PORTS_FD_SET(s, set) FD_SET((SOCKET)(s), (set))
@@ -147,26 +143,27 @@ static int recv_all(int sock, void *buf, size_t size)
 #define PORTS_FD_SET(s, set) FD_SET((s), (set))
 #endif
 
-static int ports_wait(int sock, int for_write, ports_stop_fn stop)
+static int ports_wait(int sock, int for_write, ports_stop_fn stop,
+                      std::chrono::steady_clock::time_point deadline)
 {
     for (;;)
     {
         fd_set fds;
         struct timeval tv;
         int r;
-
-        if (stop && stop())
+        const auto now = std::chrono::steady_clock::now();
+        if ((stop && stop()) || now >= deadline)
             return -1;
-
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count();
         FD_ZERO(&fds);
 #ifndef _WIN32
         if (sock >= FD_SETSIZE)
             return -1;
 #endif
         PORTS_FD_SET(sock, &fds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
+        tv.tv_sec = remaining >= 1000 ? 1 : 0;
+        tv.tv_usec = remaining >= 1000 ? 0 : (remaining % 1000) * 1000;
 #ifdef _WIN32
         r = select(0, for_write ? nullptr : &fds,
                    for_write ? &fds : nullptr, nullptr, &tv);
@@ -187,7 +184,6 @@ static int ports_wait(int sock, int for_write, ports_stop_fn stop)
 #endif
             return -1;
         }
-        /* timeout: loop and re-check the stop flag */
     }
 }
 
@@ -209,10 +205,12 @@ static int recv_all_stop(int sock, void *buf, size_t size, ports_stop_fn stop)
 {
     char *p = (char *)buf;
     size_t got = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (got < size)
     {
         int n;
-        if (ports_wait(sock, 0, stop) < 0)
+        if (std::chrono::steady_clock::now() >= deadline ||
+            ports_wait(sock, 0, stop, deadline) < 0)
             return -1;
 #ifdef _WIN32
         n = recv(sock, p + got, (int)(size - got), 0);
@@ -241,10 +239,12 @@ static int send_all_stop(int sock, const void *buf, size_t size, ports_stop_fn s
 {
     const char *p = (const char *)buf;
     size_t sent = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (sent < size)
     {
         int n;
-        if (ports_wait(sock, 1, stop) < 0)
+        if (std::chrono::steady_clock::now() >= deadline ||
+            ports_wait(sock, 1, stop, deadline) < 0)
             return -1;
 #ifdef _WIN32
         n = send(sock, p + sent, (int)(size - sent), 0);
@@ -305,9 +305,18 @@ static std::string win_process_name(DWORD pid)
         {
             if (pe.th32ProcessID == pid)
             {
-                char buffer[256];
-                wcstombs(buffer, pe.szExeFile, sizeof(buffer));
-                name = buffer;
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1,
+                                                       nullptr, 0, nullptr, nullptr);
+                if (bytes > 1) {
+                    std::string utf8((size_t)bytes, '\0');
+                    const int written = WideCharToMultiByte(
+                        CP_UTF8, 0, pe.szExeFile, -1, utf8.data(), bytes,
+                        nullptr, nullptr);
+                    if (written == bytes) {
+                        utf8.resize((size_t)bytes - 1);
+                        name = utf8;
+                    }
+                }
                 break;
             }
         } while (Process32NextW(snap, &pe));
@@ -1288,6 +1297,10 @@ void ports_service_run(ports_stop_fn should_stop)
         // On Unix, one worker thread per client
         {
             std::lock_guard<std::mutex> lk(tracker->mtx);
+            if (tracker->active >= 4) {
+                close(client);
+                continue;
+            }
             tracker->active++;
         }
         try
@@ -1415,6 +1428,65 @@ static int do_request(ports_sock_t sock,
     return (int)count;
 }
 
+static bool ports_connect_bounded(ports_sock_t sock, const sockaddr_in &addr)
+{
+#ifdef _WIN32
+    u_long one = 1;
+    if (ioctlsocket(sock, FIONBIO, &one) != 0) return false;
+#else
+    if (sock >= FD_SETSIZE) return false;
+    const int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) return false;
+#endif
+    const int rc = connect(sock, (const sockaddr *)&addr, sizeof(addr));
+    bool connected = rc == 0;
+    bool pending = false;
+    if (rc != 0) {
+#ifdef _WIN32
+        const int err = WSAGetLastError();
+        pending = err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
+#else
+        pending = errno == EINPROGRESS;
+#endif
+    }
+    if (pending) {
+        fd_set wr, ex;
+        FD_ZERO(&wr);
+        FD_ZERO(&ex);
+        FD_SET(sock, &wr);
+        FD_SET(sock, &ex);
+        timeval tv = {5, 0};
+        if (select((int)sock + 1, nullptr, &wr, &ex, &tv) > 0 &&
+            FD_ISSET(sock, &wr)) {
+            int so_error = 0;
+#ifdef _WIN32
+            int len = sizeof(so_error);
+#else
+            socklen_t len = sizeof(so_error);
+#endif
+            connected = getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                                   (char *)&so_error, &len) == 0 && so_error == 0;
+        }
+    }
+#ifdef _WIN32
+    u_long zero = 0;
+    ioctlsocket(sock, FIONBIO, &zero);
+#else
+    fcntl(sock, F_SETFL, flags);
+#endif
+    if (!connected) return false;
+#ifdef _WIN32
+    const DWORD timeout = 5000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+#else
+    const timeval timeout = {5, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+    return true;
+}
+
 ports_sock_t ports_remote_connect(const char *receiver_ip)
 {
 #ifdef _WIN32
@@ -1451,16 +1523,10 @@ ports_sock_t ports_remote_connect(const char *receiver_ip)
         return PORTS_INVALID_SOCK;
     }
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    if (!ports_connect_bounded(sock, addr))
     {
-        fprintf(stderr, "[PORTS] Could not connect to %s:%d: %s\n",
-                receiver_ip, PORTS_SERVICE_PORT,
-#ifdef _WIN32
-                strerror(WSAGetLastError())
-#else
-                strerror(errno)
-#endif
-        );
+        fprintf(stderr, "[PORTS] Could not connect to %s:%d (timeout or connection error)\n",
+                receiver_ip, PORTS_SERVICE_PORT);
 #ifdef _WIN32
         closesocket(sock);
 #else

@@ -12,8 +12,8 @@
 | 程序秒退 / 接收端无日志 | `receiver`/`app` 是 GUI 子系统（-mwindows），stdout 丢弃 | sender 自带控制台日志；receiver/app 需手动用 `-mconsole` 重新链接看输出（见[编译](building.md)） |
 | 找不到 *.dll | 运行时 DLL 闭包不全 | 用 `ldd bin/app.exe` 解析闭包，把缺失 DLL 拷到 `bin/`（与 exe 同目录）；详见[编译](building.md) |
 | Connection refused | 接收端未运行 | 检查 8081 端口，重启接收端 |
-| "Virtual display driver not found" | MttVDD 驱动未安装 | 按[安装步骤](virtual-display.md)安装驱动 |
-| "Virtual display did not come up" | 驱动安装但激活失败 | `pnputil /enum-devices /class Monitor` 检查设备状态，重启后再试；详见[虚拟显示器驱动](virtual-display.md) |
+| "Virtual display driver is not installed on the sender" | 发送端未安装 MttVDD（旧安装器只复制了文件） | 重新安装并保留虚拟显示驱动任务，或按[手动安装与修复](virtual-display.md)运行脚本 |
+| "MttVDD is installed, but no virtual monitor was exposed" | 驱动存在但无法启用或没有暴露显示器 | 检查设备管理器中的 Root\MttVDD 状态和 `vdd\install_log.txt`；详见[虚拟显示器驱动](virtual-display.md) |
 | 扩展模式黑屏 / 无画面 | 两端握手不一致（模式值 0=镜像 1=扩展） | 接收端与发送端使用同版本二进制 |
 | 断开后虚拟屏仍在「设置 → 屏幕」 | 旧版本只做 CCD 分离，或未以管理员运行 | 已修复：退出时禁用 Root\MttVDD 设备（需管理员权限运行 sender/app）。若日志出现 disable 失败，可在设备管理器手动禁用「Virtual Display Driver」。驱动说明见[虚拟显示器驱动](virtual-display.md) |
 | 「检查更新」失败（DNS 解析失败 / 请求超时 / 安全连接失败） | 检查只访问 `github.com`，直连不稳定时（企业网络或大陆网络常见）会失败，属预期降级 | 点设置页「打开下载页」用浏览器（走系统代理/VPN）手动下载安装；安装新版本前建议先在应用内「退出」，确保虚拟显示器正确卸载 |

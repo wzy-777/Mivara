@@ -61,12 +61,12 @@ A full session runs in order: discovery (or direct connect) → handshake → vi
 
 ```
 Receiver  →  joins 239.255.255.250:1900, periodically sends NOTIFY, listens for M-SEARCH
-Sender    →  sends M-SEARCH per NIC (multicast + broadcast fallback), collects 200 OK replies, lists receivers for the user
+Sender    →  sends M-SEARCH per NIC and listens concurrently; the GUI shows the first reply immediately, then adds later devices
 ```
 
-- The sender probes on every local NIC (multicast + 255.255.255.255 broadcast) — broadcast often still gets through on enterprise networks that drop multicast
-- Replies are keyed on the **datagram source address** (LOCATION may name the wrong NIC on multi-homed receivers; the source address is always reachable)
-- The receiver's LOCATION uses the NIC IP on the **same subnet** as the requester
+- All NIC sockets wait non-blockingly, with three retransmits 100 ms apart. Five seconds is the total scan budget, not a per-NIC/per-packet timeout, and cancellation interrupts the wait.
+- Each interface sends multicast, 255.255.255.255 and its own directed broadcast. Replies are deduplicated by **datagram source address + port** before any device is reported; repeated replies no longer cause serial TCP probes, and the actual connection validates reachability.
+- The receiver's LOCATION uses the NIC IP on the **same subnet** as the requester.
 
 If network policy blocks even broadcast, use direct connect:
 
@@ -115,9 +115,9 @@ Extend mode selected
   → vddStartup():
       enable the Root\MttVDD device (if disabled; SetupAPI, needs admin)
       → the driver reads vdd_settings.xml only at start-up; if the target
-        size is missing and the user agreed, the exact mode is appended
-        (backup to .mivara.bak, read-back verified) and the device is
-        restarted once when needed
+        size is missing the exact mode is appended by default
+        (`vdd_mode_write=never` opts out; backup to .mivara.bak, read-back
+        verified) and the device is restarted once when needed
       → CCD SetDisplayConfig activates the virtual display (takes it over
         if left over from a previous session)
       → positioned right of the existing desktop, at the receiver's
@@ -214,7 +214,7 @@ Status values: `0`=OK, `1`=version mismatch, `2`=declined, `3`=busy. Event types
 **Target side (receiver's 8084 service)**
 
 - A dedicated thread listens on 8084, independent of the video listener; it polls the running flag while idle and during a session, and is joined on every exit path.
-- The session runs on its own thread so the listener stays responsive: while one is active a second controller receives `KVM_ERR_BUSY` immediately (its hello is read first — closing a socket with unread data turns the close into an RST). Both ends enable TCP keepalive (15 s idle, 3 s probes), so a controller that loses power or Wi-Fi ends the session — and releases the held keys — within about a minute.
+- The session runs on its own thread so the listener stays responsive: while one is active a second controller receives `KVM_ERR_BUSY` immediately (its hello is read first — closing a socket with unread data turns the close into an RST). The controller drain thread also watches for EOF/errors, so an idle session cannot miss a peer exit indefinitely. Both ends negotiate `KVM_FEATURE_HEARTBEAT` through `KvmHello.reserved[1]` / `KvmReply.reserved`; when supported, bidirectional PING/PONG runs every 3 seconds and roughly 9 seconds without input ends the session and releases held keys. Older peers do not negotiate it and retain TCP keepalive (15 s idle, 3 s probes). Local stop uses `shutdown` to wake the sender; the target releases input on EOF, with no second blocking send.
 - After a valid `KvmHello` it shows a **topmost Yes/No dialog** (default No, auto-declined after 30 s, closed automatically on shutdown); its text names the target edge the controller will enter through, taken from `reserved[0]`. Only on Yes does it return the target virtual-desktop metrics and start injecting; after an explicit "No" the same source is rejected outright for 60 s to prevent prompt flooding (leaving the box unanswered for 30 s is a timeout, not a refusal, and arms no cooldown). While the box is up the watcher also `select`s the connection: if the controller has already stopped or disconnected, the dialog is closed and the session slot freed immediately instead of after the timeout. A non-blocking FIN check runs before the box is created, and a peer that cancels during the prompt is not treated as a refusal but delays the next prompt by 3 s (recorded per source in a bounded 8-entry table **and** in one global tick, so a rotating source address bypasses only the per-source half), with at least 1.5 s between any two dialogs regardless of source — so connect-then-close cannot flicker the topmost dialog. Only an actual "No" arms the cooldown: `MessageBoxW` returning 0 (no interactive window station, out of resources) is a failed prompt — the request is still refused, but no cooldown is armed. The backoff wait keeps polling the socket, so a peer that has already disconnected releases the session slot at once.
 - Events are injected with `SendInput`: absolute mouse coordinates + `MOUSEEVENTF_VIRTUALDESK` (normalised 0..65535), keyboard prefers scan codes (`KEYEVENTF_SCANCODE`, plus the extended flag when needed). On session end, disconnect or a clean shutdown every key/button recorded as held is released (a force-terminated process cannot run this — a known limit of "Stop" in receive mode under the GUI's default hidden-console launch).
 - Injection is serial on the session thread. `SendInput` cannot cross UIPI into **higher**-integrity windows and cannot target the secure desktop (so Ctrl+Alt+Del cannot be synthesised). A standalone `receiver` is unelevated, so elevated windows receive no stitch input; a receiver launched by the GUI inherits the GUI's administrator token and can type into them.

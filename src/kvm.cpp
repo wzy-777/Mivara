@@ -231,6 +231,7 @@ enum class ControlState { Local, Remote };
 
 EventQueue              g_queue;
 std::atomic<bool>       g_netOK{true};
+std::atomic<bool>       g_heartbeat{false};
 const std::atomic<bool> *g_running = nullptr;   /* true = keep the session */
 kvm_sock_t              g_sock = KVM_INVALID_SOCK;
 
@@ -685,20 +686,76 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static void drainLoop()
 {
+    const ULONGLONG beat_ms = 3000, timeout_ms = 9000;
+    ULONGLONG last_rx = GetTickCount64();
+    ULONGLONG next_beat = last_rx + beat_ms;
+    KvmEvent incoming = {};
+    size_t incoming_bytes = 0;
+    const auto disconnected = [] {
+        g_netOK = false;
+        if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DISCONNECT, 0, 0);
+    };
     while (!g_drainQuit.load() && (!g_running || g_running->load())) {
-        KvmEvent e;
-        if (!g_queue.pop(e)) {
-            Sleep(1);
-            continue;
+        fd_set rd, ex;
+        FD_ZERO(&rd);
+        FD_ZERO(&ex);
+        FD_SET(g_sock, &rd);
+        FD_SET(g_sock, &ex);
+        timeval tv = {0, 1000};
+        const int selected = select(0, &rd, nullptr, &ex, &tv);
+        if (selected < 0) { disconnected(); break; }
+        if (selected > 0) {
+            const int n = recv(g_sock, (char *)&incoming + incoming_bytes,
+                               (int)(sizeof(incoming) - incoming_bytes), 0);
+            if (n == 0) { disconnected(); break; }
+            if (n < 0) {
+                const int err = WSAGetLastError();
+                if (err != WSAEWOULDBLOCK && err != WSAEINTR) {
+                    disconnected();
+                    break;
+                }
+            } else {
+                incoming_bytes += (size_t)n;
+                last_rx = GetTickCount64();
+                if (incoming_bytes == sizeof(incoming)) {
+                    const uint32_t type = ntohl(incoming.type);
+                    if (type == KVM_EV_PING && g_heartbeat.load()) {
+                        KvmEvent pong = {};
+                        pong.type = htonl(KVM_EV_PONG);
+                        if (!kvmSendAll(g_sock, &pong, sizeof(pong))) {
+                            disconnected();
+                            break;
+                        }
+                    } else if (type != KVM_EV_PONG || !g_heartbeat.load()) {
+                        disconnected();
+                        break;
+                    }
+                    incoming_bytes = 0;
+                }
+            }
         }
-        KvmEvent wire;
+        if (g_heartbeat.load()) {
+            const ULONGLONG now = GetTickCount64();
+            if (now - last_rx >= timeout_ms) { disconnected(); break; }
+            if (now >= next_beat) {
+                KvmEvent ping = {};
+                ping.type = htonl(KVM_EV_PING);
+                if (!kvmSendAll(g_sock, &ping, sizeof(ping))) {
+                    disconnected();
+                    break;
+                }
+                next_beat = now + beat_ms;
+            }
+        }
+        KvmEvent e;
+        if (!g_queue.pop(e)) continue;
+        KvmEvent wire = {};
         wire.type = htonl(e.type);
         wire.a = htonl(e.a);
         wire.b = htonl(e.b);
         wire.c = htonl(e.c);
         if (!kvmSendAll(g_sock, &wire, sizeof(wire))) {
-            g_netOK = false;
-            if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DISCONNECT, 0, 0);
+            disconnected();
             break;
         }
     }
@@ -827,6 +884,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
          * then falls back to the default right side. Purely informational;
          * older targets ignore it and behave like the default (right). */
         hello.reserved[0] = htonl((uint32_t)g_side + 1u);
+        hello.reserved[1] = htonl(KVM_FEATURE_HEARTBEAT);
         if (!kvmSendAll(g_sock, &hello, sizeof(hello))) {
             emitStatError("拼接握手发送失败");
             kvmClose(g_sock);
@@ -880,6 +938,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         return 2;
     }
 
+    g_heartbeat = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
     g_tgt_x0 = (int)(int32_t)ntohl((uint32_t)reply.screen_x);
     g_tgt_y0 = (int)(int32_t)ntohl((uint32_t)reply.screen_y);
     g_tgt_w = ntohl(reply.screen_w);
@@ -971,16 +1030,10 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     KillTimer(g_hwnd, KVM_TIMER_ID);
     leaveRemote(false);
     g_drainQuit = true;
+    if (g_sock != KVM_INVALID_SOCK) shutdown(g_sock, SD_BOTH);
     if (g_drain.joinable()) g_drain.join();
-
-    /* One last release-all, sent directly: the drain thread is gone and the
-     * target may still hold a modifier from an in-flight coalesced batch. */
-    {
-        KvmEvent e = {};
-        e.type = htonl(KVM_EV_RELEASE_ALL);
-        kvmSendAll(g_sock, &e, sizeof(e));
-    }
-
+    /* The target releases every injected input when it observes EOF. Do not
+       start another blocking send after the drain thread has stopped. */
     setCursorVisible(true);
     UnhookWindowsHookEx(g_hMouse);
     UnhookWindowsHookEx(g_hKey);
@@ -1135,10 +1188,17 @@ static void releaseAll(HeldInput &held)
     }
 }
 
+struct HeartbeatState {
+    bool enabled = false;
+    ULONGLONG last_rx = 0;
+    ULONGLONG next_tx = 0;
+};
+
 /* deadline_ms == 0 means "until shutdown/EOF"; used for the hello so a peer
  * that connects and stays silent cannot pin the only KVM session slot. */
 static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
-                           std::atomic<bool> &running, DWORD deadline_ms = 0)
+                           std::atomic<bool> &running, DWORD deadline_ms = 0,
+                           HeartbeatState *hb = nullptr)
 {
     char *p = (char *)buf;
     size_t off = 0;
@@ -1147,6 +1207,16 @@ static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
         if (!running.load()) return false;
         if (deadline_ms && (DWORD)(GetTickCount() - start) > deadline_ms)
             return false;
+        if (hb && hb->enabled) {
+            const ULONGLONG now = GetTickCount64();
+            if (now - hb->last_rx >= 9000) return false;
+            if (now >= hb->next_tx) {
+                KvmEvent ping = {};
+                ping.type = htonl(KVM_EV_PING);
+                if (!kvmSendAll(s, &ping, sizeof(ping))) return false;
+                hb->next_tx = now + 3000;
+            }
+        }
         int n = recv(s, p + off, (int)(len - off), 0);
         if (n == 0) return false;
         if (n < 0) {
@@ -1154,6 +1224,7 @@ static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
             if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
             return false;
         }
+        if (hb) hb->last_rx = GetTickCount64();
         off += (size_t)n;
     }
     return true;
@@ -1399,6 +1470,8 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     KvmReply reply = {};
     reply.magic = htonl(KVM_MAGIC);
     reply.version = htonl(KVM_VERSION);
+    reply.reserved = htonl((ntohl(hello.reserved[1]) & KVM_FEATURE_HEARTBEAT)
+                               ? KVM_FEATURE_HEARTBEAT : 0);
 
     if (ntohl(hello.magic) != KVM_MAGIC) {
         reply.status = htonl(KVM_ERR_VERSION);
@@ -1496,6 +1569,10 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     reply.screen_y = (int32_t)htonl((uint32_t)sy);
     reply.screen_w = htonl(sw);
     reply.screen_h = htonl(sh);
+    HeartbeatState hb;
+    hb.enabled = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
+    hb.last_rx = GetTickCount64();
+    hb.next_tx = hb.last_rx + 3000;
     if (!kvmSendAll(client, &reply, sizeof(reply))) return;
 
     std::cout << "[kvm] stitch session started (" << sw << "x" << sh
@@ -1503,9 +1580,10 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
 
     HeldInput held;
     KvmEvent wire;
-    for (;;) {
+    bool io_ok = true;
+    while (io_ok) {
         if (!running.load()) break;
-        if (!recvAllRunning(client, &wire, sizeof(wire), running)) break;
+        if (!recvAllRunning(client, &wire, sizeof(wire), running, 0, &hb)) break;
         KvmEvent e;
         e.type = ntohl(wire.type);
         e.a = ntohl(wire.a);
@@ -1526,6 +1604,15 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
             break;
         case KVM_EV_RELEASE_ALL:
             releaseAll(held);
+            break;
+        case KVM_EV_PING:
+            if (hb.enabled) {
+                KvmEvent pong = {};
+                pong.type = htonl(KVM_EV_PONG);
+                io_ok = kvmSendAll(client, &pong, sizeof(pong));
+            }
+            break;
+        case KVM_EV_PONG:
             break;
         default:
             break;

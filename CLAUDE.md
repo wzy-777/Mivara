@@ -4,6 +4,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Machine-local notes are kept in `.claude/local-notes.md` (gitignored); read it if present before building, releasing, or changing the toolchain.
 
-All project-specific agent guidance lives in **AGENTS.md** — build commands, architecture wiring, protocol v2 constants, Windows/installer specifics, and repo-hygiene rules. It is the single source of truth: edit `AGENTS.md`, not this file, and don't duplicate its content here. It is imported below so a fresh Claude Code instance loads it:
+Project-specific agent guidance starts in **AGENTS.md**: it contains global/build rules and links to authoritative topic guides under `docs/agents/`. Read every guide relevant to the task, and edit the appropriate guide rather than duplicating its content here. Only `AGENTS.md` is imported below, so a fresh Claude Code instance loads the entry point without eagerly loading every topic guide:
 
 @AGENTS.md

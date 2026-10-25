@@ -70,37 +70,19 @@ static double now_ms(void)
 #endif
 }
 
-/* ─── I/O helpers ────────────────────────────────────────────── */
+/* ─── Bounded, stop-aware I/O ──────────────────────────────────── */
+static int recv_all_stop(int sock, void *buf, size_t size, gpu_stop_fn stop);
+static int send_all_stop(int sock, const void *buf, size_t size, gpu_stop_fn stop);
+
 static int send_all(int sock, const void *buf, size_t size)
 {
-    const char *p = (const char *)buf;
-    size_t sent = 0;
-    while (sent < size) {
-        int n = (int)send(sock, p + sent, (int)(size - sent), 0);
-        if (n <= 0) return -1;
-        sent += (size_t)n;
-    }
-    return 0;
+    return send_all_stop(sock, buf, size, NULL);
 }
 
 static int recv_all(int sock, void *buf, size_t size)
 {
-    char *p = (char *)buf;
-    size_t got = 0;
-    while (got < size) {
-        int n = (int)recv(sock, p + got, (int)(size - got), 0);
-        if (n <= 0) return -1;
-        got += (size_t)n;
-    }
-    return 0;
+    return recv_all_stop(sock, buf, size, NULL);
 }
-
-/* ─── Stop-aware I/O (receiver-side service only) ────────────────
- *
- * The service thread must be able to return even while a client sits
- * idle on a persistent connection.  Each blocking call is gated by a
- * 1 s select(); the stop callback is re-checked on every timeout.
- * The client-side helpers above stay byte-for-byte unchanged.        */
 
 #ifdef _WIN32
 #define GPU_FD_SET(s, set) FD_SET((SOCKET)(s), (set))
@@ -108,23 +90,21 @@ static int recv_all(int sock, void *buf, size_t size)
 #define GPU_FD_SET(s, set) FD_SET((s), (set))
 #endif
 
-static int gpu_wait(int sock, int for_write, gpu_stop_fn stop)
+static int gpu_wait(int sock, int for_write, gpu_stop_fn stop, double deadline)
 {
     for (;;) {
         fd_set fds;
         struct timeval tv;
         int r;
-
-        if (stop && stop()) return -1;
-
+        if ((stop && stop()) || now_ms() >= deadline) return -1;
+        const double remaining = deadline - now_ms();
         FD_ZERO(&fds);
 #ifndef _WIN32
         if (sock >= FD_SETSIZE) return -1;
 #endif
         GPU_FD_SET(sock, &fds);
-        tv.tv_sec  = 1;
-        tv.tv_usec = 0;
-
+        tv.tv_sec = remaining >= 1000.0 ? 1 : 0;
+        tv.tv_usec = remaining >= 1000.0 ? 0 : (long)(remaining * 1000.0);
 #ifdef _WIN32
         r = select(0, for_write ? NULL : &fds, for_write ? &fds : NULL,
                    NULL, &tv);
@@ -141,7 +121,6 @@ static int gpu_wait(int sock, int for_write, gpu_stop_fn stop)
 #endif
             return -1;
         }
-        /* timeout: loop and re-check the stop flag */
     }
 }
 
@@ -163,9 +142,10 @@ static int recv_all_stop(int sock, void *buf, size_t size, gpu_stop_fn stop)
 {
     char *p = (char *)buf;
     size_t got = 0;
+    const double deadline = now_ms() + 30000.0;
     while (got < size) {
         int n;
-        if (gpu_wait(sock, 0, stop) < 0) return -1;
+        if (now_ms() >= deadline || gpu_wait(sock, 0, stop, deadline) < 0) return -1;
         n = (int)recv(sock, p + got, (int)(size - got), 0);
         if (n <= 0) {
 #ifdef _WIN32
@@ -186,9 +166,10 @@ static int send_all_stop(int sock, const void *buf, size_t size, gpu_stop_fn sto
 {
     const char *p = (const char *)buf;
     size_t sent = 0;
+    const double deadline = now_ms() + 30000.0;
     while (sent < size) {
         int n;
-        if (gpu_wait(sock, 1, stop) < 0) return -1;
+        if (now_ms() >= deadline || gpu_wait(sock, 1, stop, deadline) < 0) return -1;
         n = (int)send(sock, p + sent, (int)(size - sent), 0);
         if (n <= 0) {
 #ifdef _WIN32
@@ -205,12 +186,20 @@ static int send_all_stop(int sock, const void *buf, size_t size, gpu_stop_fn sto
     return 0;
 }
 
+static int gpu_frame_bytes(uint32_t width, uint32_t height, uint32_t *out)
+{
+    if (width == 0 || height == 0 || width > 7680 || height > 4320) return 0;
+    const uint64_t bytes = (uint64_t)width * (uint64_t)height * 3u;
+    if (bytes > 7680u * 4320u * 3u) return 0;
+    *out = (uint32_t)bytes;
+    return 1;
+}
+
 /* ─── BGR → RGB swap ─────────────────────────────────────────── */
 static void fix_colour_channels(uint8_t *pixels, uint32_t width, uint32_t height)
 {
-    uint32_t total = width * height;
-    uint32_t i;
-    for (i = 0; i < total; i++) {
+    const size_t total = (size_t)width * (size_t)height;
+    for (size_t i = 0; i < total; i++) {
         uint8_t tmp       = pixels[i * 3];
         pixels[i * 3]     = pixels[i * 3 + 2];
         pixels[i * 3 + 2] = tmp;
@@ -247,54 +236,76 @@ static uint32_t rle_compress(const uint8_t *src, uint32_t src_len,
  * SENDER-SIDE CLIENT
  * ═══════════════════════════════════════════════════════════════ */
 
-gpu_sock_t gpu_remote_connect(const char *receiver_ip)
+static void gpu_close_sock(gpu_sock_t sock)
 {
 #ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET) return (gpu_sock_t)(-1);
+    closesocket((SOCKET)sock);
 #else
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
+    close((int)sock);
 #endif
+}
+
+gpu_sock_t gpu_remote_connect(const char *receiver_ip)
+{
+    gpu_sock_t sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (!GPU_SOCK_VALID(sock)) return GPU_INVALID_SOCK;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(GPU_ACCEL_PORT);
-    inet_pton(AF_INET, receiver_ip, &addr.sin_addr);
-
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    addr.sin_port = htons(GPU_ACCEL_PORT);
+    if (!receiver_ip || inet_pton(AF_INET, receiver_ip, &addr.sin_addr) != 1) {
+        gpu_close_sock(sock);
+        return GPU_INVALID_SOCK;
+    }
+    gpu_set_nonblocking((int)sock);
+    int connected = connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    if (!connected) {
+        int pending = 0;
 #ifdef _WIN32
-        closesocket(sock);
+        const int err = WSAGetLastError();
+        pending = err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
 #else
-        close(sock);
+        pending = errno == EINPROGRESS;
 #endif
+        const double deadline = now_ms() + 5000.0;
+        while (pending && now_ms() < deadline) {
+            if (gpu_wait((int)sock, 1, NULL, deadline) < 0) break;
+            int so_error = 0;
+#ifdef _WIN32
+            int len = sizeof(so_error);
+#else
+            socklen_t len = sizeof(so_error);
+#endif
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len) == 0 &&
+                so_error == 0) {
+                connected = 1;
+            }
+            break;
+        }
+    }
+    if (!connected) {
+        gpu_close_sock(sock);
         fprintf(stderr, "[GPU] Cannot connect to %s:%d\n", receiver_ip, GPU_ACCEL_PORT);
-        return (gpu_sock_t)(-1);
+        return GPU_INVALID_SOCK;
     }
 
     GpuRequest ping;
     memset(&ping, 0, sizeof(ping));
-    ping.magic     = htonl(GPU_MAGIC);
-    ping.version   = GPU_VERSION;
+    ping.magic = htonl(GPU_MAGIC);
+    ping.version = GPU_VERSION;
     ping.operation = GPU_OP_PING;
-    if (send_all((int)sock, &ping, sizeof(ping)) < 0) {
-#ifdef _WIN32
-        closesocket(sock); return (gpu_sock_t)(-1);
-#else
-        close(sock); return -1;
-#endif
-    }
     GpuResponse pong;
-    if (recv_all((int)sock, &pong, sizeof(pong)) < 0 || pong.status != 0) {
-#ifdef _WIN32
-        closesocket(sock); return (gpu_sock_t)(-1);
-#else
-        close(sock); return -1;
-#endif
+    memset(&pong, 0, sizeof(pong));
+    if (send_all((int)sock, &ping, sizeof(ping)) < 0 ||
+        recv_all((int)sock, &pong, sizeof(pong)) < 0 ||
+        ntohl(pong.magic) != GPU_MAGIC || pong.status != 0 ||
+        pong.operation != GPU_OP_PING) {
+        gpu_close_sock(sock);
+        return GPU_INVALID_SOCK;
     }
     printf("[GPU] Connected to receiver compute service at %s:%d\n",
            receiver_ip, GPU_ACCEL_PORT);
-    return (gpu_sock_t)sock;
+    return sock;
 }
 
 int gpu_remote_compress(gpu_sock_t gpu_sock,
@@ -302,35 +313,37 @@ int gpu_remote_compress(gpu_sock_t gpu_sock,
                         uint32_t width, uint32_t height,
                         uint8_t **out_buf)
 {
-    uint32_t data_size = width * height * 3;
+    uint32_t data_size = 0;
+    if (!out_buf || !pixels || !gpu_frame_bytes(width, height, &data_size)) return -1;
+    *out_buf = NULL;
     GpuRequest req;
     memset(&req, 0, sizeof(req));
-    req.magic     = htonl(GPU_MAGIC);
-    req.version   = GPU_VERSION;
+    req.magic = htonl(GPU_MAGIC);
+    req.version = GPU_VERSION;
     req.operation = GPU_OP_COMPRESS;
-    req.width     = htonl(width);
-    req.height    = htonl(height);
+    req.width = htonl(width);
+    req.height = htonl(height);
     req.data_size = htonl(data_size);
-
-    if (send_all((int)gpu_sock, &req, sizeof(req)) < 0)  return -1;
-    if (send_all((int)gpu_sock, pixels, data_size) < 0)  return -1;
+    if (send_all((int)gpu_sock, &req, sizeof(req)) < 0 ||
+        send_all((int)gpu_sock, pixels, data_size) < 0) return -1;
 
     GpuResponse resp;
-    if (recv_all((int)gpu_sock, &resp, sizeof(resp)) < 0) return -1;
-    if (resp.status != 0) return -1;
-
-    uint32_t result_size = ntohl(resp.result_size);
-    if (result_size == 0) return -1;
-
+    memset(&resp, 0, sizeof(resp));
+    if (recv_all((int)gpu_sock, &resp, sizeof(resp)) < 0 ||
+        ntohl(resp.magic) != GPU_MAGIC || resp.status != 0 ||
+        resp.operation != GPU_OP_COMPRESS) return -1;
+    const uint32_t result_size = ntohl(resp.result_size);
+    if (result_size == 0 || result_size > (uint32_t)INT32_MAX ||
+        result_size > data_size * 2u + 4096u) return -1;
     *out_buf = (uint8_t *)malloc(result_size);
     if (!*out_buf) return -1;
     if (recv_all((int)gpu_sock, *out_buf, result_size) < 0) {
-        free(*out_buf); *out_buf = NULL; return -1;
+        free(*out_buf);
+        *out_buf = NULL;
+        return -1;
     }
-
     printf("[GPU] Compress: %u → %u bytes (%.1f%%) in %.2f ms [receiver CPU]\n",
-           data_size, result_size,
-           (data_size > 0) ? 100.0f * (float)result_size / (float)data_size : 0.0f,
+           data_size, result_size, 100.0f * (float)result_size / (float)data_size,
            resp.ms_elapsed);
     return (int)result_size;
 }
@@ -339,27 +352,25 @@ int gpu_remote_colorfix(gpu_sock_t gpu_sock,
                         uint8_t *pixels,
                         uint32_t width, uint32_t height)
 {
-    uint32_t data_size = width * height * 3;
+    uint32_t data_size = 0;
+    if (!pixels || !gpu_frame_bytes(width, height, &data_size)) return -1;
     GpuRequest req;
     memset(&req, 0, sizeof(req));
-    req.magic     = htonl(GPU_MAGIC);
-    req.version   = GPU_VERSION;
+    req.magic = htonl(GPU_MAGIC);
+    req.version = GPU_VERSION;
     req.operation = GPU_OP_COLORCONV;
-    req.width     = htonl(width);
-    req.height    = htonl(height);
+    req.width = htonl(width);
+    req.height = htonl(height);
     req.data_size = htonl(data_size);
-
-    if (send_all((int)gpu_sock, &req, sizeof(req)) < 0) return -1;
-    if (send_all((int)gpu_sock, pixels, data_size) < 0) return -1;
-
+    if (send_all((int)gpu_sock, &req, sizeof(req)) < 0 ||
+        send_all((int)gpu_sock, pixels, data_size) < 0) return -1;
     GpuResponse resp;
-    if (recv_all((int)gpu_sock, &resp, sizeof(resp)) < 0) return -1;
-    if (resp.status != 0) return -1;
-
-    uint32_t result_size = ntohl(resp.result_size);
-    if (result_size != data_size) return -1;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_all((int)gpu_sock, &resp, sizeof(resp)) < 0 ||
+        ntohl(resp.magic) != GPU_MAGIC || resp.status != 0 ||
+        resp.operation != GPU_OP_COLORCONV ||
+        ntohl(resp.result_size) != data_size) return -1;
     if (recv_all((int)gpu_sock, pixels, data_size) < 0) return -1;
-
     printf("[GPU] Colorfix %ux%u in %.2f ms [receiver CPU]\n",
            width, height, resp.ms_elapsed);
     return 0;
@@ -368,11 +379,7 @@ int gpu_remote_colorfix(gpu_sock_t gpu_sock,
 void gpu_remote_disconnect(gpu_sock_t gpu_sock)
 {
     if (GPU_SOCK_VALID(gpu_sock)) {
-#ifdef _WIN32
-        closesocket((SOCKET)gpu_sock);
-#else
-        close((int)gpu_sock);
-#endif
+        gpu_close_sock(gpu_sock);
         printf("[GPU] Disconnected from receiver compute service\n");
     }
 }
@@ -388,8 +395,8 @@ void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
         GpuRequest req;
         if (should_stop && should_stop()) break;
         if (recv_all_stop(client_sock, &req, sizeof(req), should_stop) < 0) break;
-        if (ntohl(req.magic) != GPU_MAGIC) {
-            fprintf(stderr, "[GPU-SVC] Bad magic\n"); break;
+        if (ntohl(req.magic) != GPU_MAGIC || req.version != GPU_VERSION) {
+            fprintf(stderr, "[GPU-SVC] Bad magic or version\n"); break;
         }
 
         uint8_t  op      = req.operation;
@@ -403,13 +410,16 @@ void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
             resp.magic     = htonl(GPU_MAGIC);
             resp.status    = 0;
             resp.operation = GPU_OP_PING;
-            send_all_stop(client_sock, &resp, sizeof(resp), should_stop);
-            printf("[GPU-SVC] Ping OK\n");
+            if (send_all_stop(client_sock, &resp, sizeof(resp), should_stop) < 0) break;
             continue;
         }
 
-        if (data_sz == 0 || data_sz > 7680u * 4320u * 3u) {
-            fprintf(stderr, "[GPU-SVC] Bad data_sz %u\n", data_sz); break;
+        uint32_t expected = 0;
+        if ((op != GPU_OP_COMPRESS && op != GPU_OP_COLORCONV) ||
+            !gpu_frame_bytes(width, height, &expected) || data_sz != expected) {
+            fprintf(stderr, "[GPU-SVC] Invalid operation or frame size: op=%u %ux%u bytes=%u\n",
+                    op, width, height, data_sz);
+            break;
         }
 
         uint8_t *buf = (uint8_t *)malloc(data_sz);

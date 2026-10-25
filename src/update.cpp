@@ -519,18 +519,12 @@ std::string updatesDirUtf8()
     return w2u8(std::wstring(base) + L"\\Mivara\\Updates");
 }
 
-/* Takes ownership (O:BA) and applies a *protected* DACL that only lets
- * administrators write: SYSTEM + Administrators full, Users read+execute.
- * Ownership matters as much as the DACL - an owner keeps implicit WRITE_DAC
- * whatever the ACL says, so a folder a standard user created first would
- * otherwise be theirs to re-ACL. PROTECTED_DACL_SECURITY_INFORMATION is what
- * actually drops the ACEs inherited from C:\ProgramData (which grant
- * BUILTIN\Users write+create); the D:P prefix alone is a control bit in the
- * security descriptor, not part of the PACL, and passing only the DACL would
- * silently lose it (measured). Files created inside inherit the DACL, so a
- * medium-integrity process can neither plant a fake installer nor swap ours
- * between the download and the launch. */
-bool lockDownDir(const std::wstring &path)
+/* Applies O:BA plus a protected DACL to a file or directory: SYSTEM and
+ * Administrators full, Users read/execute. Owner and DACL are read back after
+ * every change. New installers are created inside the protected directory and
+ * secured individually, so a medium-integrity process cannot pre-plant one or
+ * replace it between verification and launch. */
+bool lockDownPath(const std::wstring &path)
 {
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -611,13 +605,14 @@ bool ensureUpdatesDir(std::wstring &dirOut, const char **err)
             return false;
         }
         DWORD attr = GetFileAttributesW(p.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) ||
+            (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
             *err = "file_io";
             return false;
         }
         /* Fail closed: without a locked-down directory we do not stage a
          * binary we are going to execute. */
-        if (!lockDownDir(p)) {
+        if (!lockDownPath(p)) {
             *err = "file_io";
             return false;
         }
@@ -656,10 +651,25 @@ bool checkLatest(std::string &tag_out, const char **err)
 bool fetchAssetToFile(const std::string &assetPath, const std::wstring &fileW,
                       std::string &shaHex, long long &got, const char **err)
 {
-    HANDLE f = CreateFileW(fileW.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD attr = GetFileAttributesW(fileW.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES) {
+        if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) || (attr & FILE_ATTRIBUTE_DIRECTORY) ||
+            !DeleteFileW(fileW.c_str())) {
+            *err = "file_io";
+            return false;
+        }
+    }
+    HANDLE f = CreateFileW(fileW.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { *err = "file_io"; return false; }
-    bool ok = fetchAsset(assetPath, f, shaHex, got, err);
+    if (!lockDownPath(fileW)) {
+        CloseHandle(f);
+        DeleteFileW(fileW.c_str());
+        *err = "file_io";
+        return false;
+    }
+    const bool ok = fetchAsset(assetPath, f, shaHex, got, err);
     CloseHandle(f);
     return ok;
 }
@@ -1002,27 +1012,58 @@ bool updateOpenReleasePage()
 #endif
 }
 
+#ifdef _WIN32
+static bool hashFileHandle(HANDLE f, std::string &hex_out)
+{
+    Sha256 h;
+    if (!h.init()) return false;
+    LARGE_INTEGER zero = {};
+    if (!SetFilePointerEx(f, zero, nullptr, FILE_BEGIN)) return false;
+    std::vector<unsigned char> buf(64 * 1024);
+    for (;;) {
+        DWORD read = 0;
+        if (!ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr)) return false;
+        if (read == 0) break;
+        h.update(buf.data(), read);
+    }
+    return h.finish(hex_out);
+}
+#endif
+
 bool updateLaunchInstaller()
 {
 #ifdef _WIN32
-    if (s_launched) return false;   /* handed over already: never launch twice */
+    if (s_launched) return false;
     UpdateInfo ui = updateGetInfo();
     if (ui.state != UpdateState::Downloaded || ui.install_path.empty() || ui.sha256.empty())
         return false;
-    /* Re-verify the bytes on disk right before executing them. */
-    std::string hex;
-    if (!updateFileSha256(ui.install_path, hex) || lower(hex) != lower(ui.sha256)) {
-        DeleteFileW(u82w(ui.install_path).c_str());
-        finishState(UpdateState::Failed, "hash_mismatch", true, ui.remote_tag);
+    const std::wstring wpath = u82w(ui.install_path);
+    HANDLE f = INVALID_HANDLE_VALUE;
+    const auto reject = [&](const char *reason) {
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        DeleteFileW(wpath.c_str());
+        finishState(UpdateState::Failed, reason, true, ui.remote_tag);
         return false;
-    }
-    std::wstring wpath = u82w(ui.install_path);
+    };
+    const DWORD attr = GetFileAttributesW(wpath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attr & FILE_ATTRIBUTE_REPARSE_POINT) || !lockDownPath(wpath))
+        return reject("file_io");
+    f = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return reject("file_io");
+    BY_HANDLE_FILE_INFORMATION info = {};
+    if (!GetFileInformationByHandle(f, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return reject("file_io");
+    std::string hex;
+    if (!hashFileHandle(f, hex) || lower(hex) != lower(ui.sha256))
+        return reject("hash_mismatch");
+    /* The handle denies write/delete sharing until ShellExecute returns, and
+       the protected owner/DACL keeps it locked after the hand-over. */
     HINSTANCE r = ShellExecuteW(nullptr, L"open", wpath.c_str(), nullptr, nullptr,
                                 SW_SHOWNORMAL);
+    CloseHandle(f);
     if ((INT_PTR)r <= 32) {
-        /* The download is intact - only the hand-over failed. Stay in
-         * Downloaded so the button retries the launch instead of re-downloading,
-         * and publish no completion: no operation finished on the worker. */
         setDetail("launch_failed");
         return false;
     }
@@ -1086,17 +1127,12 @@ bool updateParseSha256Sums(const std::string &text, const std::string &filename,
 bool updateFileSha256(const std::string &path, std::string &hex_out)
 {
 #ifdef _WIN32
-    Sha256 h;
-    if (!h.init()) return false;
     HANDLE f = CreateFileW(u82w(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
-    std::vector<unsigned char> buf(64 * 1024);
-    DWORD read = 0;
-    while (ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr) && read > 0)
-        h.update(buf.data(), read);
+    const bool ok = hashFileHandle(f, hex_out);
     CloseHandle(f);
-    return h.finish(hex_out);
+    return ok;
 #else
     /* POSIX builds never download an installer, so there is nothing to hash;
      * the launcher path is Windows-only. */

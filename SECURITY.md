@@ -35,14 +35,16 @@ The following are **design limitations of a LAN-only tool, not vulnerabilities b
 
 - **No transport encryption or peer authentication.** TCP 8081 (video), 8082 (RLE compute offload), 8083 (port inspector) and 8084 (stitch KVM) are plaintext and unauthenticated. SSDP discovery uses unauthenticated UDP 1900. Anyone who can reach these ports on the LAN can talk to them.
 - **无传输加密、无对端认证。** TCP 8081（视频）、8082（RLE 计算卸载）、8083（端口检查）与 8084（拼接 KVM）均为明文且不验证对端身份；SSDP 发现使用无认证的 UDP 1900。局域网内任何能访问这些端口的设备都可以与之通信。
+- **8081 has no pairing or local consent.** Any reachable peer can start a video session and supply fullscreen content; only use the receiver on a trusted private LAN.
+- **8081 没有配对或本机确认。** 任何可达对端都能建立视频会话并投放全屏内容；请只在可信的专用局域网内启动接收端。
 - **8083 accepts LIST/GET/KILL from any reachable peer** and can terminate receiver-side processes. Keep it on a trusted LAN only.
 - **8083 接受任何可达对端的 LIST/GET/KILL**，可终止接收端进程。请仅在可信局域网内使用。
 - **8084 injects keyboard and mouse input.** The target shows a per-session topmost consent dialog (default No, 30 s auto-dismiss); an explicit refusal suppresses prompts from that source IP for 60 s. There is no encryption and no peer authentication, so this human confirmation is the only gate.
 - **8084 注入键盘与鼠标输入。** 接收端每次会话都会弹出置顶的人工确认框（默认「否」，30 秒自动关闭）；明确拒绝后 60 秒内不再对该源 IP 弹窗。由于没有加密也没有对端认证，这次人工确认就是唯一的关卡。
 - **Elevation.** `sender` and `app` embed a `requireAdministrator` manifest. A `receiver` launched by the GUI inherits that elevated token and can inject into elevated windows; a standalone `receiver.exe` is unelevated, and UIPI blocks injection into higher-integrity windows.
 - **权限提升。** `sender` 与 `app` 内嵌 `requireAdministrator` 清单。由 GUI 启动的 `receiver` 会继承该管理员令牌，因而能向高权限窗口注入输入；独立运行的 `receiver.exe` 未被提升，受 UIPI 限制无法向更高完整性级别的窗口注入。
-- **Virtual display (VDD) settings file.** The sender can append a missing mode to `vdd_settings.xml` only after explicit user consent (config `vdd_mode_write`), using a backup plus validated replace, and it refuses to modify the file while any VDD CCD path is active.
-- **虚拟显示器（VDD）配置文件。** 只有在用户明确同意后（配置项 `vdd_mode_write`），发送端才可能向 `vdd_settings.xml` 追加缺失的分辨率；写入前先备份、写入后校验，且在任何 VDD CCD 路径处于活动状态时拒绝修改。
+- **Virtual display (VDD) settings file.** In extend mode the sender appends a missing receiver resolution to `vdd_settings.xml` by default, using a backup plus validated replace, and it refuses to modify the file while any VDD CCD path is active. Set `vdd_mode_write=never` in `config.ini` to forbid the write entirely (the GUI does not offer this toggle).
+- **虚拟显示器（VDD）配置文件。** 扩展模式下，发送端默认会把缺失的接收端分辨率追加到 `vdd_settings.xml`（写入前先备份、写入后校验），且在任何 VDD CCD 路径处于活动状态时拒绝修改。可在 `config.ini` 设置 `vdd_mode_write=never` 完全禁止写入（GUI 不提供该开关）。
 - **Updater.** The in-app updater contacts only `github.com/wzy-777/Mivara` over HTTPS, restricts redirects to `github.com` / `*.githubusercontent.com`, validates the tag against a fixed charset, and is fail-closed when `SHA256SUMS.txt` lacks an entry for the installer.
 - **更新器。** 应用内更新只通过 HTTPS 访问 `github.com/wzy-777/Mivara`，重定向仅允许落到 `github.com` / `*.githubusercontent.com`，并按固定字符集校验 tag；若 `SHA256SUMS.txt` 中没有安装包的条目，安装会失败关闭（fail-closed）。
 

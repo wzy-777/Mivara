@@ -10,6 +10,7 @@ build/
 .vscode/
 .mimocode/
 .playwright-cli/
+/tmp/
 
 #stats files
 *.json

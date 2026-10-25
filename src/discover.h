@@ -4,6 +4,8 @@
 #ifndef DISCOVER_H
 #define DISCOVER_H
 
+#include <atomic>
+#include <functional>
 #include <vector>
 #include <string>
 
@@ -32,8 +34,15 @@ struct DiscoveredDevice
     }
 };
 
-// Discovery functions
-std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds = 5);
+struct DiscoveryOptions
+{
+    const std::atomic<bool> *cancelled = nullptr;
+    std::function<void(const DiscoveredDevice &)> onDevice;
+};
+
+// timeout_seconds is the total scan budget, not a per-interface wait.
+std::vector<DiscoveredDevice> discoverReceivers(
+    int timeout_seconds = 5, const DiscoveryOptions &options = DiscoveryOptions{});
 bool hasReceivers();
 std::string listDevices(const std::vector<DiscoveredDevice> &devices);
 std::string getLocalIPAddress();

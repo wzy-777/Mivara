@@ -306,71 +306,61 @@ std::string getLocalIPAddress()
  */
 bool testTcpConnection(const std::string &ip, int port, int timeout_ms)
 {
+    if (port < 1 || port > 65535 || timeout_ms < 0) return false;
 #ifdef _WIN32
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET)
-        return false;
+    if (sock == INVALID_SOCKET) return false;
 #else
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
+    if (sock < 0 || sock >= FD_SETSIZE) {
+        if (sock >= 0) close(sock);
         return false;
+    }
 #endif
-
+    const auto fail = [&] { DISC_CLOSE(sock); return false; };
 #ifdef _WIN32
     u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
+    if (ioctlsocket(sock, FIONBIO, &mode) != 0) return fail();
 #else
     int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) return fail();
 #endif
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
+    sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    addr.sin_port = htons((u_short)port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return fail();
 
-    int result = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-
-    /* A non-blocking connect may complete immediately.  The old code only
-       handled EINPROGRESS/WSAEWOULDBLOCK, so a healthy receiver was reported
-       as unreachable whenever connect() returned 0. */
+    const int result = connect(sock, (sockaddr *)&addr, sizeof(addr));
     bool connected = (result == 0);
-
+    bool pending = false;
+    if (result != 0) {
 #ifdef _WIN32
-    if (result == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+        const int err = WSAGetLastError();
+        pending = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
 #else
-    if (result < 0 && errno == EINPROGRESS)
+        pending = (errno == EINPROGRESS);
 #endif
-    {
-        fd_set fdset;
-        FD_ZERO(&fdset);
-        FD_SET(sock, &fdset);
-
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-        if (select(sock + 1, NULL, &fdset, NULL, &tv) == 1)
-        {
+    }
+    if (pending) {
+        fd_set writefds, exceptfds;
+        FD_ZERO(&writefds);
+        FD_ZERO(&exceptfds);
+        FD_SET(sock, &writefds);
+        FD_SET(sock, &exceptfds);
+        timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        if (select((int)sock + 1, nullptr, &writefds, &exceptfds, &tv) > 0 &&
+            FD_ISSET(sock, &writefds)) {
             int so_error = 0;
 #ifdef _WIN32
             int len = sizeof(so_error);
 #else
             socklen_t len = sizeof(so_error);
 #endif
-            if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
-                           (char *)&so_error, &len) == 0 && so_error == 0)
-                connected = true;
+            connected = getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                                   (char *)&so_error, &len) == 0 && so_error == 0;
         }
     }
-
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
-
+    DISC_CLOSE(sock);
     return connected;
 }
 
@@ -498,229 +488,202 @@ bool parseSsdpResponse(const std::string &response, std::string &ip, int &port,
 /**
  * Discover receivers on the network
  */
-std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds)
+std::vector<DiscoveredDevice> discoverReceivers(int timeout_seconds,
+                                                const DiscoveryOptions &options)
 {
-    std::vector<DiscoveredDevice> discovered_receivers;
-
+    std::vector<DiscoveredDevice> discovered;
     std::cout << "🔍 Scanning for receivers on 239.255.255.250:1900..." << std::endl;
+    if (!initSockets()) return discovered;
 
-    if (!initSockets())
-        return discovered_receivers;
+    struct DiscoverySocket {
+        disc_sock_t fd;
+        sockaddr_in directed;
+        bool has_directed = false;
+    };
+    std::vector<DiscoverySocket> sockets;
+    const auto closeSockets = [&] {
+        for (const DiscoverySocket &entry : sockets) DISC_CLOSE(entry.fd);
+        sockets.clear();
+        cleanupSockets();
+    };
+    const auto cancelled = [&] {
+        return options.cancelled && options.cancelled->load();
+    };
 
-    int reuse = 1;
-    int sock_buf_size = SOCKET_BUFFER_SIZE;
-
-    /* One socket per local NIC: binding to INADDR_ANY lets a VPN/TUN
-       adapter (e.g. a proxy client) steal the source address, and the
-       receiver's reply then never comes back. */
     std::vector<std::string> local_ips = listLocalIPv4();
-    if (local_ips.empty())
-        local_ips.push_back(""); /* fall back to INADDR_ANY */
-
-    std::vector<disc_sock_t> socks;
-    for (const std::string &lip : local_ips)
-    {
+    if (local_ips.empty()) local_ips.push_back("");
+    const std::vector<LocalIface> ifaces = listLocalIPv4Ifaces();
+    for (const std::string &lip : local_ips) {
         disc_sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
-        if (s == DISC_INVALID)
-            continue;
-
+        if (s == DISC_INVALID) continue;
+#ifndef _WIN32
+        if (s >= FD_SETSIZE) { DISC_CLOSE(s); continue; }
+#endif
+        int reuse = 1, bc = 1, buf_size = SOCKET_BUFFER_SIZE;
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&sock_buf_size, sizeof(sock_buf_size));
-        int bc = 1;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&buf_size, sizeof(buf_size));
         setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char *)&bc, sizeof(bc));
-
-        struct sockaddr_in bind_addr;
-        memset(&bind_addr, 0, sizeof(bind_addr));
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_port = 0;
-        if (lip.empty())
-            bind_addr.sin_addr.s_addr = INADDR_ANY;
-        else
-            inet_pton(AF_INET, lip.c_str(), &bind_addr.sin_addr);
-
-        if (bind(s, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
-        {
+#ifdef _WIN32
+        u_long one = 1;
+        if (ioctlsocket(s, FIONBIO, &one) != 0) { DISC_CLOSE(s); continue; }
+#else
+        const int flags = fcntl(s, F_GETFL, 0);
+        if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) {
             DISC_CLOSE(s);
             continue;
         }
-
-        /* Scope multicast to this NIC as well */
-        if (!lip.empty())
-        {
-            struct ip_mreq mreq;
+#endif
+        sockaddr_in bind_addr = {};
+        bind_addr.sin_family = AF_INET;
+        if (!lip.empty() && inet_pton(AF_INET, lip.c_str(), &bind_addr.sin_addr) != 1) {
+            DISC_CLOSE(s);
+            continue;
+        }
+        if (bind(s, (sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            DISC_CLOSE(s);
+            continue;
+        }
+        DiscoverySocket entry = {};
+        entry.fd = s;
+        if (!lip.empty()) {
+            ip_mreq mreq = {};
             mreq.imr_multiaddr.s_addr = inet_addr(SSDP_MULTICAST_GROUP);
             inet_pton(AF_INET, lip.c_str(), &mreq.imr_interface);
             setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq));
-            struct in_addr ifaddr;
+            in_addr ifaddr = {};
             inet_pton(AF_INET, lip.c_str(), &ifaddr);
             setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&ifaddr, sizeof(ifaddr));
+            for (const LocalIface &iface : ifaces) {
+                if (iface.ip != lip || iface.prefix <= 0 || iface.prefix >= 32) continue;
+                in_addr ip_addr = {};
+                if (inet_pton(AF_INET, lip.c_str(), &ip_addr) != 1) break;
+                const uint32_t ip = ntohl(ip_addr.s_addr);
+                const uint32_t mask = ~((1u << (32 - iface.prefix)) - 1);
+                entry.directed.sin_family = AF_INET;
+                entry.directed.sin_port = htons(SSDP_MULTICAST_PORT);
+                entry.directed.sin_addr.s_addr = htonl((ip & mask) | ~mask);
+                entry.has_directed = true;
+                break;
+            }
         }
-
-#ifdef _WIN32
-        /* Windows SO_RCVTIMEO takes DWORD milliseconds — a struct timeval here
-           would be misread as a 5ms timeout and discovery would give up at once */
-        DWORD tv = (DWORD)timeout_seconds * 1000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
-#else
-        struct timeval tv;
-        tv.tv_sec = timeout_seconds;
-        tv.tv_usec = 0;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
-#endif
-
-        socks.push_back(s);
+        sockets.push_back(entry);
     }
-
-    if (socks.empty())
-    {
+    if (sockets.empty()) {
         std::cerr << "X. Failed to create discovery sockets" << std::endl;
         cleanupSockets();
-        return discovered_receivers;
+        return discovered;
     }
 
-    std::string msearch =
+    const std::string msearch =
         "M-SEARCH * HTTP/1.1\r\n"
         "HOST: 239.255.255.250:1900\r\n"
         "MAN: \"ssdp:discover\"\r\n"
         "MX: 3\r\n"
         "ST: urn:screen-share:receiver\r\n"
-        "USER-AGENT: ScreenShare/1.0\r\n"
-        "\r\n";
+        "USER-AGENT: ScreenShare/1.0\r\n\r\n";
+    sockaddr_in multicast = {}, broadcast = {};
+    multicast.sin_family = broadcast.sin_family = AF_INET;
+    multicast.sin_port = broadcast.sin_port = htons(SSDP_MULTICAST_PORT);
+    inet_pton(AF_INET, SSDP_MULTICAST_GROUP, &multicast.sin_addr);
+    broadcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(SSDP_MULTICAST_PORT);
-    inet_pton(AF_INET, SSDP_MULTICAST_GROUP, &dest_addr.sin_addr);
-
-    /* Broadcast fallback: many enterprise networks drop multicast between
-       hosts but still pass subnet broadcast. Same M-SEARCH, same port. */
-    struct sockaddr_in bcast_addr;
-    memset(&bcast_addr, 0, sizeof(bcast_addr));
-    bcast_addr.sin_family = AF_INET;
-    bcast_addr.sin_port = htons(SSDP_MULTICAST_PORT);
-    bcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-
-    std::cout << "📡 Sending SSDP M-SEARCH requests (multicast + broadcast, "
-              << socks.size() << " NIC(s))..." << std::endl;
-    std::vector<struct sockaddr_in> directed_broadcasts;
-    for (const LocalIface &iface : listLocalIPv4Ifaces())
-    {
-        if (iface.prefix <= 0 || iface.prefix >= 32) continue;
-        struct in_addr ip_addr;
-        if (inet_pton(AF_INET, iface.ip.c_str(), &ip_addr) != 1) continue;
-        uint32_t ip = ntohl(ip_addr.s_addr);
-        uint32_t mask = ~((1u << (32 - iface.prefix)) - 1);
-        struct sockaddr_in directed = {};
-        directed.sin_family = AF_INET;
-        directed.sin_port = htons(SSDP_MULTICAST_PORT);
-        directed.sin_addr.s_addr = htonl((ip & mask) | ~mask);
-        directed_broadcasts.push_back(directed);
-    }
-    for (int i = 0; i < 3; i++)
-    {
-        for (disc_sock_t s : socks)
-        {
-            sendto(s, msearch.c_str(), (int)msearch.length(), 0,
-                   (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-            sendto(s, msearch.c_str(), (int)msearch.length(), 0,
-                   (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
-            for (const auto &directed : directed_broadcasts)
-                sendto(s, msearch.c_str(), (int)msearch.length(), 0,
-                       (const struct sockaddr *)&directed, sizeof(directed));
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    std::cout << "📡 Waiting for responses (" << timeout_seconds << " seconds)..." << std::endl;
-
-    char buffer[8192];
-    struct sockaddr_in sender_addr;
-    socklen_t sender_len = sizeof(sender_addr);
-
-    int response_count = 0;
-    while (response_count < 30)
-    {
-        bool got_any = false;
-        for (disc_sock_t s : socks)
-        {
-            sender_len = sizeof(sender_addr);
-            int bytes = (int)recvfrom(s, buffer, (int)sizeof(buffer) - 1, 0,
-                                      (struct sockaddr *)&sender_addr, &sender_len);
-
-            if (bytes < 0)
-            {
-                continue;
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(std::max(1, timeout_seconds));
+    int round = 0;
+    std::cout << "📡 Listening on " << sockets.size()
+              << " NIC(s) for up to " << timeout_seconds << " seconds..." << std::endl;
+    while (!cancelled() && discovered.size() < 30) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        if (round < 3 && now >= start + std::chrono::milliseconds(round * 100)) {
+            for (const DiscoverySocket &entry : sockets) {
+                sendto(entry.fd, msearch.data(), (int)msearch.size(), 0,
+                       (sockaddr *)&multicast, sizeof(multicast));
+                sendto(entry.fd, msearch.data(), (int)msearch.size(), 0,
+                       (sockaddr *)&broadcast, sizeof(broadcast));
+                if (entry.has_directed)
+                    sendto(entry.fd, msearch.data(), (int)msearch.size(), 0,
+                           (const sockaddr *)&entry.directed, sizeof(entry.directed));
             }
-            got_any = true;
-
-            buffer[bytes] = '\0';
-            std::string response(buffer);
-
-            if (response.find("urn:screen-share:receiver") != std::string::npos ||
-                response.find("screen-share") != std::string::npos)
-            {
-                std::string loc_ip;
-                int port = 8081;
-                std::string dev_name;
-                parseSsdpResponse(response, loc_ip, port, &dev_name); /* best-effort: at least for the port */
-
-                /* The datagram source address is by definition reachable —
-                   prefer it over LOCATION, which multi-homed receivers may
-                   fill with a wrong NIC. */
-                std::string src_ip = inet_ntoa(sender_addr.sin_addr);
-                std::string ip;
-                if (testTcpConnection(src_ip, port, 500))
-                {
-                    ip = src_ip;
-                }
-                else if (!loc_ip.empty() && loc_ip != src_ip && testTcpConnection(loc_ip, port, 500))
-                {
-                    ip = loc_ip;
-                    std::cout << "   (using LOCATION address " << loc_ip << ")" << std::endl;
-                }
-
-                if (!ip.empty())
-                {
-                    std::cout << "✓ Found receiver: " << ip << ":" << port << std::endl;
-                    discovered_receivers.emplace_back(ip, port);
-                    discovered_receivers.back().name = dev_name;
-                }
-                else
-                {
-                    std::cout << "   X. Receiver at " << src_ip << ":" << port
-                              << " not reachable (LOCATION: " << loc_ip << ")" << std::endl;
-                }
-                response_count++;
-            }
+            round++;
         }
-        /* Every socket timed out with nothing left to read */
-        if (!got_any)
+
+        int wait_ms = 50;
+        if (round < 3) {
+            const auto next = start + std::chrono::milliseconds(round * 100);
+            wait_ms = (int)std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                next - std::chrono::steady_clock::now()).count());
+        }
+        fd_set ready;
+        FD_ZERO(&ready);
+        disc_sock_t maxfd = 0;
+        for (const DiscoverySocket &entry : sockets) {
+            FD_SET(entry.fd, &ready);
+            if (entry.fd > maxfd) maxfd = entry.fd;
+        }
+        timeval tv = {wait_ms / 1000, (wait_ms % 1000) * 1000};
+        const int selected = select((int)maxfd + 1, &ready, nullptr, nullptr, &tv);
+        if (selected < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
             break;
+        }
+        if (selected == 0) continue;
+
+        for (const DiscoverySocket &entry : sockets) {
+            if (!FD_ISSET(entry.fd, &ready)) continue;
+            for (;;) {
+                char buffer[8192];
+                sockaddr_in sender_addr = {};
+                socklen_t sender_len = sizeof(sender_addr);
+                const int bytes = (int)recvfrom(entry.fd, buffer, sizeof(buffer) - 1, 0,
+                                                (sockaddr *)&sender_addr, &sender_len);
+                if (bytes < 0) {
+#ifdef _WIN32
+                    const int err = WSAGetLastError();
+                    if (err == WSAEWOULDBLOCK || err == WSAEINTR) break;
+#else
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+#endif
+                    break;
+                }
+                if (bytes == 0) continue;
+                std::string response(buffer, (size_t)bytes);
+                if (response.find("urn:screen-share:receiver") == std::string::npos &&
+                    response.find("screen-share") == std::string::npos) continue;
+                std::string loc_ip, name;
+                int port = 8081;
+                if (!parseSsdpResponse(response, loc_ip, port, &name) ||
+                    port < 1 || port > 65535) continue;
+                char src[INET_ADDRSTRLEN] = {};
+                if (!inet_ntop(AF_INET, &sender_addr.sin_addr, src, sizeof(src))) continue;
+                const std::string ip = src;
+                const bool duplicate = std::any_of(discovered.begin(), discovered.end(),
+                    [&](const DiscoveredDevice &d) {
+                        return d.ip_address == ip && d.tcp_port == port;
+                    });
+                if (duplicate) continue;
+                discovered.emplace_back(ip, port);
+                discovered.back().name = name;
+                std::cout << "✓ Found receiver: " << ip << ":" << port << std::endl;
+                if (options.onDevice) options.onDevice(discovered.back());
+                if (discovered.size() >= 30) break;
+            }
+        }
     }
 
-    for (disc_sock_t s : socks)
-        DISC_CLOSE(s);
-
-    cleanupSockets();
-
-    /* Dedupe: sort first — std::unique only collapses adjacent duplicates */
-    std::sort(discovered_receivers.begin(), discovered_receivers.end(),
-              [](const DiscoveredDevice &a, const DiscoveredDevice &b)
-              {
-                  return a.ip_address < b.ip_address ||
-                         (a.ip_address == b.ip_address && a.tcp_port < b.tcp_port);
-              });
-    discovered_receivers.erase(
-        std::unique(discovered_receivers.begin(), discovered_receivers.end(),
-                    [](const DiscoveredDevice &a, const DiscoveredDevice &b)
-                    {
-                        return a.ip_address == b.ip_address && a.tcp_port == b.tcp_port;
-                    }),
-        discovered_receivers.end());
-
-    std::cout << "Discovery complete: " << discovered_receivers.size() << " receiver(s) available" << std::endl;
-    return discovered_receivers;
+    closeSockets();
+    std::sort(discovered.begin(), discovered.end(),
+        [](const DiscoveredDevice &a, const DiscoveredDevice &b) {
+            return a.ip_address < b.ip_address ||
+                   (a.ip_address == b.ip_address && a.tcp_port < b.tcp_port);
+        });
+    std::cout << "Discovery complete: " << discovered.size()
+              << " receiver(s) available" << std::endl;
+    return discovered;
 }
 
 /**

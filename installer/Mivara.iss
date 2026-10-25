@@ -33,7 +33,53 @@ WizardStyle=modern
 ;   [Languages] Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标:"
+Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加任务:"
+Name: "installvdd"; Description: "安装虚拟显示驱动（扩展模式需要，推荐）"; GroupDescription: "附加任务:"; Flags: checkedonce
+
+[Code]
+procedure InstallVirtualDisplayDriver;
+var
+  ResultCode: Integer;
+  Installer: String;
+  LogPath: String;
+begin
+  if not IsTaskSelected('installvdd') then
+    exit;
+  Installer := ExpandConstant('{app}\vdd\install_vdd.ps1');
+  LogPath := ExpandConstant('{app}\vdd\install_log.txt');
+  Log('Installing the virtual display driver for Extend mode.');
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + Installer + '"',
+              ExpandConstant('{app}\vdd'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Log(Format('Could not start the VDD installer: %s', [SysErrorMessage(ResultCode)]));
+    if WizardSilent then
+      RaiseException('Virtual display driver installation failed. See ' + LogPath);
+    SuppressibleMsgBox('The virtual display driver installer could not be started. ' +
+      'Mirror and Receive are still available. For Extend mode, run install_vdd.ps1 ' +
+      'from an administrator PowerShell. Log: ' + LogPath,
+      mbError, MB_OK, IDOK);
+    exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    Log(Format('VDD installation failed with exit code %d.', [ResultCode]));
+    if WizardSilent then
+      RaiseException('Virtual display driver installation failed. See ' + LogPath);
+    SuppressibleMsgBox('Mivara was installed, but the virtual display driver could not ' +
+      'be installed. Mirror and Receive are still available. For Extend mode, review ' +
+      'the log and run install_vdd.ps1 from an administrator PowerShell. Log: ' + LogPath,
+      mbError, MB_OK, IDOK);
+    exit;
+  end;
+  Log('Virtual display driver installation completed.');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    InstallVirtualDisplayDriver;
+end;
 
 [Files]
 ; binaries + runtime DLL closure (sender_noUAC.exe is a local test artifact, never ship it)

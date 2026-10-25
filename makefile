@@ -251,11 +251,24 @@ $(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $
 	@echo "Built $(APP_BIN)"
 
 # Windows: copy the mingw64 runtime DLL closure (incl. FFmpeg) into bin/
+# Resolve the closure with objdump, not ldd: MSYS2's ldd debug-loads each target,
+# and CreateProcess on the requireAdministrator sender/app fails with
+# ERROR_ELEVATION_REQUIRED ("Permission denied"), so ldd silently reported
+# nothing for exactly the two binaries that need SDL2_ttf / the FFmpeg DLLs.
+# objdump reads the import tables recursively without executing anything.
 copy-dlls: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)
 	@echo "Copying runtime DLLs into $(BINDIR)/ ..."
-	@for d in $$(ldd $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) 2>/dev/null | \
-	              awk '/mingw64/{print $$3}' | sort -u); do \
-	    cp -n "$$d" $(BINDIR)/ 2>/dev/null || true; \
+	@queue="$(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)"; seen=""; \
+	while [ -n "$$queue" ]; do \
+	    set -- $$queue; f=$$1; shift; queue="$$*"; \
+	    for d in $$(objdump -p "$$f" 2>/dev/null | awk '/DLL Name/{print $$3}'); do \
+	        case " $$seen " in *" $$d "*) continue;; esac; \
+	        seen="$$seen $$d"; \
+	        if [ -f "/mingw64/bin/$$d" ]; then \
+	            cp -f "/mingw64/bin/$$d" "$(BINDIR)/" 2>/dev/null || true; \
+	        fi; \
+	        if [ -f "$(BINDIR)/$$d" ]; then queue="$$queue $(BINDIR)/$$d"; fi; \
+	    done; \
 	done
 	@echo "DLL closure updated"
 

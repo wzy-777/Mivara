@@ -584,10 +584,16 @@ static std::string           g_status_note;
 static std::vector<DiscoveredDevice> g_devices;
 static std::mutex                  g_dev_mtx;
 static std::atomic<bool>           g_searching{false};
-static std::atomic<bool>           g_search_done{false};
+static std::atomic<bool>           g_search_cancel{false};
 static std::atomic<int>            g_found_count{0};
 static std::atomic<unsigned long>  g_search_generation{0};
-static std::thread                  g_search_thread;
+static std::thread                 g_search_thread;
+struct SearchUpdate {
+    unsigned long generation = 0;
+    DiscoveredDevice device{"", 0};
+    bool finished = false;
+};
+static std::vector<SearchUpdate>   g_search_updates;
 
 /* update check (the worker + state live in update.cpp; the UI polls) */
 static bool   g_upd_auto_checked = false;   /* at most one auto check per launch */
@@ -2680,26 +2686,59 @@ static Screen resolveHomeScreen()
 /* ── actions ─────────────────────────────────────────────────────────────── */
 static void startSearch()
 {
-    if (g_searching.exchange(true)) return;      /* already running */
-    g_status_note.clear();       /* FOUND renders it as a launch error */
+    g_search_cancel = true;
     if (g_search_thread.joinable()) g_search_thread.join();
+    g_search_cancel = false;
+    g_status_note.clear();
+    g_searching = true;
     const unsigned long generation = ++g_search_generation;
-    g_search_done = false;
+    {
+        std::lock_guard<std::mutex> lk(g_dev_mtx);
+        g_devices.clear();
+        g_search_updates.clear();
+        g_found_count = 0;
+    }
     g_search_thread = std::thread([generation] {
-        auto found = discoverReceivers(5);
-        if (generation != g_search_generation.load()) {
-            g_searching = false;
-            return;
-        }
-        {
+        DiscoveryOptions options;
+        options.cancelled = &g_search_cancel;
+        options.onDevice = [generation](const DiscoveredDevice &device) {
             std::lock_guard<std::mutex> lk(g_dev_mtx);
-            g_devices = found;
-        }
-        g_found_count = (int)found.size();
-        g_searching = false;
-        g_search_done = true;
+            g_search_updates.push_back({generation, device, false});
+        };
+        discoverReceivers(5, options);
+        std::lock_guard<std::mutex> lk(g_dev_mtx);
+        g_search_updates.push_back({generation, DiscoveredDevice("", 0), true});
     });
     setScreen(SCR_SEARCHING);
+}
+
+static void processSearchUpdates()
+{
+    std::vector<SearchUpdate> updates;
+    {
+        std::lock_guard<std::mutex> lk(g_dev_mtx);
+        updates.swap(g_search_updates);
+    }
+    for (const SearchUpdate &update : updates) {
+        if (update.generation != g_search_generation.load()) continue;
+        if (!update.finished) {
+            {
+                std::lock_guard<std::mutex> lk(g_dev_mtx);
+                const bool duplicate = std::any_of(g_devices.begin(), g_devices.end(),
+                    [&](const DiscoveredDevice &d) {
+                        return d.ip_address == update.device.ip_address &&
+                               d.tcp_port == update.device.tcp_port;
+                    });
+                if (!duplicate) g_devices.push_back(update.device);
+                g_found_count = (int)g_devices.size();
+            }
+            if (g_screen == SCR_SEARCHING) setScreen(SCR_FOUND);
+            continue;
+        }
+        g_searching = false;
+        if (g_screen == SCR_SEARCHING)
+            setScreen(g_found_count > 0 ? SCR_FOUND : SCR_NOT_FOUND);
+    }
 }
 
 /* Take ip/name by value: history callers pass references into g_hist, and
@@ -2772,36 +2811,15 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     }
 #ifdef _WIN32
     /* Extend mode: the sender may append the receiver's exact resolution to
-     * the virtual display driver's vdd_settings.xml. That is a system
-     * configuration change, so ask once and remember the answer. */
+     * the virtual display driver's vdd_settings.xml. Enabled by default;
+     * `vdd_mode_write=never` in config.ini opts out (legacy "ask" is treated
+     * as always — the GUI no longer prompts). */
     if (extend) {
-        std::string addModes = "0";
-        if (g_cfg.vdd_mode_write == "always") {
-            addModes = "1";
-        } else if (g_cfg.vdd_mode_write == "never") {
-            addModes = "0";
-        } else {
-            int r = MessageBoxW(
-                nullptr,
-                L"扩展模式会把接收端的屏幕分辨率加入发送端的虚拟显示器配置\n"
-                L"(C:\\Windows\\System32\\drivers\\UMDF\\vdd_settings.xml)，\n"
-                L"使扩展屏按 1:1 显示、不会因比例不同而拉伸。\n"
-                L"若该尺寸已在列表中则不会修改文件。\n\n"
-                L"修改前会自动备份原文件；若虚拟显示设备正在运行，会重启它一次\n"
-                L"以加载新模式。\n\n"
-                L"允许修改吗？（选择会记住，可在 config.ini 的 vdd_mode_write\n"
-                L"中改为 ask / always / never）",
-                L"Mivara - 扩展屏分辨率",
-                /* Default = No: a System32 write needs a deliberate Yes. */
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-            addModes = (r == IDYES) ? "1" : "0";
-            g_cfg.vdd_mode_write = (r == IDYES) ? "always" : "never";
-            configSave(g_cfg);
-            logPush(std::string("[gui] vdd_settings.xml write: ") +
-                    (r == IDYES ? "allowed" : "denied"));
-        }
+        const bool allow = g_cfg.vdd_mode_write != "never";
         args.push_back("--vdd-add-modes");
-        args.push_back(addModes);
+        args.push_back(allow ? "1" : "0");
+        logPush(std::string("[gui] vdd_settings.xml write: ") +
+                (allow ? "enabled" : "disabled by config"));
     }
 #endif
     if (!spawnChild(g_sender, path, args)) {
@@ -3809,6 +3827,7 @@ static void onButton(int id)
 
     case BTN_SEARCH_CANCEL:
         ++g_search_generation;
+        g_search_cancel = true;
         g_searching = false;
         setScreen(SCR_HOME);
         break;
@@ -4271,9 +4290,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* async search completion */
-        if (g_search_done.exchange(false))
-            setScreen((g_found_count > 0) ? SCR_FOUND : SCR_NOT_FOUND);
+        processSearchUpdates();
 
         /* async update check / download completion (main thread only) */
         {
@@ -4368,6 +4385,7 @@ int main(int argc, char *argv[])
 
     if (g_search_thread.joinable()) {
         ++g_search_generation;
+        g_search_cancel = true;
         g_search_thread.join();
     }
     updateJoin();               /* abort + join any in-flight check/download */

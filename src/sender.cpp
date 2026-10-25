@@ -246,36 +246,56 @@ public:
                  int timeout_ms = CONNECTION_TIMEOUT_MS, bool quiet = false)
     {
         _quiet = quiet;
+        if (port < 1 || port > 65535 || timeout_ms < 0) return false;
         if (!create()) return false;
-
+#ifndef _WIN32
+        if (_s >= FD_SETSIZE) { close(); return false; }
+#endif
         struct sockaddr_in addr = {};
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons((uint16_t)port);
+        addr.sin_port = htons((uint16_t)port);
         if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
             if (!quiet)
                 std::cerr << COL_RED << "Invalid IP: " << ip << COL_RESET << "\n";
+            close();
             return false;
         }
-
-        /* Non-blocking connect with timeout */
 #ifdef _WIN32
-        u_long nb = 1; ioctlsocket(_s, FIONBIO, &nb);
+        u_long nb = 1;
+        if (ioctlsocket(_s, FIONBIO, &nb) != 0) { close(); return false; }
 #else
         int fl = fcntl(_s, F_GETFL, 0);
-        fcntl(_s, F_SETFL, fl | O_NONBLOCK);
-#endif
-        ::connect(_s, (struct sockaddr *)&addr, sizeof(addr));
-
-        fd_set fds; FD_ZERO(&fds); FD_SET(_s, &fds);
-        struct timeval tv = { timeout_ms / 1000,
-                              (timeout_ms % 1000) * 1000 };
-        bool ok = false;
-        if (select((int)_s + 1, nullptr, &fds, nullptr, &tv) == 1) {
-            int err = 0; socklen_t len = sizeof(err);
-            getsockopt(_s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
-            ok = (err == 0);
+        if (fl < 0 || fcntl(_s, F_SETFL, fl | O_NONBLOCK) < 0) {
+            close();
+            return false;
         }
-
+#endif
+        const int rc = ::connect(_s, (struct sockaddr *)&addr, sizeof(addr));
+        bool ok = rc == 0;
+        bool pending = false;
+        if (rc != 0) {
+#ifdef _WIN32
+            const int err = WSAGetLastError();
+            pending = err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
+#else
+            pending = errno == EINPROGRESS;
+#endif
+        }
+        if (pending) {
+            fd_set wr, ex;
+            FD_ZERO(&wr);
+            FD_ZERO(&ex);
+            FD_SET(_s, &wr);
+            FD_SET(_s, &ex);
+            timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+            if (select((int)_s + 1, nullptr, &wr, &ex, &tv) > 0 &&
+                FD_ISSET(_s, &wr)) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                ok = getsockopt(_s, SOL_SOCKET, SO_ERROR, (char *)&err, &len) == 0 &&
+                     err == 0;
+            }
+        }
 #ifdef _WIN32
         { u_long bl = 0; ioctlsocket(_s, FIONBIO, &bl); }
 #else
@@ -283,9 +303,10 @@ public:
 #endif
         if (!ok) {
             if (!quiet)
-                std::cerr << COL_RED << "Timeout: " << ip << ":"
+                std::cerr << COL_RED << "Timeout or connection error: " << ip << ":"
                           << port << COL_RESET << "\n";
-            close(); return false;
+            close();
+            return false;
         }
 
         int nd = 1, sb = SOCK_BUF;
@@ -368,83 +389,103 @@ public:
 #ifdef _WIN32
 static std::vector<uint8_t> captureScreen()
 {
-    std::vector<uint8_t> px(SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL, 0);
-    /* Always capture through the screen DC (GetDC(nullptr)) and offset by
-     * g_cap_origin.  A per-monitor CreateDC uses device coordinates which do
-     * NOT match the screen coordinates returned by GetCursorInfo /
-     * GetMonitorInfo under DPI scaling – that mismatch put the cursor draw
-     * position outside the frame on the extended (virtual) display.  The
-     * screen DC keeps capture + cursor in one single coordinate system, and
-     * CAPTUREBLT (layered windows) is only reliable here. */
+    const size_t width = (size_t)SCREEN_WIDTH;
+    const size_t height = (size_t)SCREEN_HEIGHT;
+    const size_t stride = (width * 3 + 3) & ~(size_t)3;
+    std::vector<uint8_t> px(width * height * 3, 0);
+    std::vector<uint8_t> dib(stride * height, 0);
     HDC sdc = GetDC(nullptr);
-    if (!sdc) return px;
-    HDC     mdc = CreateCompatibleDC(sdc);
+    if (!sdc) return {};
+    HDC mdc = CreateCompatibleDC(sdc);
+    if (!mdc) { ReleaseDC(nullptr, sdc); return {}; }
     HBITMAP bmp = CreateCompatibleBitmap(sdc, SCREEN_WIDTH, SCREEN_HEIGHT);
-    if (!bmp) {
+    HGDIOBJ old = nullptr;
+    const auto cleanup = [&] {
+        if (old && old != HGDI_ERROR) SelectObject(mdc, old);
+        if (bmp) DeleteObject(bmp);
         DeleteDC(mdc);
         ReleaseDC(nullptr, sdc);
-        return px;
+    };
+    if (!bmp) { cleanup(); return {}; }
+    old = SelectObject(mdc, bmp);
+    if (!old || old == HGDI_ERROR) { old = nullptr; cleanup(); return {}; }
+    if (!BitBlt(mdc, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, sdc,
+                g_cap_origin.x, g_cap_origin.y, SRCCOPY | CAPTUREBLT)) {
+        cleanup();
+        return {};
     }
-    SelectObject(mdc, bmp);
-    BitBlt(mdc, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, sdc,
-           g_cap_origin.x, g_cap_origin.y, SRCCOPY | CAPTUREBLT);
 
-    /* Draw the mouse cursor into the frame so it is visible on the receiver.
-     * This also implements pointer "handoff": when the user moves the cursor
-     * into the streamed monitor's area, the receiver shows it. */
-    CURSORINFO ci;
+    CURSORINFO ci = {};
     ci.cbSize = sizeof(ci);
-    bool haveCur = GetCursorInfo(&ci) != FALSE;
-
+    const bool haveCur = GetCursorInfo(&ci) != FALSE;
     if (haveCur && (ci.flags & CURSOR_SHOWING)) {
-        int cx = ci.ptScreenPos.x - g_cap_origin.x;
-        int cy = ci.ptScreenPos.y - g_cap_origin.y;
+        const int cx = ci.ptScreenPos.x - g_cap_origin.x;
+        const int cy = ci.ptScreenPos.y - g_cap_origin.y;
         if (cx >= 0 && cy >= 0 && cx < SCREEN_WIDTH && cy < SCREEN_HEIGHT) {
-            ICONINFO ii;
+            ICONINFO ii = {};
             if (GetIconInfo(ci.hCursor, &ii)) {
-                int cw = GetSystemMetrics(SM_CXCURSOR);
-                int ch = GetSystemMetrics(SM_CYCURSOR);
-                DrawIconEx(mdc, cx - ii.xHotspot, cy - ii.yHotspot,
-                           ci.hCursor, cw, ch, 0, NULL, DI_NORMAL);
-                if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+                DrawIconEx(mdc, cx - ii.xHotspot, cy - ii.yHotspot, ci.hCursor,
+                           GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR),
+                           0, NULL, DI_NORMAL);
+                if (ii.hbmMask) DeleteObject(ii.hbmMask);
                 if (ii.hbmColor) DeleteObject(ii.hbmColor);
             }
         }
     }
 
-    BITMAPINFOHEADER bi = {};
-    bi.biSize = sizeof(bi); bi.biWidth = SCREEN_WIDTH;
-    bi.biHeight = -SCREEN_HEIGHT;          /* top-down, no flip needed */
-    bi.biPlanes = 1; bi.biBitCount = 24; bi.biCompression = BI_RGB;
-    GetDIBits(mdc, bmp, 0, SCREEN_HEIGHT, px.data(),
-              (BITMAPINFO *)&bi, DIB_RGB_COLORS);
-    DeleteObject(bmp); DeleteDC(mdc);
-    ReleaseDC(nullptr, sdc);
-    /* GDI returns BGR; swap to RGB for network transmission */
-    for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++)
-        std::swap(px[i*3], px[i*3+2]);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = SCREEN_WIDTH;
+    bi.bmiHeader.biHeight = -SCREEN_HEIGHT;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 24;
+    bi.bmiHeader.biCompression = BI_RGB;
+    const UINT rows = GetDIBits(mdc, bmp, 0, (UINT)SCREEN_HEIGHT, dib.data(),
+                                &bi, DIB_RGB_COLORS);
+    cleanup();
+    if (rows != (UINT)SCREEN_HEIGHT) return {};
+    for (size_t y = 0; y < height; y++) {
+        const uint8_t *src = dib.data() + y * stride;
+        for (size_t x = 0; x < width; x++) {
+            const size_t di = (y * width + x) * 3;
+            px[di] = src[x * 3 + 2];
+            px[di + 1] = src[x * 3 + 1];
+            px[di + 2] = src[x * 3];
+        }
+    }
     return px;
 }
 
 #elif defined(__APPLE__)
 static std::vector<uint8_t> captureScreen()
 {
-    std::vector<uint8_t> px(SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL, 0);
     CGImageRef img = CGDisplayCreateImage(kCGDirectMainDisplay);
-    if (!img) return px;
-    CGDataProviderRef dp  = CGImageGetDataProvider(img);
-    CFDataRef         raw = CGDataProviderCopyData(dp);
-    if (!raw) { CGImageRelease(img); return px; }
+    if (!img) return {};
+    const size_t width = CGImageGetWidth(img);
+    const size_t height = CGImageGetHeight(img);
+    const size_t bpr = CGImageGetBytesPerRow(img);
+    const size_t bits = CGImageGetBitsPerPixel(img);
+    bool valid = width == (size_t)SCREEN_WIDTH && height == (size_t)SCREEN_HEIGHT &&
+                 bits >= 24 && bits % 8 == 0 && height > 0 &&
+                 bpr >= width * (bits / 8) && bpr <= SIZE_MAX / height;
+    CGDataProviderRef dp = valid ? CGImageGetDataProvider(img) : nullptr;
+    CFDataRef raw = dp ? CGDataProviderCopyData(dp) : nullptr;
+    if (!raw || (size_t)CFDataGetLength(raw) < bpr * height) {
+        if (raw) CFRelease(raw);
+        CGImageRelease(img);
+        return {};
+    }
     const uint8_t *src = CFDataGetBytePtr(raw);
-    size_t bpr = CGImageGetBytesPerRow(img);
-    size_t bpp = CGImageGetBitsPerPixel(img) / 8; /* usually 4: BGRA */
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            size_t si = y * bpr + x * bpp;
-            size_t di = ((size_t)y * SCREEN_WIDTH + x) * 3;
-            px[di+0] = src[si+2]; /* R */
-            px[di+1] = src[si+1]; /* G */
-            px[di+2] = src[si+0]; /* B */
+    if (!src) { CFRelease(raw); CGImageRelease(img); return {}; }
+    std::vector<uint8_t> px(width * height * 3, 0);
+    const size_t bpp = bits / 8;
+    for (size_t y = 0; y < height; y++) {
+        for (size_t x = 0; x < width; x++) {
+            const size_t si = y * bpr + x * bpp;
+            const size_t di = (y * width + x) * 3;
+            px[di] = src[si + 2];
+            px[di + 1] = src[si + 1];
+            px[di + 2] = src[si];
         }
     }
     CFRelease(raw);
@@ -1167,7 +1208,8 @@ int main(int argc, char* argv[])
      *   GUI asks the user and can switch it mid-session over stdin.
      *   Extend auto-probes the receiver and matches its display size; when
      *   that size is missing from the driver's settings file, --vdd-add-modes 1
-     *   appends it (the GUI sets it after an explicit user consent).
+     *   appends it (the GUI always sets it unless config.ini has
+     *   vdd_mode_write=never; the CLI stays opt-in).
      *   stitch is a software-KVM channel (kvm.h): it never captures or
      *   encodes anything and exits before the display-mode/VDD code below. */
     std::string cli_mode;                       /* empty = ask interactively */
@@ -1355,11 +1397,10 @@ int main(int argc, char* argv[])
             }
         }
 
-        /* Make sure the driver's mode list contains the target size.
-         * allowWrite is true only when the user (or the GUI, after an
-         * explicit consent) passed --vdd-add-modes 1. Without it the file
-         * is read but never modified; vddStartup then uses the closest
-         * advertised mode and the receiver letterboxes the difference. */
+        /* Make sure the driver's mode list contains the target size. The GUI
+         * enables writes unless vdd_mode_write=never; the CLI stays opt-in.
+         * Without write permission the closest advertised mode is used and
+         * the receiver letterboxes the difference. */
         const bool allowWrite = (cli_add_modes == 1);
         std::string mode_err;
         const VddModeResult mode_res =
@@ -1709,6 +1750,10 @@ int main(int argc, char* argv[])
 #endif
 
         auto frame = captureScreen();
+        if (frame.empty()) {
+            emitStatError("capture_failed_or_display_changed");
+            break;
+        }
 
         if (isCodedCodec()) {
             /* Coded: one access unit per frame, framed like any DATA packet */
