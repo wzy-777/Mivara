@@ -62,6 +62,24 @@ typedef int ports_sock_t;
     /** Return non-zero when the service should stop (NULL = never stop). */
     typedef int (*ports_stop_fn)(void);
 
+    /** Session authorization hook (see auth.h). The receiver installs one;
+     *  each client must present the 32-byte session token first. */
+    typedef int (*ports_token_check_fn)(const uint8_t *token, uint32_t len);
+    void ports_service_set_token_check(ports_token_check_fn fn);
+
+    /** Real startup result of the 8083 listener, for the receiver's status
+     *  line: state 0 = starting, 1 = listening, -1 = failed;
+     *  stage 0 = none, 1 = socket, 2 = winsock, 3 = bind, 4 = listen;
+     *  error_code is the native errno / WSA error (0 when not failed). */
+    typedef struct ports_startup_status
+    {
+        int      state;
+        int      stage;
+        int      error_code;
+        uint16_t port;
+    } ports_startup_status;
+    ports_startup_status ports_service_status(void);
+
 /* Socket states (mirrors Linux TCP states, mapped on other platforms) */
 #define PSTATE_ESTABLISHED 1
 #define PSTATE_SYN_SENT 2
@@ -120,8 +138,11 @@ typedef int ports_sock_t;
 
     /* ─── Sender-side (client) API ────────────────────────────────── */
 
-    /** Connect to the receiver's port service. Returns socket or PORTS_INVALID_SOCK. */
-    ports_sock_t ports_remote_connect(const char *receiver_ip);
+    /** Connect to the receiver's port service. Returns socket or
+     *  PORTS_INVALID_SOCK. `token` is the 32-byte session token from the v3
+     *  handshake; the service refuses the connection without it. */
+    ports_sock_t ports_remote_connect(const char *receiver_ip,
+                                      const uint8_t *token);
 
     /** List all TCP ports on the receiver.
      *  Caller must free(*entries) with ports_free_entries(). Returns count or -1. */

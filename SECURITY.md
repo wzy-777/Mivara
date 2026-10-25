@@ -6,9 +6,9 @@ Mivara（幻屏）是一个仅限局域网使用的投屏工具。本文说明�
 
 ## Supported Versions / 支持版本
 
-Security fixes are provided for the **0.10.x** release line only. Older releases receive no fixes; upgrade to the latest release before reporting an issue.
+Security fixes are provided for the **0.11.x** release line only. Older releases receive no fixes; upgrade to the latest release before reporting an issue.
 
-仅对 **0.10.x** 版本线提供安全修复。更早的版本不再修复；报告问题前请先升级到最新版本。
+仅对 **0.11.x** 版本线提供安全修复。更早的版本不再修复；报告问题前请先升级到最新版本。
 
 ## Reporting a Vulnerability / 报告漏洞
 
@@ -33,14 +33,16 @@ The following are **design limitations of a LAN-only tool, not vulnerabilities b
 
 以下是这类仅限局域网工具**固有的设计取舍，本身不构成安全漏洞**。除非能证明超出下述范围的具体影响，否则仅依赖这些取舍的报告不在受理范围内。
 
-- **No transport encryption or peer authentication.** TCP 8081 (video), 8082 (RLE compute offload), 8083 (port inspector) and 8084 (stitch KVM) are plaintext and unauthenticated. SSDP discovery uses unauthenticated UDP 1900. Anyone who can reach these ports on the LAN can talk to them.
-- **无传输加密、无对端认证。** TCP 8081（视频）、8082（RLE 计算卸载）、8083（端口检查）与 8084（拼接 KVM）均为明文且不验证对端身份；SSDP 发现使用无认证的 UDP 1900。局域网内任何能访问这些端口的设备都可以与之通信。
-- **8081 has no pairing or local consent.** Any reachable peer can start a video session and supply fullscreen content; only use the receiver on a trusted private LAN.
-- **8081 没有配对或本机确认。** 任何可达对端都能建立视频会话并投放全屏内容；请只在可信的专用局域网内启动接收端。
-- **8083 accepts LIST/GET/KILL from any reachable peer** and can terminate receiver-side processes. Keep it on a trusted LAN only.
-- **8083 接受任何可达对端的 LIST/GET/KILL**，可终止接收端进程。请仅在可信局域网内使用。
-- **8084 injects keyboard and mouse input.** The target shows a per-session topmost consent dialog (default No, 30 s auto-dismiss); an explicit refusal suppresses prompts from that source IP for 60 s. There is no encryption and no peer authentication, so this human confirmation is the only gate.
-- **8084 注入键盘与鼠标输入。** 接收端每次会话都会弹出置顶的人工确认框（默认「否」，30 秒自动关闭）；明确拒绝后 60 秒内不再对该源 IP 弹窗。由于没有加密也没有对端认证，这次人工确认就是唯一的关卡。
+- **No transport encryption.** TCP 8081 (video + authorization), 8082 (RLE compute offload), 8083 (port inspector) and 8084 (stitch KVM) are plaintext, and the sender does not verify the receiver's identity. SSDP discovery uses unauthenticated UDP 1900. Anyone who can reach these ports on the LAN can talk to them and can read the traffic.
+- **无传输加密。** TCP 8081（视频 + 授权）、8082（RLE 计算卸载）、8083（端口检查）与 8084（拼接 KVM）均为明文，且发送端不验证接收端身份；SSDP 发现使用无认证的 UDP 1900。局域网内任何能访问这些端口的设备都可以与之通信并读取流量。
+- **8081 admission control is receiver-side only.** The receiver applies open / password / manual approval; a new install defaults to manual approval, and "allow any connection" is an explicit opt-in. This decides *who may start a session*; it does not encrypt the picture, and it does not authenticate the receiver to the sender.
+- **8081 的准入控制仅在接收端。** 接收端执行「任意 / 密码 / 手动授权」策略，新装默认手动授权，「允许任意连接」需显式选择。它只决定**谁可以建立会话**，不加密画面，也不向发送端证明接收端身份。
+- **The connection password is a short admission secret, not a strong key.** It is 4–8 printable ASCII characters and only meant to gate a trusted LAN. Letters are matched case-insensitively: A–Z are folded to a–z before PBKDF2, which lowers each letter from about 5.7 to 4.7 bits and shrinks an 8-character password's search space by up to 256×. The receiver stores a PBKDF2 record and never receives the plaintext; the proof is domain-separated per port (8081 vs 8084), binds a fresh nonce and the exact request bytes, and new records use 300,000 PBKDF2 iterations (existing records keep the count they were created with). Online guessing is throttled per source across both ports. Two limitations remain by design: a device that captures a challenge and proof can brute-force a short password offline, and a leaked `config.ini` is credential-equivalent — a symmetric verifier cannot prevent either. Moving to an audited aPAKE is the long-term fix; this release does not claim one.
+- **连接密码是短准入口令，不是强密钥。** 密码为 4–8 个可打印 ASCII 字符，仅用于可信局域网内的准入。字母不区分大小写：PBKDF2 前会把 A–Z 折叠为 a–z，每个字母的信息量约从 5.7 bit 降到 4.7 bit，8 字符密码的搜索空间最多缩小 256 倍。接收端只保存 PBKDF2 记录、永不接触明文；证明按端口用途分离（8081 与 8084 不同），绑定每次新生成的随机数与完整请求字节；新设置的密码使用 300000 次 PBKDF2 迭代（旧记录保留创建时的次数）。在线猜测在 8081/8084 间共享按来源节流。仍有两项设计内限制：截获挑战与证明的设备可离线暴力破解短密码；`config.ini` 泄露等价于凭据泄露——对称校验记录无法避免这两点。长期方案是迁移到经过审计的 aPAKE，本版本不作此宣称。
+- **8082/8083 token gate.** Both services require the 32-byte token of the current authorized 8081 session, read it on connect and **re-check it before every request** (including before 8083's port listing and kill). The token is cleared when the session ends, so an already-open sidecar connection loses access on its next request and a new connection with the old token is refused. The token travels in the clear, so a LAN peer that can sniff the live session can replay it while that session lives. Neither service is encrypted.
+- **8082/8083 的令牌门。** 两个服务都要求当前已授权 8081 会话的 32 字节令牌：建连时读取一次，并在**每个请求前重新校验**（包括 8083 的端口列举与结束进程之前）。会话结束即清空令牌，因此已建立的旁路连接会在下一次请求时失去权限，携带旧令牌的新连接会被拒绝。令牌明文传输，能窃听该会话的局域网设备可在会话存续期间重放。两者均不加密。
+- **8084 injects keyboard and mouse input.** It obeys the same 8081 policy (open / password / manual; manual by default) and adds no second confirmation. 8081 and 8084 share one active-session slot: while either port has a session, the other answers BUSY, and an unauthenticated handshake never holds the slot. Manual approval is serialized across both ports (one prompt at a time; a second device gets BUSY). Under manual approval the target shows a prompt (default deny, 30 s timeout). Only an explicit refusal suppresses prompts from that source IP for 60 s — a timeout, peer disconnect, prompt failure or a late allow after the deadline releases the slot without arming the cooldown. The channel is unencrypted, so authorization is the only gate.
+- **8084 注入键盘与鼠标输入。** 它与 8081 使用同一策略（任意 / 密码 / 手动，默认手动），不再额外增加一次确认。8081 与 8084 共用一个活动会话槽：任一端有会话时，另一端返回 BUSY；未认证的握手不会占住该槽。手动授权在两个端口间串行（同一时刻只有一个弹窗；第二个设备返回 BUSY）。手动授权时接收端弹窗（默认拒绝，30 秒超时）。只有**明确拒绝**才会在 60 秒内抑制该源 IP 的弹窗——超时、对端断开、弹窗失败或超过截止时间的“允许”都会直接释放槽位，不写冷却。通道不加密，因此授权就是唯一关卡。
 - **Elevation.** `sender` and `app` embed a `requireAdministrator` manifest. A `receiver` launched by the GUI inherits that elevated token and can inject into elevated windows; a standalone `receiver.exe` is unelevated, and UIPI blocks injection into higher-integrity windows.
 - **权限提升。** `sender` 与 `app` 内嵌 `requireAdministrator` 清单。由 GUI 启动的 `receiver` 会继承该管理员令牌，因而能向高权限窗口注入输入；独立运行的 `receiver.exe` 未被提升，受 UIPI 限制无法向更高完整性级别的窗口注入。
 - **Virtual display (VDD) settings file.** In extend mode the sender appends a missing receiver resolution to `vdd_settings.xml` by default, using a backup plus validated replace, and it refuses to modify the file while any VDD CCD path is active. Set `vdd_mode_write=never` in `config.ini` to forbid the write entirely (the GUI does not offer this toggle).
@@ -50,13 +52,13 @@ The following are **design limitations of a LAN-only tool, not vulnerabilities b
 
 ## Out of Scope / 不在受理范围
 
-- Using a documented unauthenticated service on a trusted LAN (see Threat Model above).
+- Using a documented plaintext service, or the explicit "allow any connection" policy, on a trusted LAN (see Threat Model above).
 - Resource-exhaustion denial of service.
 - Attacks requiring physical access to a device.
 - Issues in unsupported versions.
 - Social engineering.
 - Issues that require an already-compromised host.
-- 在可信局域网内使用文档中已说明的无认证服务（见上文威胁模型）。
+- 在可信局域网内使用文档中已说明的明文服务，或显式选择「允许任意连接」策略（见上文威胁模型）。
 - 资源耗尽型拒绝服务。
 - 需要物理接触设备的攻击。
 - 不受支持版本中的问题。

@@ -1,4 +1,20 @@
 $ErrorActionPreference = 'Stop'
+
+# Inno Setup is a 32-bit process, so the installer (and any 32-bit shell) starts
+# this script with 32-bit PowerShell. There %SystemRoot%\System32 is redirected
+# to SysWOW64, where pnputil.exe does not exist, and the driver store cannot be
+# written correctly. Re-launch under 64-bit PowerShell through Sysnative (the
+# alias that is only visible to 32-bit processes) and forward the exit code.
+if (-not [Environment]::Is64BitProcess) {
+    $ps64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $ps64 -PathType Leaf)) {
+        Write-Host 'VDD installation failed: 64-bit PowerShell is required.' -ForegroundColor Red
+        exit 1
+    }
+    & $ps64 -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PSCommandPath @args
+    exit $LASTEXITCODE
+}
+
 $root = $PSScriptRoot
 $logPath = Join-Path $root 'install_log.txt'
 $transcribing = $false
@@ -16,7 +32,8 @@ function Invoke-Native {
 }
 
 function Get-MivaraVddDevice {
-    return @(Get-PnpDevice -HardwareId 'Root\MttVDD', 'MttVDD' -ErrorAction SilentlyContinue)
+    return @(Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.HardwareID -contains 'Root\MttVDD' -or $_.HardwareID -contains 'MttVDD' })
 }
 
 try {
@@ -49,7 +66,7 @@ try {
 
     Write-Output '=== 2. Ensure the Root\MttVDD device exists ==='
     if ((Get-MivaraVddDevice).Count -eq 0) {
-        Invoke-Native $devcon @('create', '@Root\MttVDD')
+        Invoke-Native $devcon @('install', $inf, 'Root\MttVDD')
     } else {
         Write-Output 'Existing MttVDD device found; skipping device creation.'
     }

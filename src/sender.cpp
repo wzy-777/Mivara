@@ -37,10 +37,12 @@
 
 #include <iostream>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <csignal>
 #include <chrono>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -48,6 +50,7 @@
 #include <fstream>
 #include <cstdint>
 #include <algorithm>
+#include "auth.h"
 #include "discover.h"
 #include "gpu_accelerate.h"
 #include "kvm.h"
@@ -152,6 +155,64 @@ static std::mutex        g_setp_mtx;
 static std::string       g_pending_setp;
 static std::string       g_recv_ip;    /* receiver address (RLE 8082 lifecycle) */
 
+static std::atomic<bool> g_running{true};
+
+/* ── v3 authorization ──────────────────────────────────────────────────────
+ * The password arrives on stdin (never on the command line) and is only kept
+ * in memory for the duration of one handshake. The derived key is not stored:
+ * the sender recomputes PBKDF2 from the receiver's salt and the typed
+ * password, then answers the nonce with an HMAC proof. */
+static std::mutex              g_auth_mtx;
+static std::condition_variable g_auth_cv;
+static std::string             g_auth_password;
+static bool                    g_auth_password_ready = false;
+static bool                    g_auth_cancelled = false;
+static std::atomic<bool>       g_auth_awaiting{false};
+
+/* Session token issued by the receiver; 8082/8083 require it. */
+static uint8_t g_session_token[HS_TOKEN_BYTES] = {};
+static bool    g_session_token_valid = false;
+
+/* This machine's display name, sent in HsRequestExtV3. */
+static std::string g_device_name;
+
+static int64_t steadyMs()
+{
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/* Wait for AUTH|password=… from the GUI (or a terminal line). Bounded so a
+ * forgotten prompt cannot pin the process forever. */
+static bool takePassword(std::string &pw)
+{
+    std::unique_lock<std::mutex> lk(g_auth_mtx);
+    g_auth_awaiting = true;
+    /* A cancel sent for an earlier prompt (or after it already finished) must
+     * not abort this one before the user can type. */
+    g_auth_cancelled = false;
+    const int64_t deadline = steadyMs() + 120000;
+    bool ok = false;
+    while (!g_auth_password_ready && !g_auth_cancelled) {
+        if (!g_running || steadyMs() > deadline) break;
+        g_auth_cv.wait_for(lk, std::chrono::milliseconds(250));
+    }
+    if (g_auth_password_ready) {
+        pw.swap(g_auth_password);
+        g_auth_password_ready = false;
+        ok = true;
+    }
+    /* The static hand-off buffer must not keep a plaintext password, whether
+     * it was just retired by the swap or arrived after the wait gave up. */
+    if (!g_auth_password.empty()) {
+        mivaraSecureZero(&g_auth_password[0], g_auth_password.size());
+        g_auth_password.clear();
+    }
+    g_auth_awaiting = false;
+    return ok;
+}
+
 #ifdef _WIN32
 /* True-Extend mode: capture a specific monitor instead of the primary.
  * g_cap_device empty  -> legacy primary-screen capture (GetDC(nullptr))
@@ -160,8 +221,6 @@ static std::string       g_recv_ip;    /* receiver address (RLE 8082 lifecycle) 
 static std::string g_cap_device;
 static POINT       g_cap_origin = {0, 0};   /* monitor origin in virtual desktop */
 #endif
-
-static std::atomic<bool> g_running{true};
 
 /* GPU offload */
 static gpu_sock_t g_gpu_sock   = GPU_INVALID_SOCK;
@@ -380,6 +439,32 @@ public:
             got += (size_t)n;
         }
         return true;
+    }
+
+    /* Like recvAll, but tells an idle timeout apart from a dead transport.
+     * Returns 1 on a full read, 0 when the peer sent nothing before the
+     * timeout expired, -1 when the connection closed or failed (including a
+     * timeout in the middle of the chunk). Used for the first handshake frame
+     * so "no response" and "connection dropped" stay distinguishable. */
+    int recvAllEx(void *data, size_t size) {
+        char *p = (char *)data;
+        size_t got = 0;
+        while (got < size) {
+            int n = (int)recv(_s, p + got, (int)(size - got), 0);
+            if (n > 0) { got += (size_t)n; continue; }
+            if (n == 0) return -1;
+#ifdef _WIN32
+            const int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK)
+                return got == 0 ? 0 : -1;
+#else
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return got == 0 ? 0 : -1;
+#endif
+            return -1;
+        }
+        return 1;
     }
 };
 
@@ -831,6 +916,30 @@ static void stdinReaderLoop()
     std::string line;
     while (std::getline(std::cin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("AUTH|", 0) == 0) {
+            /* AUTH|password=… from the GUI. The value is taken verbatim (it
+             * may contain '=' or spaces); the app validates the rule. */
+            std::string body = line.substr(5);
+            if (body.rfind("password=", 0) == 0) {
+                {
+                    std::lock_guard<std::mutex> lk(g_auth_mtx);
+                    std::string next = body.substr(9);
+                    g_auth_password.swap(next);   /* retired value stays in next */
+                    mivaraSecureZero(&next[0], next.size());
+                    g_auth_password_ready = true;
+                    g_auth_cancelled = false;
+                    g_auth_cv.notify_all();
+                }
+                /* Only the hand-off buffer keeps the secret now. */
+                mivaraSecureZero(&body[0], body.size());
+                mivaraSecureZero(&line[0], line.size());
+            } else if (body == "cancel") {
+                std::lock_guard<std::mutex> lk(g_auth_mtx);
+                g_auth_cancelled = true;
+                g_auth_cv.notify_all();
+            }
+            continue;
+        }
         if (line.rfind("SETP|", 0) == 0) {
             std::lock_guard<std::mutex> lk(g_setp_mtx);
             g_pending_setp = line;              /* last-wins */
@@ -844,6 +953,28 @@ static void stdinReaderLoop()
             }
         } else if (line == "PING") {
             std::cout << "STAT|event=pong\n" << std::flush;
+        } else if (line == "STOP|mivara") {
+            /* GUI 停止 / 退出. Console control events are not delivered to a
+             * child console on current Windows (the app's report), so the
+             * owner asks over this pipe instead: leave the loop and let the
+             * normal cleanup (stats flush, VDD teardown) run. The token is
+             * longer than the 8-character password rule, so it can never be
+             * mistaken for a password typed at the interactive prompt. */
+            std::cout << "Stop requested by GUI\n" << std::flush;
+            g_running = false;
+        } else if (g_auth_awaiting.load() && !line.empty()) {
+            /* Interactive (no GUI): the line typed at the prompt is the
+             * password. */
+            {
+                std::lock_guard<std::mutex> lk(g_auth_mtx);
+                std::string next = line;
+                g_auth_password.swap(next);
+                mivaraSecureZero(&next[0], next.size());
+                g_auth_password_ready = true;
+                g_auth_cancelled = false;
+                g_auth_cv.notify_all();
+            }
+            mivaraSecureZero(&line[0], line.size());
         }
     }
 }
@@ -866,9 +997,10 @@ static bool takePendingSetp(std::string &out)
 static void gpuOffloadConnect()
 {
     if (GPU_SOCK_VALID(g_gpu_sock) || g_recv_ip.empty()) return;
+    if (!g_session_token_valid) return;   /* 8082 needs the session token */
     std::cout << COL_MAGENTA << "GPU offload: " << g_recv_ip << ":"
               << GPU_ACCEL_PORT << " ...\n" << COL_RESET;
-    g_gpu_sock = gpu_remote_connect(g_recv_ip.c_str());
+    g_gpu_sock = gpu_remote_connect(g_recv_ip.c_str(), g_session_token);
     if (GPU_SOCK_VALID(g_gpu_sock)) {
         g_gpu_active = true;
         std::cout << COL_GREEN << "Remote compute (CPU offload) active\n" << COL_RESET;
@@ -931,7 +1063,8 @@ static bool probeReceiverDisplay(const std::string &ip, int port,
     if (!probe.recvAll(&res, sizeof(res)))
         return false;
     if (ntohl(res.magic) != TVHS_MAGIC ||
-        ntohl(res.version) != TVHS_VERSION)
+        ntohl(res.version) != TVHS_VERSION ||
+        ntohl(res.status) != HS_ERR_DIMS)
         return false;
 
     int rw = (int)ntohl(res.recv_width);
@@ -972,6 +1105,11 @@ static const char *hsStatusMsg(uint32_t st)
     case HS_ERR_DIMS:    return "receiver rejected the stream dimensions";
     case HS_ERR_DECODER: return "receiver has no decoder for this codec";
     case HS_ERR_LEGACY:  return "peer is a legacy Mivara build — please update both Mivara ends";
+    case HS_ERR_BUSY:    return "对方忙：接收端已有连接";
+    case HS_ERR_AUTH:    return "连接密码错误";
+    case HS_ERR_AUTH_TIMEOUT: return "对方未在 30 秒内处理授权请求";
+    case HS_ERR_DENIED:  return "对方拒绝了本次连接";
+    case HS_ERR_AUTH_CONFIG: return "接收端授权配置异常";
     default:             return "unknown handshake error";
     }
 }
@@ -984,8 +1122,220 @@ static const char *hsStatusToken(uint32_t st)
     case HS_ERR_DIMS:    return "dims_rejected";
     case HS_ERR_DECODER: return "decoder_unavailable";
     case HS_ERR_LEGACY:  return "legacy_peer";
+    case HS_ERR_BUSY:    return "peer_busy";
+    case HS_ERR_AUTH:    return "bad_password";
+    case HS_ERR_AUTH_TIMEOUT: return "auth_timeout";
+    case HS_ERR_DENIED:  return "auth_denied";
+    case HS_ERR_AUTH_CONFIG: return "auth_config";
     default:             return "handshake_rejected";
     }
+}
+
+/* This machine's name for the receiver's approval dialog. */
+static std::string localDeviceName()
+{
+    char host[256] = {0};
+    if (gethostname(host, sizeof(host) - 1) != 0 || host[0] == '\0')
+        return "Mivara";
+    host[sizeof(host) - 1] = '\0';
+    std::string s(host);
+    if (s.size() > 31) s.resize(31);
+    return s;
+}
+
+static void emitAuthStat(const char *state, const std::string &extra = std::string())
+{
+    std::cout << "STAT|event=auth|state=" << state;
+    if (!extra.empty()) std::cout << "|" << extra;
+    std::cout << "\n" << std::flush;
+}
+
+/* 拼接 (8084) authorization hooks: the same password prompt and progress
+ * lines as the 8081 handshake, so the GUI shows one password modal and one
+ * wait state no matter which channel is being authorized. */
+static bool kvmPasswordHook(std::string *out, void *ctx)
+{
+    (void)ctx;
+    return takePassword(*out);
+}
+
+static void kvmReportHook(const char *state, const char *extra, void *ctx)
+{
+    (void)ctx;
+    emitAuthStat(state, extra ? std::string(extra) : std::string());
+}
+
+/* Result of the v3 authorization exchange (see proto.h). */
+struct HsOutcome {
+    uint32_t status     = HS_ERR_LEGACY;
+    bool     no_response = false;  /* peer sent nothing / not a handshake */
+    bool     transport   = false;  /* connection died mid-exchange        */
+    bool     legacy      = false;  /* peer answered with another version  */
+    bool     protocol_error = false; /* same-version peer broke the protocol */
+    bool     cancelled   = false;  /* user dismissed the password prompt  */
+    uint32_t peer_version = 0;     /* HsResponseV2.version as received    */
+    int      recv_w = 0, recv_h = 0;
+    bool     have_token = false;
+    uint8_t  token[HS_TOKEN_BYTES] = {};
+};
+
+/* v3 handshake: request → challenge → identity (+ proof) → response → token.
+ * A receiver that refuses before the challenge answers with the bare
+ * HsResponseV2, so its `version` decides what happened: the current version
+ * is a same-version refusal (BUSY, corrupt auth config, ...) whose status must
+ * be reported verbatim; any other version is a peer running an incompatible
+ * protocol (`legacy`, update hint). A timeout with no bytes is `no_response`,
+ * a transport that dies mid-frame is `transport`. The socket's recv timeout
+ * must be set by the caller. */
+static HsOutcome handshakeV3(NetworkSocket &conn, const HsRequestV2 &hs_out)
+{
+    HsOutcome out;
+
+    if (!conn.sendAll(&hs_out, sizeof(hs_out))) {
+        out.transport = true;
+        return out;
+    }
+
+    uint32_t magic = 0;
+    const int first = conn.recvAllEx(&magic, sizeof(magic));
+    if (first != 1) {
+        if (first == 0) out.no_response = true;  /* idle timeout: mute peer */
+        else            out.transport = true;    /* closed / truncated frame */
+        return out;
+    }
+    magic = ntohl(magic);
+
+    if (magic == TVHS_MAGIC) {          /* refusal or reply before a challenge */
+        HsResponseV2 res = {};
+        res.magic = htonl(magic);
+        if (!conn.recvAll((uint8_t *)&res + sizeof(magic),
+                          sizeof(res) - sizeof(magic))) {
+            out.transport = true;
+            return out;
+        }
+        const uint32_t peer_version = ntohl(res.version);
+        out.peer_version = peer_version;
+        out.recv_w = (int)ntohl(res.recv_width);
+        out.recv_h = (int)ntohl(res.recv_height);
+        out.status = ntohl(res.status);
+        if (peer_version == TVHS_VERSION) {
+            /* Same protocol: the receiver refused before the challenge
+             * (BUSY, AUTH_CONFIG, ...). Keep its status so the caller can
+             * show the real reason instead of a bogus update hint. HS_OK
+             * here would mean "authorized without any challenge", which is
+             * a protocol violation – fail closed before reading a token. */
+            if (out.status == HS_OK) out.protocol_error = true;
+            return out;
+        }
+        out.legacy = true;              /* peer speaks another version */
+        out.status = HS_ERR_VERSION;
+        return out;
+    }
+    if (magic != TVHA_MAGIC) {          /* not a Mivara handshake at all */
+        out.no_response = true;
+        return out;
+    }
+
+    HsAuthStart as = {};
+    as.magic = htonl(magic);
+    if (!conn.recvAll((uint8_t *)&as + sizeof(magic),
+                      sizeof(as) - sizeof(magic))) {
+        out.transport = true;
+        return out;
+    }
+    /* The challenge carries its own protocol generation. A mismatch (e.g. a
+     * build using the old proof formula) is a version problem, not a bad
+     * password: fail before sending an identity frame no one can verify. */
+    if (ntohl(as.version) != TVHA_VERSION) {
+        out.status = HS_ERR_VERSION;
+        out.legacy = true;
+        return out;
+    }
+    const uint32_t mode = ntohl(as.mode);
+
+    /* Our identity, shown by the receiver in its approval dialog. */
+    HsRequestExtV3 ext = {};
+    ext.magic   = htonl(TVHX_MAGIC);
+    ext.version = htonl(TVHA_VERSION);
+    std::snprintf(ext.device, sizeof(ext.device), "%s", g_device_name.c_str());
+    if (!conn.sendAll(&ext, sizeof(ext))) {
+        out.transport = true;
+        return out;
+    }
+
+    if (mode == AUTH_MODE_PASSWORD) {
+        const uint32_t iter = ntohl(as.kdf_iter);
+        if (iter < HS_KDF_ITER_MIN || iter > HS_KDF_ITER_MAX) {
+            out.status = HS_ERR_AUTH_CONFIG;
+            return out;
+        }
+        emitAuthStat("need_password");
+        std::string pw;
+        if (!takePassword(pw)) {
+            out.cancelled = true;
+            return out;
+        }
+        uint8_t key[32];
+        mivaraPasswordKey(pw, as.salt, sizeof(as.salt), iter, key);
+        mivaraSecureZero(&pw[0], pw.size());
+        pw.clear();
+
+        /* The proof binds the exact wire bytes of both requests, so it can
+         * neither be replayed (fresh nonce) nor reused for other parameters. */
+        uint8_t bound[sizeof(HsRequestV2) + sizeof(HsRequestExtV3)];
+        std::memcpy(bound, &hs_out, sizeof(hs_out));
+        std::memcpy(bound + sizeof(hs_out), &ext, sizeof(ext));
+        HsAuthProof proof = {};
+        proof.magic   = htonl(TVHA_MAGIC);
+        proof.version = htonl(TVHA_VERSION);
+        mivaraAuthProof(key, MIVARA_AUTH_PURPOSE_VIDEO, as.nonce, bound,
+                        sizeof(bound), proof.proof);
+        mivaraSecureZero(key, sizeof(key));
+
+        emitAuthStat("authenticating");
+        if (!conn.sendAll(&proof, sizeof(proof))) {
+            out.transport = true;
+            return out;
+        }
+    } else if (mode == AUTH_MODE_MANUAL) {
+        /* The receiver user gets up to 30 s to answer the dialog. */
+        emitAuthStat("waiting", "timeout=30");
+    }
+    /* AUTH_MODE_OPEN has no sender-side round trip. */
+
+    conn.setRecvTimeout(mode == AUTH_MODE_MANUAL ? 60000 : 30000);
+
+    HsResponseV2 res = {};
+    if (!conn.recvAll(&res, sizeof(res))) {
+        out.transport = true;
+        return out;
+    }
+    out.status = ntohl(res.status);
+    out.recv_w = (int)ntohl(res.recv_width);
+    out.recv_h = (int)ntohl(res.recv_height);
+    if (ntohl(res.magic) != TVHS_MAGIC) {
+        out.protocol_error = true;      /* not a Mivara handshake response */
+        return out;
+    }
+    const uint32_t peer_version = ntohl(res.version);
+    if (peer_version != TVHS_VERSION) {
+        out.legacy = true;
+        out.peer_version = peer_version;
+        out.status = HS_ERR_VERSION;
+        return out;
+    }
+    if (out.status != HS_OK) return out;
+
+    HsResponseExtV3 grant = {};
+    if (!conn.recvAll(&grant, sizeof(grant)) ||
+        ntohl(grant.magic) != TVHR_MAGIC ||
+        ntohl(grant.version) != TVHA_VERSION) {
+        out.transport = true;
+        return out;
+    }
+    std::memcpy(out.token, grant.token, sizeof(out.token));
+    out.have_token = true;
+    return out;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1344,8 +1694,11 @@ int main(int argc, char* argv[])
         /* The GUI switches sides with STITCH|side=… lines on stdin. Stitch
          * returns before the streaming path starts its own reader. */
         startStdinReader();
+        KvmClientAuth kvm_auth = {};
+        kvm_auth.password = kvmPasswordHook;
+        kvm_auth.report = kvmReportHook;
         const int rc = kvmRunController(sel.ip_address.c_str(), KVM_PORT,
-                                        cli_stitch_side, g_running);
+                                        cli_stitch_side, g_running, &kvm_auth);
         cleanupSockets();
         return rc == 0 ? 0 : 1;
     }
@@ -1428,90 +1781,132 @@ int main(int argc, char* argv[])
     }
 #endif
 
-    /* Remote compute offload (8082) is only used by the RLE path – connecting
-     * it for RAW or coded streams would traverse the LAN twice for nothing. */
     g_recv_ip = sel.ip_address;
+
+    /* The authorization exchange may ask the GUI for a password over stdin,
+     * so the reader has to be live before the handshake. Every interactive
+     * prompt above is finished, so it cannot swallow their input. */
+    startStdinReader();
+
+    /* Connect stream socket */
+    NetworkSocket conn;
+    if (!conn.connect(sel.ip_address, sel.tcp_port)) {
+        emitStatError("connect_failed");
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+
+    /* ── Handshake v3 (proto.h): request → auth challenge → response + token ── */
+    g_device_name = localDeviceName();
+    HsRequestV2 hs_out = makeHsRequest(SCREEN_WIDTH, SCREEN_HEIGHT);
+    conn.setRecvTimeout(30000);
+    const HsOutcome hs = handshakeV3(conn, hs_out);
+    if (hs.cancelled) {
+        /* The user dismissed the password prompt: not an error worth a popup. */
+        std::cout << COL_YELLOW << "Authorization cancelled\n" << COL_RESET;
+        emitAuthStat("cancelled");
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (hs.no_response) {
+        /* Nothing came back before the timeout, or the first bytes were not a
+         * Mivara handshake at all. Distinct from "old version" and "peer
+         * dropped the connection". */
+        std::cerr << COL_RED
+                  << "接收端无响应（接收服务未启动、被防火墙拦截或网络不可达）\n"
+                  << COL_RESET;
+        emitStatError("no_response");
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (hs.protocol_error) {
+        std::cerr << COL_RED << "接收端握手应答异常（协议不兼容）\n"
+                  << COL_RESET;
+        emitStatError("protocol_error");
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (hs.transport) {
+        std::cerr << COL_RED << "Connection lost during authorization\n"
+                  << COL_RESET;
+        emitStatError("auth_failed");
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (hs.legacy) {
+        /* Only a genuinely different protocol version lands here; a
+         * same-version refusal keeps its own status and is handled below. */
+        if (hs.peer_version > TVHS_VERSION) {
+            std::cerr << COL_RED
+                      << "Handshake refused – the receiver speaks a newer "
+                         "protocol (v" << hs.peer_version
+                      << "); please update this sender\n"
+                      << COL_RESET;
+            emitStatError("version_mismatch");
+        } else {
+            std::cerr << COL_RED
+                      << "Handshake refused – the peer is a legacy Mivara build "
+                         "without connection authorization; please update both "
+                         "Mivara ends\n"
+                      << COL_RESET;
+            emitStatError("legacy_peer");
+        }
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (hs.status != HS_OK) {
+        std::cerr << COL_RED << "Handshake rejected: "
+                  << hsStatusMsg(hs.status) << "\n" << COL_RESET;
+        emitStatError(hsStatusToken(hs.status));
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    if (!hs.have_token) {
+        /* A v3 grant always carries the token; without it the sidecar
+         * services could not be reached, so treat it as a broken peer. */
+        emitStatError("auth_config");
+#ifdef _WIN32
+        vddShutdown();
+#endif
+        cleanupSockets(); return 1;
+    }
+    std::memcpy(g_session_token, hs.token, sizeof(g_session_token));
+    g_session_token_valid = true;
+    emitAuthStat("granted");
+
+    RECV_WIDTH  = hs.recv_w;
+    RECV_HEIGHT = hs.recv_h;
+
+    /* Sidecar services belong to the session that was just authorized: dial
+     * them only now, and only with its token. Remote compute offload (8082)
+     * is used by the RLE path alone; 8083 backs the 'p' port inspector. */
     if (g_codec == CODEC_RLE)
         gpuOffloadConnect();
 
-    /* Connect to port inspection service */
     std::cout << COL_MAGENTA << "Port inspector: "
               << sel.ip_address << ":" << PORTS_SERVICE_PORT << " ...\n"
               << COL_RESET;
-    g_ports_sock = ports_remote_connect(sel.ip_address.c_str());
+    g_ports_sock = ports_remote_connect(sel.ip_address.c_str(), g_session_token);
     if (PORTS_SOCK_VALID(g_ports_sock)) {
         std::cout << COL_GREEN << "Port inspector active  (press 'p' during stream)\n"
                   << COL_RESET;
     } else {
         std::cout << COL_YELLOW << "Port inspector unavailable\n" << COL_RESET;
     }
-
-    /* Connect stream socket */
-    NetworkSocket conn;
-    if (!conn.connect(sel.ip_address, sel.tcp_port)) {
-        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
-        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
-#ifdef _WIN32
-        vddShutdown();
-#endif
-        cleanupSockets(); return 1;
-    }
-
-    /* ── Handshake v2 (proto.h): HsRequestV2 → HsResponseV2 ── */
-    HsRequestV2 hs_out = makeHsRequest(SCREEN_WIDTH, SCREEN_HEIGHT);
-    if (!conn.sendAll(&hs_out, sizeof(hs_out))) {
-        emitStatError("handshake_send_failed");
-        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
-        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
-#ifdef _WIN32
-        vddShutdown();
-#endif
-        cleanupSockets(); return 1;
-    }
-
-    HsResponseV2 hs_in = {};
-    if (!conn.recvAll(&hs_in, sizeof(hs_in))) {
-        std::cerr << COL_RED
-                  << "No handshake response – the peer is probably a legacy "
-                     "Mivara build; please update both Mivara ends\n"
-                  << COL_RESET;
-        emitStatError("legacy_peer");
-        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
-        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
-#ifdef _WIN32
-        vddShutdown();
-#endif
-        cleanupSockets(); return 1;
-    }
-    uint32_t hs_magic  = ntohl(hs_in.magic);
-    uint32_t hs_status = ntohl(hs_in.status);
-    if (hs_magic != TVHS_MAGIC) {
-        std::cerr << COL_RED
-                  << "Bad handshake response (no TVHS magic) – peer is "
-                     "probably a legacy Mivara build; please update both "
-                     "Mivara ends\n"
-                  << COL_RESET;
-        emitStatError("legacy_peer");
-        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
-        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
-#ifdef _WIN32
-        vddShutdown();
-#endif
-        cleanupSockets(); return 1;
-    }
-    if (hs_status != HS_OK) {
-        std::cerr << COL_RED << "Handshake rejected: "
-                  << hsStatusMsg(hs_status) << "\n" << COL_RESET;
-        emitStatError(hsStatusToken(hs_status));
-        if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
-        if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
-#ifdef _WIN32
-        vddShutdown();
-#endif
-        cleanupSockets(); return 1;
-    }
-    RECV_WIDTH  = (int)ntohl(hs_in.recv_width);
-    RECV_HEIGHT = (int)ntohl(hs_in.recv_height);
 
     std::cout << COL_GREEN
               << "Extended desktop active:\n"
@@ -1567,7 +1962,7 @@ int main(int argc, char* argv[])
 
     std::cout << COL_GREEN << "Streaming – Ctrl+C to stop\n" << COL_RESET;
     emitStatStart();
-    startStdinReader();   /* SETP|… runtime reconfigure lines from the GUI */
+    /* The stdin reader already runs (started before the handshake). */
 
     /* ── Streaming loop ── */
     auto       frame_dur   = std::chrono::microseconds(1000000 / TARGET_FPS);
@@ -1866,6 +2261,12 @@ int main(int argc, char* argv[])
               << COL_RESET;
 
     emitStatStop((long)total_s, frames_sent);
+
+    /* Release the stream socket BEFORE the virtual-display teardown: the
+     * receiver leaves the session the moment it sees EOF, while vddShutdown()
+     * (detach + device disable) can take seconds in extend mode. Otherwise
+     * the peer kept showing the last frame for the whole teardown. */
+    conn.close();
 
     if (g_gpu_active) gpu_remote_disconnect(g_gpu_sock);
     if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);

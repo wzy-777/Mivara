@@ -19,10 +19,13 @@
  *      the edge crossing and the remote cursor.
  *
  *  - kvmServiceRun()     (bin/receiver)
- *      Listens on TCP 8084 and serves one controller. Before answering it
- *      asks the local user for consent with a topmost MessageBox (default
- *      No, auto-dismissed after 30 s). Accepted events are replayed with
- *      SendInput (absolute virtual-desktop moves + scancode key events).
+ *      Listens on TCP 8084 and serves one controller at a time. Every
+ *      connection obeys the receiver's configured policy (open / password /
+ *      manual, see kvm.h); the manual prompt is a topmost MessageBox (default
+ *      No, auto-dismissed after 30 s) when the receiver supplied no GUI hooks.
+ *      8084 shares the process-wide single-session slot with 8081, so video
+ *      and stitch can never be active together. Accepted events are replayed
+ *      with SendInput (absolute virtual-desktop moves + scancode key events).
  *      Every exit path sends a release-all so no key/button stays stuck.
  *
  * Threading / latency: a hook callback must never block on the network (a
@@ -35,6 +38,7 @@
  * unsupported and kvmServiceRun() returns immediately.
  */
 #include "kvm.h"
+#include "proto.h"
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +46,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -820,10 +825,180 @@ static kvm_sock_t connectTimeout(const char *ip, int port,
     return KVM_INVALID_SOCK;
 }
 
+/* This machine's name, sent to the target's 授权 popup (same cap as the 8081
+ * extension frame). */
+static std::string kvmLocalDeviceName()
+{
+    char name[256] = {0};
+    DWORD n = (DWORD)sizeof(name);
+    if (!GetComputerNameA(name, &n) || name[0] == '\0')
+        return "Mivara";
+    name[n < sizeof(name) ? n : sizeof(name) - 1] = '\0';
+    std::string s(name);
+    if (s.size() > 31) s.resize(31);
+    return s;
+}
+
+/* The device name comes straight off the wire and is echoed into STAT lines
+ * (and the app's approval dialog), where '|' separates fields. Replace control
+ * characters and '|' the same way the 8081 receiver does, so a hostile client
+ * cannot smuggle extra keys into `auth|...|dev=` and spoof the address text. */
+static std::string kvmDeviceNameFromWire(const HsRequestExtV3 &ext)
+{
+    std::string d;
+    for (size_t i = 0; i < sizeof(ext.device); i++) {
+        const unsigned char c = (unsigned char)ext.device[i];
+        if (!c) break;
+        d.push_back((c < 0x20 || c == 0x7f || c == '|') ? '?' : (char)c);
+    }
+    if (d.size() > 31) d.resize(31);
+    return d;
+}
+
+static bool kvmSendHsResponse(kvm_sock_t s, uint32_t status, uint32_t w,
+                              uint32_t h)
+{
+    HsResponseV2 res = {};
+    res.magic = htonl(TVHS_MAGIC);
+    res.version = htonl(TVHS_VERSION);
+    res.recv_width = htonl(w);
+    res.recv_height = htonl(h);
+    res.status = htonl(status);
+    return kvmSendAll(s, &res, sizeof(res));
+}
+
+/* Human-readable text for the authorization verdicts. Never includes a
+ * password: only the receiver's status code is used. */
+static void kvmAuthErrorText(uint32_t status, std::string &out)
+{
+    switch (status) {
+    case HS_ERR_AUTH:
+        out = "连接密码错误，或尝试次数过多";
+        break;
+    case HS_ERR_AUTH_TIMEOUT:
+        out = "对方未在 30 秒内确认拼接请求";
+        break;
+    case HS_ERR_DENIED:
+        out = "对方拒绝了拼接请求";
+        break;
+    case HS_ERR_BUSY:
+        out = "对方正在接收其他连接";
+        break;
+    case HS_ERR_AUTH_CONFIG:
+        out = "对方接收授权配置异常，请在设置中重新设置连接密码";
+        break;
+    case HS_ERR_VERSION:
+        out = "拼接协议版本不一致，请将两端更新到同一版本";
+        break;
+    default:
+        out = "拼接请求被拒绝（错误码 " + std::to_string(status) + "）";
+        break;
+    }
+}
+
+enum class AuthOutcome { Ok, Status, Cancelled, Transport };
+
+/* Controller half of the v2 authorization exchange: identity frame, optional
+ * password proof, then the receiver's verdict. The client's verdict is left in
+ * `status` for AuthOutcome::Status and a user-facing reason in `why`. */
+static AuthOutcome kvmClientAuthorize(kvm_sock_t s, const KvmHello &hello,
+                                      const HsAuthStart &as,
+                                      const std::atomic<bool> &running,
+                                      const KvmClientAuth *auth,
+                                      uint32_t &status, std::string &why)
+{
+    const auto report = [auth](const char *state) {
+        if (auth && auth->report) auth->report(state, nullptr, auth->ctx);
+    };
+
+    HsRequestExtV3 ext = {};
+    ext.magic = htonl(TVHX_MAGIC);
+    ext.version = htonl(TVHA_VERSION);
+    const std::string device = kvmLocalDeviceName();
+    std::memcpy(ext.device, device.data(),
+                device.size() < sizeof(ext.device) ? device.size()
+                                                   : sizeof(ext.device));
+    if (!kvmSendAll(s, &ext, sizeof(ext))) {
+        why = "拼接授权请求发送失败";
+        return AuthOutcome::Transport;
+    }
+
+    const uint32_t mode = ntohl(as.mode);
+    if (mode == AUTH_MODE_PASSWORD) {
+        const uint32_t iter = ntohl(as.kdf_iter);
+        if (iter < HS_KDF_ITER_MIN || iter > HS_KDF_ITER_MAX) {
+            why = "对方下发的密码参数无效";
+            return AuthOutcome::Transport;
+        }
+        std::string pw;
+        if (!auth || !auth->password) {
+            report("cancelled");
+            why = "对方要求连接密码，但当前客户端无法输入";
+            return AuthOutcome::Cancelled;
+        }
+        report("need_password");
+        if (!auth->password(&pw, auth->ctx) || pw.empty()) {
+            if (!pw.empty()) {
+                volatile char *v = &pw[0];
+                for (size_t i = 0; i < pw.size(); i++) v[i] = 0;
+            }
+            report("cancelled");
+            why = "已取消输入连接密码";
+            return AuthOutcome::Cancelled;
+        }
+        report("authenticating");
+
+        uint8_t key[32] = {}, proof[32] = {};
+        mivaraPasswordKey(pw, as.salt, sizeof(as.salt), iter, key);
+        {
+            volatile char *v = &pw[0];
+            for (size_t i = 0; i < pw.size(); i++) v[i] = 0;
+        }
+        uint8_t bound[sizeof(KvmHello) + sizeof(HsRequestExtV3)];
+        std::memcpy(bound, &hello, sizeof(hello));
+        std::memcpy(bound + sizeof(hello), &ext, sizeof(ext));
+        mivaraAuthProof(key, MIVARA_AUTH_PURPOSE_STITCH, as.nonce, bound,
+                        sizeof(bound), proof);
+        std::memset(key, 0, sizeof(key));
+
+        HsAuthProof hp = {};
+        hp.magic = htonl(TVHA_MAGIC);
+        hp.version = htonl(TVHA_VERSION);
+        std::memcpy(hp.proof, proof, sizeof(proof));
+        std::memset(proof, 0, sizeof(proof));
+        if (!kvmSendAll(s, &hp, sizeof(hp))) {
+            why = "拼接授权应答发送失败";
+            return AuthOutcome::Transport;
+        }
+    } else {
+        report("waiting");
+    }
+
+    HsResponseV2 res = {};
+    const int rv = kvmRecvAllPoll(s, &res, sizeof(res), running, 35000);
+    if (rv == 0) {
+        why = (mode == AUTH_MODE_MANUAL)
+                  ? "对方未在 30 秒内确认拼接请求"
+                  : "对方未在 35 秒内回应拼接授权";
+        return AuthOutcome::Transport;
+    }
+    if (rv < 0) {
+        why = "拼接授权过程中连接已断开";
+        return AuthOutcome::Transport;
+    }
+    if (ntohl(res.magic) != TVHS_MAGIC || ntohl(res.version) != TVHS_VERSION) {
+        why = "拼接授权应答无效";
+        return AuthOutcome::Transport;
+    }
+    status = ntohl(res.status);
+    return status == HS_OK ? AuthOutcome::Ok : AuthOutcome::Status;
+}
+
 } /* namespace */
 
 int kvmRunController(const char *peer_ip, int peer_port, int side,
-                     const std::atomic<bool> &running)
+                     const std::atomic<bool> &running,
+                     const KvmClientAuth *auth)
 {
     if (!peer_ip || !*peer_ip) return 1;
 
@@ -892,11 +1067,15 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             return 1;
         }
 
-        reply = KvmReply{};
-        const int rv =
-            kvmRecvAllPoll(g_sock, &reply, sizeof(reply), running, 35000);
+        /* The target answers with one of three frames; the first word tells
+         * them apart (see kvm.h). Reading only that word keeps a refusal
+         * (HsResponseV2 before any challenge) distinguishable from a
+         * challenge and from the v1-style bare reply. */
+        uint32_t first_raw = 0;
+        int rv = kvmRecvAllPoll(g_sock, &first_raw, sizeof(first_raw),
+                                running, 35000);
         if (rv == 0) {
-            emitStatError("对方未在 35 秒内确认拼接请求");
+            emitStatError("对方未在 35 秒内回应拼接请求");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
             return 1;
@@ -907,8 +1086,104 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             g_sock = KVM_INVALID_SOCK;
             return 1;
         }
-        if (ntohl(reply.magic) != KVM_MAGIC) {
+        const uint32_t first = ntohl(first_raw);
+
+        if (first == KVM_MAGIC) {
+            reply = KvmReply{};
+            reply.magic = first_raw;
+            rv = kvmRecvAllPoll(g_sock, (char *)&reply + sizeof(uint32_t),
+                                sizeof(reply) - sizeof(uint32_t), running,
+                                35000);
+            if (rv <= 0) {
+                if (running.load()) emitStatError("拼接握手失败（对方应答不完整）");
+                kvmClose(g_sock);
+                g_sock = KVM_INVALID_SOCK;
+                return 1;
+            }
+            if (ntohl(reply.version) != KVM_VERSION) {
+                emitStatError("拼接协议版本不一致，请将两端更新到同一版本");
+                kvmClose(g_sock);
+                g_sock = KVM_INVALID_SOCK;
+                return 1;
+            }
+            status = ntohl(reply.status);
+            if (status != KVM_ERR_BUSY || attempt == 1) break;
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            if (!running.load()) return 1;
+            Sleep(300);
+            continue;
+        }
+
+        if (first == TVHS_MAGIC) {
+            /* A refusal sent before the challenge: the receiver's password
+             * record is missing/corrupt (fail closed), never a downgrade. */
+            HsResponseV2 res = {};
+            res.magic = first_raw;
+            rv = kvmRecvAllPoll(g_sock, (char *)&res + sizeof(uint32_t),
+                                sizeof(res) - sizeof(uint32_t), running, 35000);
+            std::string why = "拼接授权被拒绝";
+            if (rv > 0 && ntohl(res.magic) == TVHS_MAGIC &&
+                ntohl(res.version) == TVHS_VERSION)
+                kvmAuthErrorText(ntohl(res.status), why);
+            emitStatError(why);
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return 2;
+        }
+
+        if (first != TVHA_MAGIC) {
             emitStatError("拼接握手失败（对方不是 Mivara 接收端）");
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return 1;
+        }
+
+        HsAuthStart as = {};
+        as.magic = first_raw;
+        rv = kvmRecvAllPoll(g_sock, (char *)&as + sizeof(uint32_t),
+                            sizeof(as) - sizeof(uint32_t), running, 35000);
+        if (rv <= 0) {
+            if (running.load()) emitStatError("拼接授权握手失败（对方应答不完整）");
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return 1;
+        }
+        if (ntohl(as.version) != TVHA_VERSION) {
+            emitStatError("拼接协议版本不一致，请将两端更新到同一版本");
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return 1;
+        }
+        const uint32_t auth_mode = ntohl(as.mode);
+        if (auth_mode != AUTH_MODE_OPEN && auth_mode != AUTH_MODE_PASSWORD &&
+            auth_mode != AUTH_MODE_MANUAL) {
+            if (auth && auth->report) auth->report("cancelled", nullptr, auth->ctx);
+            emitStatError("对方下发的授权方式无效");
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return 2;
+        }
+
+        uint32_t auth_status = 0;
+        std::string why;
+        const AuthOutcome ao =
+            kvmClientAuthorize(g_sock, hello, as, running, auth, auth_status,
+                               why);
+        if (ao != AuthOutcome::Ok) {
+            if (auth && auth->report && ao != AuthOutcome::Cancelled)
+                auth->report("cancelled", nullptr, auth->ctx);
+            if (ao == AuthOutcome::Status) kvmAuthErrorText(auth_status, why);
+            emitStatError(why);
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return ao == AuthOutcome::Transport ? 1 : 2;
+        }
+        /* Authorized: the metrics reply follows the verdict. */
+        reply = KvmReply{};
+        rv = kvmRecvAllPoll(g_sock, &reply, sizeof(reply), running, 35000);
+        if (rv <= 0 || ntohl(reply.magic) != KVM_MAGIC) {
+            if (running.load()) emitStatError("拼接授权后未收到会话参数");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
             return 1;
@@ -920,11 +1195,16 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             return 1;
         }
         status = ntohl(reply.status);
-        if (status != KVM_ERR_BUSY || attempt == 1) break;
-        kvmClose(g_sock);
-        g_sock = KVM_INVALID_SOCK;
-        if (!running.load()) return 1;
-        Sleep(300);
+        if (status != KVM_OK) {
+            if (auth && auth->report) auth->report("cancelled", nullptr, auth->ctx);
+            kvmAuthErrorText(status, why);
+            emitStatError(why);
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return 2;
+        }
+        if (auth && auth->report) auth->report("granted", nullptr, auth->ctx);
+        break;
     }
     if (status != KVM_OK) {
         if (status == KVM_ERR_DENIED)
@@ -1195,39 +1475,49 @@ struct HeartbeatState {
 };
 
 /* deadline_ms == 0 means "until shutdown/EOF"; used for the hello so a peer
- * that connects and stays silent cannot pin the only KVM session slot. */
+ * that connects and stays silent cannot pin the only KVM session slot.
+ * ULONGLONG (GetTickCount64) rather than DWORD: a receiver can run for weeks
+ * and a 49-day tick wrap must not stretch a deadline. */
 static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
-                           std::atomic<bool> &running, DWORD deadline_ms = 0,
-                           HeartbeatState *hb = nullptr)
+                           std::atomic<bool> &running,
+                           ULONGLONG deadline_ms = 0,
+                           HeartbeatState *hb = nullptr,
+                           size_t *got = nullptr,
+                           bool *timed_out = nullptr)
 {
     char *p = (char *)buf;
     size_t off = 0;
-    const DWORD start = GetTickCount();
+    const ULONGLONG start = GetTickCount64();
+    const auto finish = [&](bool ok, bool deadline) {
+        if (got) *got = off;
+        if (timed_out) *timed_out = deadline;
+        return ok;
+    };
     while (off < len) {
-        if (!running.load()) return false;
-        if (deadline_ms && (DWORD)(GetTickCount() - start) > deadline_ms)
-            return false;
+        if (!running.load()) return finish(false, false);
+        if (deadline_ms && GetTickCount64() - start > deadline_ms)
+            return finish(false, true);
         if (hb && hb->enabled) {
             const ULONGLONG now = GetTickCount64();
-            if (now - hb->last_rx >= 9000) return false;
+            if (now - hb->last_rx >= 9000) return finish(false, false);
             if (now >= hb->next_tx) {
                 KvmEvent ping = {};
                 ping.type = htonl(KVM_EV_PING);
-                if (!kvmSendAll(s, &ping, sizeof(ping))) return false;
+                if (!kvmSendAll(s, &ping, sizeof(ping))) return finish(false, false);
                 hb->next_tx = now + 3000;
             }
         }
         int n = recv(s, p + off, (int)(len - off), 0);
-        if (n == 0) return false;
+        if (n == 0) return finish(false, false);
         if (n < 0) {
             int err = WSAGetLastError();
             if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
-            return false;
+            return finish(false, false);
         }
         if (hb) hb->last_rx = GetTickCount64();
         off += (size_t)n;
     }
-    return true;
+    return finish(true, false);
 }
 
 /* Dismiss the consent box as if its default button (No) was clicked.
@@ -1392,9 +1682,11 @@ static ConsentResult askConsent(const std::string &peer_ip, int side,
                                   MB_TOPMOST | MB_SETFOREGROUND);
     done = true;
     if (watcher.joinable()) watcher.join();
-    if (r == IDYES) return CONSENT_YES;
+    /* The deadline wins over a click that raced the watcher: an "allow" after
+     * 30 s must not establish a session (same rule as 8081, issue 21). */
     if (reason.load() == 1) return CONSENT_TIMEOUT;
     if (reason.load() == 2 || reason.load() == 3) return CONSENT_CANCELLED;
+    if (r == IDYES) return CONSENT_YES;
     /* Only an actual IDNO is a human refusal. MessageBoxW returns 0 when it
      * could not create the box at all (no interactive window station, out of
      * resources); the watcher never recorded a reason in that case, so a bare
@@ -1422,6 +1714,13 @@ struct PeerThrottle {
 };
 static PeerThrottle g_kvm_peers[8];
 static unsigned g_kvm_peer_next = 0;
+
+/* Password failures on 8084 go through the process-wide per-source throttle
+ * in auth.cpp, the same instance the 8081 handshake uses: alternating ports
+ * must not grant two free budgets or two cooldowns. Those helpers serialise
+ * access internally, so no local mutex or throttle instance may be kept here.
+ * Only a real password-proof failure feeds this budget; the local handshake
+ * abuse counter below is separate (an abandoned handshake is not a guess). */
 static const DWORD KVM_DENY_COOLDOWN_MS = 60000;
 static const DWORD KVM_CANCEL_BACKOFF_MS = 3000;
 
@@ -1455,17 +1754,191 @@ static PeerThrottle *peerThrottle(const std::string &ip, bool create)
     return &p;
 }
 
-static void serveClient(kvm_sock_t client, const std::string &peer_ip,
-                        std::atomic<bool> &running)
+/* ── handshake budget and per-source admission ─────────────────────────────
+ * kvmServiceRun() still serves one connection at a time (the session thread
+ * stays responsive to everyone else with a busy reply), so an unauthenticated
+ * peer that stalls would otherwise hold the only slot for the whole identity
+ * or proof deadline. Every stage is bounded, the whole exchange has one
+ * budget, and a source that keeps abandoning a handshake is refused early.
+ * GetTickCount64 is used because a DWORD tick wraps after 49 days and would
+ * make a long-running receiver misjudge a deadline. */
+static const ULONGLONG KVM_HELLO_TIMEOUT_MS = 3000;
+static const ULONGLONG KVM_IDENTITY_TIMEOUT_MS = 10000;
+/* The controller's password prompt allows 120 s, so the proof window must not
+ * close earlier than that (the per-source admission and abandon cooldown, not
+ * a short timeout, are what bound a hostile peer). */
+static const ULONGLONG KVM_PROOF_TIMEOUT_MS = 125000;
+static const ULONGLONG KVM_HANDSHAKE_BUDGET_MS = 140000;
+
+static const int KVM_HS_SLOTS = 8;
+static const int KVM_HS_MAX_PENDING_PER_IP = 1;   /* same source: one at a time */
+static const int KVM_HS_FREE_ABANDONS = 2;        /* tolerate transients first */
+static const ULONGLONG KVM_HS_COOLDOWN_BASE_MS = 2000;
+static const ULONGLONG KVM_HS_COOLDOWN_MAX_MS = 60000;
+
+struct HsEntry {
+    std::string ip;
+    int         pending = 0;
+    int         strikes = 0;
+    ULONGLONG   until = 0;   /* abuse-cooldown end (0 = none) */
+    ULONGLONG   last = 0;    /* last admission, for eviction */
+};
+static HsEntry g_kvm_hs[KVM_HS_SLOTS];
+static unsigned g_kvm_hs_next = 0;
+static std::mutex g_kvm_hs_mtx;
+
+static HsEntry *hsFind(const std::string &ip)
 {
-    /* A stalled client must not pin the port forever, and a controller that
-     * vanishes without a FIN must be detected (the session is idle whenever
-     * the user is not typing, so TCP has nothing else to time out). */
+    for (auto &e : g_kvm_hs)
+        if (!e.ip.empty() && e.ip == ip) return &e;
+    return nullptr;
+}
+
+/* Caller holds g_kvm_hs_mtx. Evicts the least recently used idle entry; an
+ * entry with an unfinished handshake is never evicted. */
+static HsEntry *hsSlot(const std::string &ip)
+{
+    if (HsEntry *e = hsFind(ip)) return e;
+    for (auto &e : g_kvm_hs) {
+        if (e.ip.empty()) {
+            e.ip = ip;
+            return &e;
+        }
+    }
+    HsEntry *victim = nullptr;
+    for (auto &e : g_kvm_hs) {
+        if (e.pending > 0) continue;
+        if (!victim || e.last < victim->last) victim = &e;
+    }
+    if (!victim) victim = &g_kvm_hs[g_kvm_hs_next++ % KVM_HS_SLOTS];
+    *victim = HsEntry{};
+    victim->ip = ip;
+    return victim;
+}
+
+/* Admit one handshake from `ip`. False when the source is in its local abuse
+ * cooldown or already has an unfinished handshake. */
+static bool hsAdmit(const std::string &ip)
+{
+    std::lock_guard<std::mutex> lk(g_kvm_hs_mtx);
+    HsEntry *e = hsSlot(ip);
+    const ULONGLONG now = GetTickCount64();
+    if (e->until) {
+        if (now < e->until) return false;
+        e->until = 0;
+        e->strikes = 0;
+    }
+    if (e->pending >= KVM_HS_MAX_PENDING_PER_IP) return false;
+    e->pending++;
+    e->last = now;
+    return true;
+}
+
+/* Release an admission. `abandoned` is only for a protocol-stage timeout/EOF
+ * before authorization; a refusal, cancellation or claim failure must not
+ * punish the source, and a completed authorization clears its strikes. */
+static void hsRelease(const std::string &ip, bool admitted, bool abandoned,
+                      bool success)
+{
+    /* A source that never reached admission and did not abandon anything
+     * (version mismatch, cross-mode busy) leaves no trace. */
+    if (!admitted && !abandoned && !success) return;
+    std::lock_guard<std::mutex> lk(g_kvm_hs_mtx);
+    HsEntry *e = hsSlot(ip);
+    if (admitted && e->pending > 0) e->pending--;
+    if (success) {
+        e->strikes = 0;
+        e->until = 0;
+        return;
+    }
+    if (!abandoned) return;
+    e->strikes++;
+    if (e->strikes > KVM_HS_FREE_ABANDONS) {
+        const int step = e->strikes - KVM_HS_FREE_ABANDONS - 1; /* 0,1,2... */
+        ULONGLONG cd = KVM_HS_COOLDOWN_BASE_MS << std::min(step, 5);
+        if (cd > KVM_HS_COOLDOWN_MAX_MS) cd = KVM_HS_COOLDOWN_MAX_MS;
+        e->until = GetTickCount64() + cd;
+    }
+}
+
+/* Milliseconds left in the whole-handshake budget; 0 = already spent. */
+static ULONGLONG hsRemaining(ULONGLONG start)
+{
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG elapsed = now >= start ? now - start : 0;
+    return elapsed >= KVM_HANDSHAKE_BUDGET_MS
+               ? 0 : KVM_HANDSHAKE_BUDGET_MS - elapsed;
+}
+
+/* recv bounded by both the stage limit and the remaining total budget. */
+static bool recvHandshake(kvm_sock_t s, void *buf, size_t len,
+                          std::atomic<bool> &running, ULONGLONG stage_ms,
+                          ULONGLONG start, size_t *got = nullptr,
+                          bool *timed_out = nullptr)
+{
+    const ULONGLONG left = hsRemaining(start);
+    if (left == 0) {
+        if (got) *got = 0;
+        if (timed_out) *timed_out = true;
+        return false;
+    }
+    const ULONGLONG wait = stage_ms < left ? stage_ms : left;
+    return recvAllRunning(s, buf, len, running, wait, nullptr, got, timed_out);
+}
+
+/* Releases the source's pending slot on every serveClient exit path. */
+struct HsGuard {
+    explicit HsGuard(const std::string &peer) : ip(peer) {}
+    ~HsGuard() { hsRelease(ip, admitted, abandoned, success); }
+
+    bool admit() { admitted = hsAdmit(ip); return admitted; }
+    void markAbandoned() { abandoned = true; }
+    void markSuccess() { success = true; }
+
+    std::string ip;
+    bool admitted = false;
+    bool abandoned = false;
+    bool success = false;
+};
+
+/* Releases the process-wide session lease on every exit path after the claim
+ * (HS_OK/metrics send failure, protocol error, session end). */
+struct SessionLeaseGuard {
+    MivaraSessionLease lease{};
+    bool held = false;
+    ~SessionLeaseGuard() { if (held) mivaraSessionRelease(lease); }
+};
+
+static void serveClient(kvm_sock_t client, const std::string &peer_ip,
+                        std::atomic<bool> &running,
+                        const KvmTargetAuth *auth)
+{
+    /* One budget covers hello + identity + proof; each stage additionally has
+     * its own (shorter) limit. A stalled client must not pin the port forever,
+     * and a controller that vanishes without a FIN must be detected (the
+     * session is idle whenever the user is not typing, so TCP has nothing else
+     * to time out). The guard releases this source's pending slot even when we
+     * return early. */
+    const ULONGLONG hs_start = GetTickCount64();
+    HsGuard hs(peer_ip);
+
     kvmSetTimeouts(client, 1000, 1000);
     kvmEnableKeepAlive(client);
 
     KvmHello hello = {};
-    if (!recvAllRunning(client, &hello, sizeof(hello), running, 5000)) return;
+    size_t got = 0;
+    bool timed_out = false;
+    if (!recvHandshake(client, &hello, sizeof(hello), running,
+                       KVM_HELLO_TIMEOUT_MS, hs_start, &got, &timed_out)) {
+        /* A bare TCP probe (the GUI tests the port that way) connects and
+         * closes without sending a byte; that is not an abandoned handshake
+         * and must not arm the cooldown, otherwise normal discovery would
+         * lock out the real controller. A partial hello or a source that
+         * stays silent until the deadline is a real abandonment. A local
+         * shutdown is not the peer's fault either. */
+        if (running.load() && (got > 0 || timed_out)) hs.markAbandoned();
+        return;
+    }
 
     KvmReply reply = {};
     reply.magic = htonl(KVM_MAGIC);
@@ -1473,14 +1946,36 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     reply.reserved = htonl((ntohl(hello.reserved[1]) & KVM_FEATURE_HEARTBEAT)
                                ? KVM_FEATURE_HEARTBEAT : 0);
 
-    if (ntohl(hello.magic) != KVM_MAGIC) {
+    /* A v1 peer (or a foreign service) is refused before authorization, so an
+     * old client can never reach the event stream around the policy. */
+    if (ntohl(hello.magic) != KVM_MAGIC ||
+        ntohl(hello.version) != KVM_VERSION) {
         reply.status = htonl(KVM_ERR_VERSION);
         kvmSendAll(client, &reply, sizeof(reply));
         return;
     }
-    if (ntohl(hello.version) != KVM_VERSION) {
-        reply.status = htonl(KVM_ERR_VERSION);
+
+    /* 8081 and 8084 share one process-wide session slot (auth.h). Refuse
+     * before asking for a password or showing a prompt: neither a video
+     * session nor a video handshake that already claimed the slot may be
+     * joined. HsResponseV2(HS_ERR_BUSY) is the cross-mode "receiving another
+     * connection" answer the controller understands. */
+    if (mivaraSessionOwner() != MIVARA_SESSION_NONE) {
+        kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
+        std::cout << "[kvm] request from " << peer_ip
+                  << " refused: another session is active\n" << std::flush;
+        return;
+    }
+
+    /* Same source: at most one unfinished handshake plus a local cooldown
+     * after repeated protocol-stage abandons. Keep the bare KvmReply so the
+     * controller retains its single 300 ms retry (a TVHS refusal ends it). */
+    if (!hs.admit()) {
+        reply.status = htonl(KVM_ERR_BUSY);
         kvmSendAll(client, &reply, sizeof(reply));
+        std::cout << "[kvm] request from " << peer_ip
+                  << " refused: source busy or in handshake cooldown\n"
+                  << std::flush;
         return;
     }
 
@@ -1495,7 +1990,7 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     }
 
     /* Where the peer sits relative to the controller (informational: it only
-     * tailors the consent text). The controller encodes side + 1 so a zeroed
+     * tailors the approval text). The controller encodes side + 1 so a zeroed
      * field (older build, or a raw KvmHello = {}) means "unspecified" rather
      * than KVM_SIDE_LEFT; anything out of range falls back to the default. */
     const uint32_t raw_side = ntohl(hello.reserved[0]);
@@ -1503,67 +1998,267 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
                          ? (int)raw_side - 1
                          : (int)KVM_SIDE_RIGHT;
 
-    std::cout << "[kvm] stitch request from " << peer_ip << " (peer on the "
-              << kvmSideKey(side) << ")\n" << std::flush;
-    /* Back off after a peer-cancelled prompt: without this, a host that keeps
-     * connecting + closing would flash the topmost dialog repeatedly. Waiting
-     * (rather than denying) keeps a legitimate rapid retry working. Poll the
-     * socket while waiting so a peer that has already hung up frees the single
-     * session slot immediately instead of keeping every other controller out
-     * for the whole backoff. */
-    DWORD backoff = 0;
-    if (throttle && throttle->cancel_tick) {
-        const DWORD age = (DWORD)(GetTickCount() - throttle->cancel_tick);
-        if (age < KVM_CANCEL_BACKOFF_MS) backoff = KVM_CANCEL_BACKOFF_MS - age;
-    }
-    if (g_kvm_last_cancel) {
-        const ULONGLONG age = GetTickCount64() - g_kvm_last_cancel;
-        if (age < KVM_CANCEL_BACKOFF_MS &&
-            (DWORD)(KVM_CANCEL_BACKOFF_MS - age) > backoff)
-            backoff = (DWORD)(KVM_CANCEL_BACKOFF_MS - age);
-    }
-    while (backoff > 0) {
-        if (!running.load() || peerClosed(client)) {
-            noteCancel(GetTickCount64());
-            if (PeerThrottle *p = peerThrottle(peer_ip, true))
-                p->cancel_tick = GetTickCount();
-            return;
-        }
-        const DWORD slice = backoff < 100 ? backoff : 100;
-        Sleep(slice);
-        backoff -= slice;
-    }
-    const ConsentResult verdict = askConsent(peer_ip, side, running, client);
-    if (verdict != CONSENT_YES) {
-        if (verdict == CONSENT_CANCELLED) {
-            /* Controller left (or we are shutting down): no reply to send and
-             * nothing to hold against this peer — only a short backoff. */
-            noteCancel(GetTickCount64());
-            if (PeerThrottle *p = peerThrottle(peer_ip, true))
-                p->cancel_tick = GetTickCount();
-            std::cout << "[kvm] request from " << peer_ip
-                      << " cancelled before consent\n" << std::flush;
-            return;
-        }
-        reply.status = htonl(KVM_ERR_DENIED);
-        kvmSendAll(client, &reply, sizeof(reply));
-        if (verdict == CONSENT_NO) {
-            /* Only a human "No" starts the per-peer cooldown: an unanswered
-             * box (30 s) is not a refusal and must not block the reconnect. */
-            if (PeerThrottle *p = peerThrottle(peer_ip, true))
-                p->deny_tick = GetTickCount();
-        }
-        std::cout << "[kvm] request " << peer_ip
-                  << (verdict == CONSENT_TIMEOUT        ? " timed out\n"
-                      : verdict == CONSENT_PROMPT_FAILED ? " refused (consent prompt could not be shown)\n"
-                                                         : " declined\n")
-                  << std::flush;
+    /* ══ 接收策略 (same one 8081 uses) ═══════════════════════════════════
+     * No hook means manual: the v1 native prompt is kept, but a caller that
+     * forgets the hooks must not expose an open desktop. */
+    MivaraAuthMode mode = MIVARA_AUTH_MANUAL;
+    uint8_t salt[16] = {}, hash[32] = {};
+    uint32_t iter = 0;
+    bool record_ok = false;
+    if (auth && auth->policy &&
+        !auth->policy(&mode, salt, hash, &iter, &record_ok, auth->ctx))
+        mode = MIVARA_AUTH_MANUAL;
+
+    if (mode == MIVARA_AUTH_PASSWORD && !record_ok) {
+        /* Fail closed: a missing/corrupt record is never a downgrade. */
+        kvmSendHsResponse(client, HS_ERR_AUTH_CONFIG, 0, 0);
+        std::cout << "[kvm] request from " << peer_ip
+                  << " refused: password record unusable\n" << std::flush;
         return;
     }
 
     int sx, sy;
     uint32_t sw, sh;
     targetMetrics(sx, sy, sw, sh);
+
+    /* The process-wide slot is acquired before a manual prompt (so the human
+     * decision cannot be stolen by a video handshake that finishes first) or,
+     * for password/open, right before the grant. It is released on every exit
+     * path by the guard. */
+    SessionLeaseGuard lease;
+
+    if (mode != MIVARA_AUTH_OPEN) {
+        HsAuthStart as = {};
+        as.magic = htonl(TVHA_MAGIC);
+        as.version = htonl(TVHA_VERSION);
+        as.mode = htonl(mode == MIVARA_AUTH_PASSWORD ? AUTH_MODE_PASSWORD
+                                                     : AUTH_MODE_MANUAL);
+        as.kdf_iter = htonl(iter);
+        if (mode == MIVARA_AUTH_PASSWORD)
+            std::memcpy(as.salt, salt, sizeof(as.salt));
+        if (!mivaraRandomBytes(as.nonce, sizeof(as.nonce))) {
+            std::cout << "[kvm] request from " << peer_ip
+                      << " refused: no CSPRNG\n" << std::flush;
+            return;
+        }
+        if (!kvmSendAll(client, &as, sizeof(as))) return;
+
+        /* The identity frame arrives before any verdict so a manual prompt
+         * can name the device and a password proof can bind it. The sender
+         * sends it immediately, so a short stage limit is enough; the proof
+         * gets the long one because it waits for a typed password. Both are
+         * additionally bounded by what is left of the total budget. */
+        HsRequestExtV3 ext = {};
+        if (!recvHandshake(client, &ext, sizeof(ext), running,
+                           KVM_IDENTITY_TIMEOUT_MS, hs_start)) {
+            if (running.load()) hs.markAbandoned();
+            return;
+        }
+        if (ntohl(ext.magic) != TVHX_MAGIC ||
+            ntohl(ext.version) != TVHA_VERSION) {
+            kvmSendHsResponse(client, HS_ERR_VERSION, 0, 0);
+            return;
+        }
+        std::string device = kvmDeviceNameFromWire(ext);
+        if (device.empty()) device = peer_ip;
+        std::cout << "[kvm] stitch request from " << peer_ip << " (" << device
+                  << ", peer on the " << kvmSideKey(side) << ")\n" << std::flush;
+
+        if (mode == MIVARA_AUTH_PASSWORD) {
+            /* One process-wide budget shared with the 8081 handshake: a source
+             * cannot alternate ports for extra free guesses or a shorter
+             * cooldown. The helpers lock internally. */
+            const int wait_s = mivaraAuthThrottleRetryAfter(peer_ip);
+            if (wait_s > 0) {
+                kvmSendHsResponse(client, HS_ERR_AUTH, 0, 0);
+                std::cout << "[kvm] request from " << peer_ip
+                          << " throttled after failed passwords\n" << std::flush;
+                return;
+            }
+            HsAuthProof proof = {};
+            if (!recvHandshake(client, &proof, sizeof(proof), running,
+                               KVM_PROOF_TIMEOUT_MS, hs_start)) {
+                if (running.load()) hs.markAbandoned();
+                return;
+            }
+            if (ntohl(proof.magic) != TVHA_MAGIC ||
+                ntohl(proof.version) != TVHA_VERSION) {
+                mivaraAuthThrottleNoteAbuse(peer_ip);
+                kvmSendHsResponse(client, HS_ERR_AUTH, 0, 0);
+                return;
+            }
+            uint8_t bound[sizeof(KvmHello) + sizeof(HsRequestExtV3)];
+            std::memcpy(bound, &hello, sizeof(hello));
+            std::memcpy(bound + sizeof(hello), &ext, sizeof(ext));
+            uint8_t expect[32] = {};
+            /* The password itself never reaches this machine; the proof is
+             * domain-separated for 8084 (see auth.h). */
+            mivaraAuthProof(hash, MIVARA_AUTH_PURPOSE_STITCH, as.nonce, bound,
+                            sizeof(bound), expect);
+            if (!mivaraConstEq(expect, proof.proof, sizeof(expect))) {
+                mivaraAuthThrottleNoteFailure(peer_ip);
+                kvmSendHsResponse(client, HS_ERR_AUTH, 0, 0);
+                std::cout << "[kvm] request from " << peer_ip
+                          << " refused: bad password\n" << std::flush;
+                return;
+            }
+            mivaraAuthThrottleNoteSuccess(peer_ip);
+        } else {
+            /* Manual policy. Before opening a modal prompt, make sure the peer
+             * is still there: a controller that sent the identity frame and
+             * hung up must not hold the slot for the whole 30 s deadline. */
+            if (peerClosed(client)) {
+                std::cout << "[kvm] request from " << peer_ip
+                          << " cancelled before approval\n" << std::flush;
+                return;
+            }
+            /* Reserve the slot across the prompt: a video handshake that
+             * grants while the user is deciding must not swallow the result. */
+            if (!lease.held) {
+                if (!mivaraSessionClaim(MIVARA_SESSION_STITCH, 60000,
+                                        &lease.lease)) {
+                    kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
+                    std::cout << "[kvm] request from " << peer_ip
+                              << " refused: another session claimed the slot\n"
+                              << std::flush;
+                    return;
+                }
+                lease.held = true;
+            }
+            KvmApprovalResult verdict = KVM_APPROVAL_DENY;
+            if (auth && auth->approve) {
+                verdict = auth->approve(peer_ip.c_str(), device.c_str(),
+                                        (intptr_t)client, auth->ctx);
+            } else {
+                /* Native-prompt fallback (no GUI hooks): keep the v1 cancel
+                 * backoff so a peer that connects + closes cannot flash the
+                 * topmost dialog in a loop. */
+                DWORD backoff = 0;
+                if (throttle && throttle->cancel_tick) {
+                    const DWORD age =
+                        (DWORD)(GetTickCount() - throttle->cancel_tick);
+                    if (age < KVM_CANCEL_BACKOFF_MS)
+                        backoff = KVM_CANCEL_BACKOFF_MS - age;
+                }
+                if (g_kvm_last_cancel) {
+                    const ULONGLONG age = GetTickCount64() - g_kvm_last_cancel;
+                    if (age < KVM_CANCEL_BACKOFF_MS &&
+                        (DWORD)(KVM_CANCEL_BACKOFF_MS - age) > backoff)
+                        backoff = (DWORD)(KVM_CANCEL_BACKOFF_MS - age);
+                }
+                while (backoff > 0) {
+                    if (!running.load() || peerClosed(client)) {
+                        noteCancel(GetTickCount64());
+                        if (PeerThrottle *p = peerThrottle(peer_ip, true))
+                            p->cancel_tick = GetTickCount();
+                        return;
+                    }
+                    const DWORD slice = backoff < 100 ? backoff : 100;
+                    Sleep(slice);
+                    backoff -= slice;
+                }
+                const ConsentResult cr =
+                    askConsent(peer_ip, side, running, client);
+                if (cr == CONSENT_CANCELLED) {
+                    noteCancel(GetTickCount64());
+                    if (PeerThrottle *p = peerThrottle(peer_ip, true))
+                        p->cancel_tick = GetTickCount();
+                    std::cout << "[kvm] request from " << peer_ip
+                              << " cancelled before consent\n" << std::flush;
+                    return;
+                }
+                switch (cr) {
+                case CONSENT_YES: verdict = KVM_APPROVAL_ALLOW; break;
+                case CONSENT_NO: verdict = KVM_APPROVAL_DENY; break;
+                case CONSENT_TIMEOUT: verdict = KVM_APPROVAL_TIMEOUT; break;
+                case CONSENT_CANCELLED: verdict = KVM_APPROVAL_CANCELLED; break;
+                case CONSENT_PROMPT_FAILED:
+                    verdict = KVM_APPROVAL_FAILED;
+                    break;
+                }
+            }
+
+            /* Handle the verdict value by value. Folding timeout, cancel and
+             * prompt failure into "deny" would arm the 60 s cooldown for a
+             * request that nobody actually refused. */
+            switch (verdict) {
+            case KVM_APPROVAL_ALLOW:
+                break;
+            case KVM_APPROVAL_DENY:
+                /* Only an explicit human "No" starts the per-peer cooldown. */
+                if (PeerThrottle *p = peerThrottle(peer_ip, true))
+                    p->deny_tick = GetTickCount();
+                kvmSendHsResponse(client, HS_ERR_DENIED, 0, 0);
+                std::cout << "[kvm] request " << peer_ip << " declined\n"
+                          << std::flush;
+                return;
+            case KVM_APPROVAL_TIMEOUT:
+                /* An unanswered prompt is not a refusal: no cooldown. */
+                kvmSendHsResponse(client, HS_ERR_AUTH_TIMEOUT, 0, 0);
+                std::cout << "[kvm] request " << peer_ip << " timed out\n"
+                          << std::flush;
+                return;
+            case KVM_APPROVAL_CANCELLED:
+                /* Peer hung up or the receiver is stopping. Not a refusal and
+                 * not the peer's fault; the socket is usually already gone, so
+                 * skip the reply and free the slot now (the guard does it on
+                 * return) instead of waiting out the 30 s deadline. */
+                std::cout << "[kvm] request " << peer_ip
+                          << " cancelled during approval\n" << std::flush;
+                return;
+            case KVM_APPROVAL_FAILED:
+                /* No human was asked because the prompt could not be created.
+                 * Log the real cause but answer like a refusal; a local
+                 * failure must not arm the peer cooldown. */
+                kvmSendHsResponse(client, HS_ERR_DENIED, 0, 0);
+                std::cout << "[kvm] request " << peer_ip
+                          << " denied: approval prompt failed\n" << std::flush;
+                return;
+            case KVM_APPROVAL_BUSY:
+                /* Another device is already asking the local user. Answer
+                 * "busy" instead of dropping the request silently; not a
+                 * refusal, so no cooldown. */
+                kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
+                std::cout << "[kvm] request " << peer_ip
+                          << " refused: another approval is pending\n"
+                          << std::flush;
+                return;
+            default:
+                kvmSendHsResponse(client, HS_ERR_DENIED, 0, 0);
+                std::cout << "[kvm] request " << peer_ip
+                          << " denied: unknown approval verdict\n" << std::flush;
+                return;
+            }
+        }
+    }
+
+    /* Authorization succeeded (or the policy is open). Password/open claim
+     * here; manual already holds the slot from before its prompt. Promote
+     * before telling the controller it may start. */
+    if (!lease.held) {
+        if (!mivaraSessionClaim(MIVARA_SESSION_STITCH, 30000, &lease.lease)) {
+            kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
+            std::cout << "[kvm] request from " << peer_ip
+                      << " refused: another session claimed the slot\n"
+                      << std::flush;
+            return;
+        }
+        lease.held = true;
+    }
+    if (!mivaraSessionPromote(lease.lease)) {
+        /* The claim expired while we were authorizing; the destructor releases
+         * whatever is left, and the caller is told the slot is busy. */
+        kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
+        std::cout << "[kvm] request from " << peer_ip
+                  << " refused: session claim expired\n" << std::flush;
+        return;
+    }
+    hs.markSuccess();
+
+    if (mode != MIVARA_AUTH_OPEN) {
+        if (!kvmSendHsResponse(client, HS_OK, sw, sh)) return;
+    }
+
     reply.status = htonl(KVM_OK);
     reply.screen_x = (int32_t)htonl((uint32_t)sx);
     reply.screen_y = (int32_t)htonl((uint32_t)sy);
@@ -1625,37 +2320,89 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
 
 } /* namespace */
 
-void kvmServiceRun(std::atomic<bool> &running)
+/* Real listener state, readable from any thread before, during or after
+ * kvmServiceRun(). state: 0 = not started yet (starting), 1 = listening,
+ * -1 = failed; stage: 0 none, 1 socket, 3 bind, 4 listen. */
+static std::atomic<int> g_kvm_start_state{0};
+static std::atomic<int> g_kvm_start_stage{0};
+static std::atomic<int> g_kvm_start_error{0};
+
+static void kvmReportStartup(int state, int stage, int error)
+{
+    g_kvm_start_error.store(error);
+    g_kvm_start_stage.store(stage);
+    g_kvm_start_state.store(state);   /* publish the state last */
+}
+
+KvmStartupStatus kvmServiceStatus()
+{
+    KvmStartupStatus st = {};
+    st.state = g_kvm_start_state.load();
+    st.stage = g_kvm_start_stage.load();
+    st.error_code = g_kvm_start_error.load();
+    st.port = (uint16_t)KVM_PORT;
+    return st;
+}
+
+void kvmServiceRun(std::atomic<bool> &running, const KvmTargetAuth *auth)
 {
     raiseThreadDpiAwareness();
+    kvmReportStartup(0, 0, 0);
 
     kvm_sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == KVM_INVALID_SOCK) {
-        std::cout << "[kvm] socket init failed; stitch disabled\n";
+        const int err = WSAGetLastError();
+        kvmReportStartup(-1, 1, err);
+        std::cout << "[kvm] socket init failed (" << err
+                  << "); stitch disabled\n" << std::flush;
         return;
     }
-    int reuse = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse,
-               sizeof(reuse));
+    /* SO_EXCLUSIVEADDRUSE, not SO_REUSEADDR: on Windows the latter allows a
+     * second bind on the same port (and would let this process hide an
+     * existing listener behind it), so a real port conflict would look like
+     * success. Exclusive use makes bind() fail and the GUI sees the truth. */
+    BOOL exclusive = TRUE;
+    if (setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   (const char *)&exclusive, sizeof(exclusive)) != 0) {
+        const int err = WSAGetLastError();
+        kvmReportStartup(-1, 1, err);
+        std::cout << "[kvm] SO_EXCLUSIVEADDRUSE failed (" << err
+                  << "); stitch disabled\n" << std::flush;
+        kvmClose(srv);
+        return;
+    }
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(KVM_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(srv, (sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(srv, 4) < 0) {
-        std::cout << "[kvm] bind failed on " << KVM_PORT
-                  << "; stitch disabled\n" << std::flush;
+    if (bind(srv, (sockaddr *)&addr, sizeof(addr)) < 0) {
+        const int err = WSAGetLastError();
+        kvmReportStartup(-1, 3, err);
+        std::cout << "[kvm] bind failed on " << KVM_PORT << " (error " << err
+                  << "); stitch disabled\n" << std::flush;
         kvmClose(srv);
         return;
     }
+    if (listen(srv, 4) < 0) {
+        const int err = WSAGetLastError();
+        kvmReportStartup(-1, 4, err);
+        std::cout << "[kvm] listen failed on " << KVM_PORT << " (error " << err
+                  << "); stitch disabled\n" << std::flush;
+        kvmClose(srv);
+        return;
+    }
+    kvmReportStartup(1, 4, 0);
     std::cout << "[kvm] stitch listener on TCP " << KVM_PORT << "\n"
               << std::flush;
 
     /* The session runs on its own thread so the listener stays responsive:
      * a second controller gets an immediate KVM_ERR_BUSY instead of sitting
      * in the accept backlog for the whole (possibly hours-long) session, and
-     * shutdown never has to wait for the modal consent box to be answered. */
+     * shutdown never has to wait for the modal consent box to be answered.
+     * Only one serveClient runs at a time. `session_active` is the same-port
+     * admission only; the cross-mode (8081 vs 8084) slot is the shared gate
+     * in auth.h, checked and claimed inside serveClient. */
     std::atomic<bool> session_active{false};
     std::thread session;
 
@@ -1707,8 +2454,8 @@ void kvmServiceRun(std::atomic<bool> &running)
         if (session.joinable()) session.join();
         session_active = true;
         std::string peer(ip);
-        session = std::thread([client, peer, &running, &session_active] {
-            serveClient(client, peer, running);
+        session = std::thread([client, peer, &running, &session_active, auth] {
+            serveClient(client, peer, running, auth);
             kvmClose(client);
             session_active = false;
         });
@@ -1722,12 +2469,14 @@ void kvmServiceRun(std::atomic<bool> &running)
 #else /* !_WIN32 */
 
 int kvmRunController(const char *peer_ip, int peer_port, int side,
-                     const std::atomic<bool> &running)
+                     const std::atomic<bool> &running,
+                     const KvmClientAuth *auth)
 {
     (void)peer_ip;
     (void)peer_port;
     (void)side;
     (void)running;
+    (void)auth;
     std::cout << "STAT|event=error|msg=拼接模式目前仅支持 Windows\n"
               << std::flush;
     return 3;
@@ -1738,9 +2487,21 @@ void kvmSetControllerSide(int side)
     (void)side;
 }
 
-void kvmServiceRun(std::atomic<bool> &running)
+void kvmServiceRun(std::atomic<bool> &running, const KvmTargetAuth *auth)
 {
     (void)running;
+    (void)auth;
+}
+
+/* 拼接 is Windows-only, so there is no listener to report on other platforms. */
+KvmStartupStatus kvmServiceStatus()
+{
+    KvmStartupStatus st = {};
+    st.state = 2;   /* not supported */
+    st.stage = 0;
+    st.error_code = 0;
+    st.port = (uint16_t)KVM_PORT;
+    return st;
 }
 
 #endif /* _WIN32 */

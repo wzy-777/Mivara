@@ -44,11 +44,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include "auth.h"
 #include "config.h"
 #include "discover.h"
 #include "history.h"
 #include "kvm.h"
 #include "theme.h"
+#include "tray.h"
 #include "update.h"
 #include "vdd.h"
 #include "version.h"
@@ -152,17 +154,34 @@
 
 #define CARD_R THEME.radiusCard
 
-/* home */
+/* home — one primary entry (连接设备) plus a low-weight receive status bar.
+ * 接收 is no longer a hero card: it is a setting that runs in the background,
+ * so it gets a status row with one contextual action instead. */
 #define HOME_TITLE_Y 76                 /* tagline under the header             */
 #define HOME_BAND_Y 108                 /* update notice band                   */
 #define HOME_CAPTION_Y 160
 #define HOME_CARD_Y 184
-#define HOME_CARD_W 336
-#define HOME_CARD_H 156
+#define HOME_CARD_W BODY_W              /* full-width 连接设备 card              */
+#define HOME_CARD_H 104
 #define HOME_CARD_X(i) (BODY_X + (i) * (HOME_CARD_W + 24))
+/* While a sender session is active the hero card becomes a session card with
+ * these two buttons; they sit inside the same card rect, right-aligned. */
+#define HOME_SESSION_BTN_H 34
+#define HOME_SESSION_BTN_Y (HOME_CARD_Y + 56)
+#define HOME_SESSION_STOP_W 96
+#define HOME_SESSION_BACK_W 116
+#define HOME_SESSION_STOP_X (HOME_CARD_X(0) + HOME_CARD_W - 16 - HOME_SESSION_STOP_W)
+#define HOME_SESSION_BACK_X (HOME_SESSION_STOP_X - 8 - HOME_SESSION_BACK_W)
 
-#define HIST_CARD_Y 372
-#define HIST_CARD_H 288
+#define RECV_BAR_Y 300
+#define RECV_BAR_H 68
+#define RECV_BAR_ACT_W 104
+#define RECV_BAR_ACT_H 32
+#define RECV_BAR_ACT_X (BODY_R - 16 - RECV_BAR_ACT_W)
+#define RECV_BAR_ACT_Y (RECV_BAR_Y + (RECV_BAR_H - RECV_BAR_ACT_H) / 2)
+
+#define HIST_CARD_Y 376
+#define HIST_CARD_H 284
 #define HIST_ROW_X (BODY_X + 16)
 #define HIST_ROW_W (BODY_W - 32)
 #define HIST_ROW_H 44
@@ -289,6 +308,58 @@ static SDL_Rect rcSideCancel()
 #define SET_ACT_Y 648                   /* 确定 / 恢复默认 / 返回会话             */
 #define SET_ACT_H 44
 
+/* Settings tabs: 常规 keeps the existing card layout; 接收与安全 owns the
+ * receive switch + connection authorization. The chips sit in the title row
+ * so neither tab needs a shifted copy of the layout above. */
+#define SET_TAB_Y 58
+#define SET_TAB_H 34
+#define SET_TAB_W 118
+#define SET_TAB_X(i) (BODY_R - (2 - (i)) * (SET_TAB_W + 8))
+
+/* 接收与安全 tab */
+#define SEC_SWITCH_Y 108
+#define SEC_SWITCH_H 196
+#define SEC_AUTH_Y 320
+#define SEC_AUTH_H 292
+#define SEC_ROW_X (BODY_X + 20)
+#define SEC_ROW_W (BODY_W - 40)
+#define SEC_TOGGLE_Y(i) (SEC_SWITCH_Y + 50 + (i) * 44)
+#define SEC_POLICY_Y(i) (SEC_AUTH_Y + 50 + (i) * 42)
+#define SEC_POLICY_X (BODY_X + 32)
+#define SEC_PW_ROW_Y (SEC_AUTH_Y + 190)
+
+/* Authorization modals: the receiver's approval request and the sender's
+ * password prompt. Both are overlays drawn above the screen but below the
+ * buttons, which buildButtons() limits to the dialog's own cells. */
+#define AUTH_DLG_W 460
+#define AUTH_DLG_H 250
+#define AUTH_DLG_X (CONTENT_X + (CONTENT_W - AUTH_DLG_W) / 2)
+#define AUTH_DLG_Y 220
+
+#define PW_DLG_W 460
+#define PW_DLG_H 286
+#define PW_DLG_X (CONTENT_X + (CONTENT_W - PW_DLG_W) / 2)
+#define PW_DLG_Y 200
+#define PW_FIELD_X (PW_DLG_X + 24)
+#define PW_FIELD_Y (PW_DLG_Y + 78)
+#define PW_FIELD_W (PW_DLG_W - 48)
+#define PW_FIELD_H 44
+#define PW_SHOW_X (PW_FIELD_X + PW_FIELD_W - 116)
+#define PW_SHOW_Y (PW_FIELD_Y + PW_FIELD_H + 12)
+
+/* 设置 / 修改连接密码: one masked field. The 显示密码 link is the only
+ * safeguard against a typo now that there is no confirmation field. */
+#define SETPW_DLG_W 460
+#define SETPW_DLG_H 250
+#define SETPW_DLG_X (CONTENT_X + (CONTENT_W - SETPW_DLG_W) / 2)
+#define SETPW_DLG_Y 190
+#define SETPW_FIELD_X (SETPW_DLG_X + 24)
+#define SETPW_FIELD_W (SETPW_DLG_W - 48)
+#define SETPW_FIELD_H 38
+#define SETPW_A_Y (SETPW_DLG_Y + 84)
+#define SETPW_SHOW_X (SETPW_FIELD_X + SETPW_FIELD_W - 116)
+#define SETPW_SHOW_Y (SETPW_A_Y + SETPW_FIELD_H + 10)
+
 #define SET_CODEC_LABEL_Y 168
 #define SET_GRID_Y0 196                 /* codec 3x2 grid                        */
 #define SET_ROW_Y(i) (288 + (i) * 44)   /* 画质 / 帧率 / 码率 / 缩放 / 色度      */
@@ -352,6 +423,34 @@ static const char *sendModeLabel(int mode)
     }
 }
 
+/* Sender connection phase. The sender used to fold 连接中 / 等待密码 / 等待授权 /
+ * 验证中 / 已授权未开流 into one "会话进行中" screen; the phase is now the only
+ * source for that screen's copy, so waiting is never shown as an active
+ * session. STAT|event=start (video) or event=stitch (拼接) is the only way into
+ * SP_LIVE. */
+enum SendPhase {
+    SP_IDLE = 0,
+    SP_CONNECTING,
+    SP_PASSWORD,
+    SP_WAIT_AUTH,
+    SP_VERIFY,
+    SP_GRANTED,
+    SP_LIVE,
+    SP_FAILED
+};
+static SendPhase g_send_phase = SP_IDLE;
+
+/* STAT lines are last-wins and can arrive out of order on a slow link: once the
+ * session is live, an older auth line must not drag the UI back to 等待授权. */
+static void setSendPhase(SendPhase p)
+{
+    if (g_send_phase == SP_LIVE &&
+        (p == SP_CONNECTING || p == SP_PASSWORD || p == SP_WAIT_AUTH ||
+         p == SP_VERIFY || p == SP_GRANTED))
+        return;
+    g_send_phase = p;
+}
+
 /* ── button ids ──────────────────────────────────────────────────────────── */
 enum BtnId {
     BTN_NONE = -1,
@@ -360,6 +459,10 @@ enum BtnId {
     BTN_HOME_SEND,
     BTN_HOME_RECEIVE_STOP,
     BTN_HOME_SENDER_STOP,
+    BTN_HOME_CONNECT,                   /* 连接设备 hero card (102) */
+    BTN_HOME_RECV_START,                /* 接收状态栏 开启 / 重试   */
+    BTN_HOME_RECV_DETAIL,               /* 接收状态栏 → 接收详情    */
+    BTN_HOME_RECV_SETTINGS,             /* 接收状态栏 → 接收与安全  */
     /* receiving */
     BTN_RECV_STOP = 200,
     BTN_RECV_LOG,
@@ -440,7 +543,34 @@ enum BtnId {
     BTN_STITCH_SIDE_BASE = 9000,        /* +0..3, plus cancel */
     BTN_STITCH_SIDE_CANCEL = 9004,
     BTN_STITCH_SWITCH_BASE = 9010,      /* +0..3 */
+
+    /* authorization modals (receiver approval / sender password) */
+    BTN_AUTH_ALLOW  = 9100,
+    BTN_AUTH_DENY,
+    BTN_PW_CONNECT  = 9110,
+    BTN_PW_CANCEL,
+    BTN_PW_SHOW,
+
+    /* settings tabs + 接收与安全 controls (below the nav block, above the
+     * stitch block; exact-match ids, so no range arithmetic) */
+    BTN_SET_TAB_BASE  = 8030,           /* +0 常规 / +1 接收与安全 */
+    BTN_SET_ALLOW_RECV = 8040,          /* 允许其他设备连接到此电脑 */
+    BTN_SET_POLICY_OPEN,                /* 允许任意连接             */
+    BTN_SET_POLICY_PASSWORD,            /* 仅允许密码连接           */
+    BTN_SET_POLICY_MANUAL,              /* 每次手动授权             */
+    BTN_SET_PW_EDIT,                    /* 设置 / 修改连接密码      */
+    BTN_SETPW_OK      = 9120,           /* password editor modal */
+    BTN_SETPW_CANCEL,
+    BTN_SETPW_SHOW,
+    BTN_SETPW_FIELD_A,                  /* 连接密码 field      */
 };
+
+/* 接收与安全 policy radios — kept outside the enum arithmetic so the three
+ * policies cannot drift from auth.h's MivaraAuthMode values. */
+static const int kAuthModeBtn[3] = {BTN_SET_POLICY_OPEN,
+                                    BTN_SET_POLICY_PASSWORD,
+                                    BTN_SET_POLICY_MANUAL};
+static const char *kAuthModeKey[3] = {"open", "password", "manual"};
 
 static_assert(BTN_SET_THEME_BASE > BTN_UPD_NOTICE && BTN_SET_THEME_BASE + 2 < BTN_NAV_HOME,
               "appearance ids must stay in the gap between the settings and nav ranges");
@@ -534,6 +664,15 @@ struct ChildProc {
     std::thread reader;
 };
 
+static bool childExited(ChildProc &child, const char *name);
+static void setScreen(Screen s);
+
+/* spawnChild flags: the control pipe and the visible console are independent.
+ * A receiver ALWAYS gets the pipe — it speaks the --gui protocol over
+ * stdin/stdout — so "no pipe + --gui" can no longer be constructed. The console
+ * bit only decides whether a second, visible console window is allocated. */
+enum { SPAWN_PIPES = 1u, SPAWN_CONSOLE = 2u };
+
 /* Last-wins decoded STAT| payload. */
 struct LiveStats {
     bool valid = false;
@@ -541,6 +680,15 @@ struct LiveStats {
     std::string fps, kbps, codec, hw, mode, src, dst, quality, frames, t;
     std::string state;      /* event=stitch: waiting | local | remote */
     std::string side;       /* event=stitch: left | right | top | bottom */
+    std::string id;         /* event=auth: approval request id            */
+    std::string dev, ip;    /* event=auth|start|stop: peer identity      */
+    std::string req;        /* event=auth: video (8081) | stitch (8084)  */
+    std::string policy;     /* receiver: open | password | manual        */
+    std::string record;     /* receiver: ok | bad (password record)      */
+    std::string svc;        /* receiver: gpu | ports | kvm (event=svc)   */
+    std::string stage;      /* receiver: service startup stage           */
+    std::string err;        /* receiver: service error token             */
+    int         port = 0;   /* receiver: service port                    */
 };
 
 /* The 拼接 chooser holds the device it was opened for; only valid while
@@ -551,6 +699,69 @@ struct StitchAsk {
     std::string ip;
     std::string name;
     int port = KVM_PORT;
+};
+
+/* ── receive state (from the receiver's STAT lines) ───────────────────────
+ * The home screen shows a low-weight status bar instead of a hero card, so
+ * every state the receiver can be in needs a name here. RSV_OFF means the
+ * receiver child is not running; RSV_FAILED keeps the error token until the
+ * user retries. */
+enum RecvState {
+    RSV_OFF = 0,      /* 接收已关闭            */
+    RSV_STARTING,     /* 正在开启              */
+    RSV_WAITING,      /* 等待连接              */
+    RSV_AUTH,         /* 等待授权              */
+    RSV_STREAMING,    /* 正在接收              */
+    RSV_FAILED        /* 开启失败              */
+};
+
+/* A manual-approval request from the receiver (event=auth, state=pending).
+ * The receiver auto-denies after 30 s; the deadline here only stops the app
+ * from showing a dialog the receiver has already given up on. */
+struct AuthAsk {
+    bool   open = false;
+    long   id = 0;
+    std::string dev, ip;
+    std::string req;              /* "video" | "stitch" (empty = video) */
+    Uint32 deadline = 0;
+};
+
+/* Sender-side password prompt (event=auth, state=need_password). */
+struct PwAsk {
+    bool   open = false;
+    bool   show = false;          /* 显示密码 toggle */
+    std::string text;
+    std::string error;
+    Uint32 deadline = 0;          /* sender gives up 120 s after asking */
+};
+
+/* 设置 → 接收与安全: the single-field password editor. Only the PBKDF2
+ * record is kept; the plaintext is dropped as soon as it is hashed. */
+struct SetPwAsk {
+    bool   open = false;
+    bool   show = false;
+    std::string a, err;
+};
+
+/* Startup result of the auxiliary receivers (8082 计算 / 8083 端口 / 8084 拼接).
+ * The primary video listener (8081) is tracked by RecvState: only its failure
+ * is 开启失败. A failed side service degrades the receive state instead. */
+struct RecvServiceState {
+    int         state = -1;       /* -1 unknown · 0 ok · 1 fail · 2 na */
+    int         port = 0;
+    std::string err;              /* stable token (bind_failed, …) */
+};
+struct RecvServices {
+    RecvServiceState gpu, ports, kvm;
+    RecvServices() { gpu.port = 8082; ports.port = 8083; kvm.port = 8084; }
+};
+
+/* A queued STAT line plus the receiver generation that produced it. Lines from
+ * a previous receiver process must never resurrect 等待连接 after a stop. */
+struct StatMsg {
+    std::string line;
+    bool        from_receiver = false;
+    unsigned long epoch = 0;
 };
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
@@ -608,6 +819,34 @@ static AppConfig g_live_params;         /* params the running sender holds */
 static std::string g_last_ip, g_last_name;
 static int  g_last_port = 8081;
 static StitchAsk g_stitch_ask;          /* 拼接 direction modal (if open) */
+static std::atomic<int> g_recv_state{RSV_OFF};
+static std::atomic<unsigned long> g_recv_epoch{0}; /* incremented per launch/stop */
+static std::mutex       g_recv_mtx;
+static std::string      g_recv_policy = "manual";  /* open | password | manual */
+static std::string      g_recv_peer;               /* device · ip of the session/request */
+static std::string      g_recv_error;              /* last receiver error token */
+static RecvServices     g_recv_services;           /* guarded by g_recv_mtx */
+static Uint32           g_recv_started_at = 0;     /* SDL_GetTicks() of STARTING */
+static AuthAsk          g_auth_ask;
+static PwAsk            g_pw_ask;
+static SetPwAsk         g_set_pw;
+static int              g_set_tab = 0;      /* 0 常规 / 1 接收与安全 */
+static std::string      g_auth_wait_note;  /* sender: 等待授权 / 正在验证 */
+
+/* Windows tray state. `g_hidden` means the main window is hidden but the
+ * process (and its children) keep running; `g_tray_ok` is false on POSIX or
+ * when the shell refused the icon, in which case closing the window exits as
+ * before. */
+static bool             g_tray_ok = false;
+static bool             g_hidden = false;
+static std::string      g_tray_tip_last;
+static bool             g_exit_requested = false;  /* UI asked to quit      */
+static bool             g_exit_no_confirm = false; /* installer hand-over  */
+
+/* STAT lines arrive on the child readers' threads; only the GUI thread may
+ * touch SDL / the dialogs, so the readers enqueue and the loop drains. */
+static std::mutex g_stat_q_mtx;
+static std::deque<StatMsg> g_stat_q;
 static std::vector<HistEntry> g_hist;
 static int g_hist_scroll = 0;
 
@@ -2122,7 +2361,242 @@ static void logPush(const std::string &line)
     persistLogLine(line);
 }
 
-static void parseStatLine(const std::string &line)
+static void closeAuthAsk(long id);
+static void openPasswordAsk(const std::string &error);
+static void showFromTray();
+
+/* Short, non-leaking description of a receiver error token. */
+static std::string receiverErrorText(const std::string &msg)
+{
+    if (msg == "bind_failed")         return "端口 8081 被占用或被防火墙拦截";
+    if (msg == "socket_init_failed")  return "网络初始化失败";
+    if (msg == "auth_failed")         return "连接密码错误";
+    if (msg == "auth_throttled")      return "密码错误次数过多，请稍后再试";
+    if (msg == "auth_timeout")        return "授权超时，已自动拒绝";
+    if (msg == "auth_denied")         return "已拒绝连接请求";
+    if (msg == "auth_config")         return "连接密码记录无效，请在设置中重新设置";
+    if (msg == "spawn_failed")        return "接收程序启动失败";
+    if (msg == "not_installed")       return "找不到 receiver 程序，请重新安装或运行 make";
+    if (msg == "start_timeout")       return "接收服务启动超时，请重试";
+    if (msg == "receiver_exited")     return "接收服务意外退出，请重试";
+    if (msg == "receiver_unresponsive") return "接收进程无响应，请重新开启接收";
+    if (msg == "version_mismatch")    return "对方版本不兼容，请将两端更新到同一版本";
+    if (msg.empty())                  return "接收服务出现异常";
+    return msg;
+}
+
+/* Sender-side failure tokens → user-facing text. The sender reports stable
+ * tokens on STAT|event=error, and the PRD requires the user to be able to tell
+ * a wrong password from a refusal, a timeout, a busy peer or a version skew.
+ * Unknown values are shown unchanged: kvm.cpp already emits Chinese text. */
+static std::string senderErrorText(const std::string &msg)
+{
+    if (msg == "bad_password")    return "连接密码错误";
+    if (msg == "auth_timeout")    return "对方未在 30 秒内确认，已自动拒绝";
+    if (msg == "auth_denied")     return "对方拒绝了连接请求";
+    if (msg == "peer_busy")       return "对方正在接收其他连接，请稍后再试";
+    if (msg == "auth_config")     return "对方接收授权配置异常，请在对方设置中重新设置连接密码";
+    if (msg == "version_mismatch") return "两端版本不一致，请将软件更新到同一版本";
+    if (msg == "legacy_peer")     return "对方版本过旧，不支持连接授权，请更新两端";
+    if (msg == "auth_failed")     return "授权过程中连接已断开";
+    if (msg == "codec_rejected")  return "对方不支持所选编码，请更换编码方式";
+    if (msg == "dims_rejected")   return "分辨率不被对方接受，请调整缩放";
+    if (msg == "decoder_unavailable") return "对方解码器不可用，请更换编码方式";
+    if (msg == "handshake_rejected")  return "对方拒绝了握手";
+    if (msg == "connect_failed")      return "无法连接对方（接收服务未开启或网络不可达）";
+    if (msg == "send_failed")         return "网络连接中断";
+    if (msg == "encoder_open_failed" || msg == "encoder_rebuild_failed")
+        return "编码器初始化失败，请更换编码方式";
+    if (msg == "capture_failed_or_display_changed")
+        return "屏幕采集失败，或显示配置已改变";
+    if (msg == "vdd_startup_failed")  return "虚拟显示器启动失败";
+    if (msg == "vdd_lost")            return "虚拟显示器已断开";
+    if (msg == "resize_notify_failed" || msg == "reconfig_notify_failed")
+        return "通知对方调整参数失败";
+    return msg;
+}
+
+/* Reason text for an auxiliary service error token (never a password). */
+static std::string recvServiceErrorText(const std::string &err)
+{
+    if (err == "bind_failed")        return "端口被占用或被防火墙拦截";
+    if (err == "socket_init_failed") return "网络初始化失败";
+    if (err == "unsupported")        return "当前平台不支持";
+    return err;
+}
+
+/* "部分服务不可用：计算 8082（端口被占用…）、拼接 8084（…）"
+ * 8081 is the primary listener and is represented by RSV_FAILED, not here.
+ * state=na (e.g. 拼接 on POSIX) is "not applicable", not a problem. */
+static std::string recvServicesIssue(const RecvServices &svc)
+{
+    struct Item { const char *label; const RecvServiceState *st; };
+    const Item items[3] = {{"计算", &svc.gpu},
+                           {"端口", &svc.ports},
+                           {"拼接", &svc.kvm}};
+    std::string out;
+    for (const Item &it : items) {
+        if (it.st->state != 1) continue;     /* only fail() is a problem */
+        out += out.empty() ? "部分服务不可用：" : "、";
+        out += it.label;
+        out += " " + std::to_string(it.st->port);
+        const std::string why = recvServiceErrorText(it.st->err);
+        if (!why.empty()) out += "（" + why + "）";
+    }
+    return out;
+}
+
+/* Home-screen status bar state, driven by the receiver's STAT lines. */
+static void applyReceiverStat(const LiveStats &s)
+{
+    if (s.event == "policy") {
+        bool recovered = false;
+        bool bad = false;
+        {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            if (!s.mode.empty()) g_recv_policy = s.mode;
+            bad = (s.mode == "password" && s.record == "bad");
+            /* A usable record — or a non-password policy, which has no record
+             * at all — resolves 授权配置无效. Nothing else may clear it. */
+            if (g_recv_error == "auth_config" &&
+                (s.record == "ok" ||
+                 (!s.mode.empty() && s.mode != "password"))) {
+                g_recv_error.clear();
+                recovered = true;
+            }
+        }
+        if (bad) {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_error = "auth_config";
+            /* An active session is real; the new policy only affects new
+             * connections, so do not paint the session as failed. */
+            if (g_recv_state.load() != RSV_STREAMING) g_recv_state = RSV_FAILED;
+            return;
+        }
+        if (recovered && g_receiver.active) g_recv_state = RSV_WAITING;
+        return;
+    }
+    if (s.event == "ready" || s.event == "waiting") {
+        /* A corrupt password record leaves the service listening but rejects
+         * every connection. A later ready/waiting must never paint that as
+         * 等待连接 — only a policy line with record=ok clears it. */
+        if (s.record == "bad" || s.state == "error") {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_error = "auth_config";
+            if (!s.policy.empty()) g_recv_policy = s.policy;
+            if (g_recv_state.load() != RSV_STREAMING) g_recv_state = RSV_FAILED;
+            if (g_hidden)
+                trayNotify("接收服务异常", receiverErrorText("auth_config"));
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            if (!s.policy.empty()) g_recv_policy = s.policy;
+            if (g_recv_error == "auth_config") {
+                if (g_recv_state.load() != RSV_STREAMING) g_recv_state = RSV_FAILED;
+                return;                     /* sticky until record=ok */
+            }
+            g_recv_error.clear();
+        }
+        const int cur = g_recv_state.load();
+        if (cur != RSV_STREAMING && cur != RSV_AUTH)
+            g_recv_state = RSV_WAITING;
+        return;
+    }
+    if (s.event == "auth") {
+        if (s.state == "pending") {
+            g_auth_ask.open = true;
+            g_auth_ask.id = std::atol(s.id.c_str());
+            g_auth_ask.dev = s.dev;
+            g_auth_ask.ip = s.ip;
+            g_auth_ask.req = s.req;
+            g_auth_ask.deadline = SDL_GetTicks() + 30000;
+            g_recv_state = RSV_AUTH;
+            {
+                std::lock_guard<std::mutex> lk(g_recv_mtx);
+                g_recv_peer = (s.dev.empty() ? s.ip : s.dev) +
+                              (s.ip.empty() ? "" : " · " + s.ip);
+            }
+            /* The prompt has a 30 s deadline, so a hidden window must come
+             * back immediately — a balloon alone would not let the user answer
+             * in time. */
+            if (g_hidden) {
+                showFromTray();
+                trayNotify("有设备请求连接",
+                           (s.dev.empty() ? s.ip : s.dev) +
+                               (s.req == "stitch"
+                                    ? " 请求拼接控制，请在 30 秒内选择"
+                                    : " 请求投屏/扩展，请在 30 秒内选择"));
+            }
+        } else if (s.state == "done") {
+            const long id = std::atol(s.id.c_str());
+            /* Only the request that owns the visible prompt may return the
+             * state to "waiting"; a late done for an older id must not clear
+             * a prompt the user is still looking at. */
+            const bool current = g_auth_ask.open && g_auth_ask.id == id;
+            closeAuthAsk(id);
+            if (current && g_receiver.active) g_recv_state = RSV_WAITING;
+        }
+        return;
+    }
+    if (s.event == "start") {
+        g_recv_state = RSV_STREAMING;
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_peer = (s.dev.empty() ? s.ip : s.dev) +
+                      (s.ip.empty() ? "" : " · " + s.ip);
+        /* A corrupt record cannot produce a real session; keep the token. */
+        if (g_recv_error != "auth_config") g_recv_error.clear();
+        return;
+    }
+    if (s.event == "stop") {
+        if (g_receiver.active) g_recv_state = RSV_WAITING;
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_peer.clear();
+        return;
+    }
+    if (s.event == "svc") {
+        int val;
+        if (s.state == "ok")       val = 0;
+        else if (s.state == "fail") val = 1;
+        else if (s.state == "na")   val = 2;
+        else return;
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        RecvServiceState *dst = nullptr;
+        if (s.svc == "gpu")        dst = &g_recv_services.gpu;
+        else if (s.svc == "ports") dst = &g_recv_services.ports;
+        else if (s.svc == "kvm")   dst = &g_recv_services.kvm;
+        if (!dst) return;
+        dst->state = val;
+        if (s.port > 0) dst->port = s.port;
+        dst->err = s.err;
+        logPush(std::string("[gui] 接收服务 ") + s.svc + "(" +
+                std::to_string(dst->port) + "): " + s.state +
+                (s.stage.empty() ? "" : " stage=" + s.stage) +
+                (s.err.empty() ? "" : " err=" + s.err));
+        return;
+    }
+    if (s.event == "error") {
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_error = s.msg;
+        /* Per-connection failures leave the service listening; a bind/socket
+         * failure or an unusable password record makes the service a real
+         * 开启失败. auth_config may also arrive for a second peer while a
+         * session is live — that session is still real. */
+        const bool fatal = (s.msg == "bind_failed" ||
+                            s.msg == "socket_init_failed" ||
+                            s.msg == "auth_config");
+        if (fatal) {
+            if (!(s.msg == "auth_config" &&
+                  g_recv_state.load() == RSV_STREAMING))
+                g_recv_state = RSV_FAILED;
+            /* Errors must stay discoverable while the window is hidden. */
+            if (g_hidden) trayNotify("接收服务异常", receiverErrorText(s.msg));
+        }
+        return;
+    }
+}
+
+static void parseStatLine(const std::string &line, bool from_receiver)
 {
     /* STAT|k=v|k=v|… */
     LiveStats s;
@@ -2152,19 +2626,106 @@ static void parseStatLine(const std::string &line)
             else if (k == "msg") s.msg = v;
             else if (k == "state") s.state = v;
             else if (k == "side") s.side = v;
+            else if (k == "id") s.id = v;
+            else if (k == "dev") s.dev = v;
+            else if (k == "ip") s.ip = v;
+            else if (k == "req") s.req = v;
+            else if (k == "policy") s.policy = v;
+            else if (k == "record") s.record = v;
+            else if (k == "svc") s.svc = v;
+            else if (k == "stage") s.stage = v;
+            else if (k == "err") s.err = v;
+            else if (k == "port") s.port = std::atoi(v.c_str());
         }
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
-    std::lock_guard<std::mutex> lk(g_stats_mtx);
-    g_stats = s;
+    if (from_receiver) {
+        /* The receiver owns the home status bar; its stats never drive the
+         * sender's stat panel. */
+        applyReceiverStat(s);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_stats_mtx);
+        g_stats = s;
+    }
+    /* Sender authorization progress: the connect screen (and the password
+     * modal) follow these lines. The phase — not the last STAT payload — is
+     * what renderScreen() reads, so an out-of-order line cannot leave the UI
+     * claiming an active session while a password is still being checked. */
+    if (s.event == "auth") {
+        if (s.state == "need_password") {
+            setSendPhase(SP_PASSWORD);
+            openPasswordAsk(std::string());
+        } else if (s.state == "authenticating") {
+            g_pw_ask.open = false;
+            setSendPhase(SP_VERIFY);
+            g_auth_wait_note = "正在验证连接密码…";
+        } else if (s.state == "waiting") {
+            g_pw_ask.open = false;
+            setSendPhase(SP_WAIT_AUTH);
+            g_auth_wait_note = "已发送连接请求，等待对方授权（最多 30 秒）…";
+        } else if (s.state == "granted") {
+            setSendPhase(SP_GRANTED);
+            g_auth_wait_note = "对方已允许连接";
+        } else if (s.state == "cancelled") {
+            g_pw_ask.open = false;
+            setSendPhase(SP_CONNECTING);
+            g_auth_wait_note.clear();
+        }
+    } else if (s.event == "error") {
+        setSendPhase(SP_FAILED);
+        g_auth_wait_note.clear();
+    } else if (s.event == "start") {
+        setSendPhase(SP_LIVE);
+        g_auth_wait_note.clear();
+    } else if (s.event == "stitch") {
+        /* state=waiting is emitted before the 8084 connect and before the peer
+         * authorizes, so it is not a live session yet. Only local/remote are. */
+        if (s.state != "waiting") {
+            setSendPhase(SP_LIVE);
+            g_auth_wait_note.clear();
+        }
+    } else if (s.event == "stop") {
+        setSendPhase(SP_IDLE);
+        g_auth_wait_note.clear();
+    }
 }
 
-static void handleChildLine(const std::string &line)
+static void handleChildLine(const std::string &line, bool from_receiver,
+                            unsigned long epoch)
 {
-    if (line.compare(0, 5, "STAT|") == 0) parseStatLine(line);
-    else logPush(line);
-    if (line.compare(0, 5, "STAT|") == 0) persistLogLine(line);
+    if (line.compare(0, 5, "STAT|") == 0) {
+        /* Reader thread: queue it for the GUI thread. Only the GUI thread may
+         * open dialogs or touch SDL (SDL_StartTextInput in particular). */
+        {
+            std::lock_guard<std::mutex> lk(g_stat_q_mtx);
+            if (g_stat_q.size() > 512) g_stat_q.pop_front();
+            g_stat_q.push_back(StatMsg{line, from_receiver, epoch});
+        }
+        persistLogLine(line);
+    } else {
+        logPush(line);
+    }
+}
+
+/** Apply every queued STAT line. GUI thread only, once per frame.
+ *  Receiver lines carry the generation that produced them: a stop/restart
+ *  bumps g_recv_epoch, so a teardown ready/waiting/stop line from the previous
+ *  process can never put the UI back into 等待连接. */
+static void drainChildStats()
+{
+    std::deque<StatMsg> batch;
+    {
+        std::lock_guard<std::mutex> lk(g_stat_q_mtx);
+        batch.swap(g_stat_q);
+    }
+    const unsigned long epoch = g_recv_epoch.load();
+    for (auto &p : batch) {
+        if (p.from_receiver && p.epoch != epoch) continue;
+        parseStatLine(p.line, p.from_receiver);
+    }
 }
 
 static void stopReader(ChildProc &child)
@@ -2217,6 +2778,194 @@ static bool sendToChild(ChildProc &child, const std::string &line)
     }
     return true;
 #endif
+}
+
+/* ── authorization dialogs ───────────────────────────────────────────────── */
+/* Receiver side: a peer asks to connect and the policy is 每次手动授权. The
+ * dialog mirrors the receiver's own 30 s deadline; when it lapses the
+ * receiver denies on its own, so the app only stops showing the prompt. */
+static void closeAuthAsk(long id)
+{
+    if (!g_auth_ask.open) return;
+    if (id >= 0 && g_auth_ask.id != id) return;   /* a newer request owns it */
+    g_auth_ask.open = false;
+}
+
+static void answerAuthAsk(bool allow)
+{
+    if (!g_auth_ask.open) return;
+    const bool ok = sendToChild(g_receiver,
+                                "AUTH|id=" + std::to_string(g_auth_ask.id) + "|" +
+                                    (allow ? "allow" : "deny"));
+    g_auth_ask.open = false;
+    if (!ok) {
+        /* The decision never reached the receiver. Report the real reason
+         * instead of leaving the user believing the peer was answered. */
+        if (childExited(g_receiver, "receiver")) {
+            drainChildStats();
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_peer.clear();
+            if (g_recv_error.empty()) g_recv_error = "receiver_exited";
+            g_recv_state = RSV_FAILED;
+            logPush("[gui] 授权答复失败：接收进程已退出");
+        } else {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_error = "receiver_unresponsive";
+            g_recv_state = RSV_FAILED;
+            logPush("[gui] 授权答复失败：接收进程无响应");
+        }
+        return;
+    }
+    if (g_receiver.active) g_recv_state = RSV_WAITING;
+}
+
+/* Sender side: the receiver's policy is 仅允许密码连接. The password is typed
+ * here, sent over stdin (never argv), and cleared as soon as it is handed
+ * over. */
+static void openPasswordAsk(const std::string &error)
+{
+    if (g_pw_ask.open) {
+        if (!error.empty()) g_pw_ask.error = error;
+        return;
+    }
+    g_pw_ask.open = true;
+    g_pw_ask.show = false;
+    g_pw_ask.text.clear();
+    g_pw_ask.error = error;
+    g_pw_ask.deadline = SDL_GetTicks() + 120000;
+    SDL_StartTextInput();
+    /* A password prompt is time-limited and must be answerable: a hidden
+     * window cannot accept text, and a balloon alone would let the 120 s
+     * deadline expire unanswered. */
+    if (g_hidden) {
+        showFromTray();
+        trayNotify("对方要求输入连接密码",
+                   "请输入该接收端设置的 4～8 个字符连接密码（字母不区分大小写）；120 秒内未输入将取消连接");
+    }
+}
+
+static void closePasswordAsk(bool cancel)
+{
+    if (!g_pw_ask.open) return;
+    const bool was_open = g_pw_ask.open;
+    g_pw_ask.open = false;
+    g_pw_ask.text.assign(g_pw_ask.text.size(), '\0');
+    g_pw_ask.text.clear();
+    SDL_StopTextInput();
+    if (cancel && was_open) {
+        sendToChild(g_sender, "AUTH|cancel");
+        setSendPhase(SP_CONNECTING);
+        g_auth_wait_note.clear();
+    }
+}
+
+static void submitPassword()
+{
+    if (!mivaraPasswordValid(g_pw_ask.text)) {
+        g_pw_ask.error = mivaraPasswordRule();
+        return;
+    }
+    sendToChild(g_sender, "AUTH|password=" + g_pw_ask.text);
+    g_pw_ask.open = false;
+    g_pw_ask.text.assign(g_pw_ask.text.size(), '\0');
+    g_pw_ask.text.clear();
+    SDL_StopTextInput();
+    setSendPhase(SP_VERIFY);
+    g_auth_wait_note = "正在验证连接密码…";
+}
+
+/* Single source of truth for the 4–8 character password field. A too-long
+ * input is rejected as a whole and the original text is kept: the value that
+ * is later saved/submitted must never be a silently truncated different
+ * password. Non-ASCII / invisible bytes are rejected outright instead of
+ * being dropped — with no confirmation field left, silently shrinking a
+ * pasted password would save something the user never intended. */
+static const int kPasswordMaxLen = 8;   /* mirrors the 4–8 rule in auth.h */
+
+static bool appendPasswordInput(std::string &dst, const char *text,
+                                std::string &err)
+{
+    std::string add;
+    bool bad = false;
+    if (text) {
+        for (const char *c = text; *c; c++) {
+            const unsigned char u = (unsigned char)*c;
+            if (u >= 0x20 && u < 0x7F) add.push_back((char)u);
+            else bad = true;
+        }
+    }
+    if (bad) {
+        err = "连接密码仅支持 ASCII 可见字符";
+        return false;
+    }
+    if ((int)(dst.size() + add.size()) > kPasswordMaxLen) {
+        err = "密码长度为 4～8 个字符";
+        return false;
+    }
+    if (add.empty()) return false;      /* nothing visible: keep old text+err */
+    dst += add;
+    err.clear();
+    return true;
+}
+
+/* Receiving-side password editor (设置 → 接收与安全). The plaintext lives only
+ * in this field and is wiped on close; config.ini keeps salt + PBKDF2 hash
+ * (see auth.h). The 显示密码 link replaces the old confirmation field. */
+static void closeSetPwAsk()
+{
+    if (!g_set_pw.open) return;
+    g_set_pw.open = false;
+    g_set_pw.a.assign(g_set_pw.a.size(), '\0');
+    g_set_pw.a.clear();
+    g_set_pw.err.clear();
+    SDL_StopTextInput();
+}
+
+static void openSetPwAsk()
+{
+    /* The local 拼接 direction chooser and the password editor are two steps of
+     * different flows; keeping both open would stack two modals for no reason. */
+    g_stitch_ask.open = false;
+    g_set_pw.open = true;
+    g_set_pw.show = false;
+    g_set_pw.a.clear();
+    g_set_pw.err.clear();
+    SDL_StartTextInput();
+}
+
+static void submitSetPassword()
+{
+    if (!mivaraPasswordValid(g_set_pw.a)) {
+        g_set_pw.err = mivaraPasswordRule();
+        return;
+    }
+    uint8_t salt[16], hash[32];
+    uint32_t iter = (g_cfg_edit.auth_iter > 0)
+                        ? (uint32_t)g_cfg_edit.auth_iter
+                        : 0;
+    if (!mivaraAuthMakeRecord(g_set_pw.a, salt, hash, iter)) {
+        g_set_pw.err = "无法生成密码记录";
+        return;
+    }
+    g_cfg_edit.auth_salt = mivaraHexEncode(salt, sizeof(salt));
+    g_cfg_edit.auth_hash = mivaraHexEncode(hash, sizeof(hash));
+    g_cfg_edit.auth_iter = (int)iter;
+    closeSetPwAsk();
+    g_status_note = "密码已设置，点「确定」保存";
+}
+
+/* Drop dialogs whose deadline the child owns (receiver: 30 s auto-deny,
+ * sender: 120 s password prompt). */
+static void tickAuthDialogs()
+{
+    const Uint32 now = SDL_GetTicks();
+    if (g_auth_ask.open && (Sint32)(now - g_auth_ask.deadline) >= 0) {
+        closeAuthAsk(-1);
+        if (g_receiver.active && g_recv_state.load() == RSV_AUTH)
+            g_recv_state = RSV_WAITING;
+    }
+    if (g_pw_ask.open && (Sint32)(now - g_pw_ask.deadline) >= 0)
+        closePasswordAsk(true);
 }
 
 /* Diff the 7 transfer params into a SETP line; returns "SETP" if unchanged. */
@@ -2363,14 +3112,21 @@ static std::string sibling(const char *name)
     return exeDir() + "/" + name;
 }
 
-static bool spawnChild(ChildProc &child, const std::string &path, const std::vector<std::string> &args)
+static bool spawnChild(ChildProc &child, const std::string &path,
+                       const std::vector<std::string> &args,
+                       unsigned spawn_flags, bool is_receiver = false,
+                       unsigned long epoch = 0)
 {
     if (child.active) return false;
     if (child.reader.joinable()) child.reader.join();
 
-    const bool redirect = (g_cfg.show_status_console == 0);
+    /* Defence in depth: every receiver is launched with --gui and therefore
+     * needs the stdin/stdout channel, whatever the caller passed. */
+    if (is_receiver) spawn_flags |= SPAWN_PIPES;
+    const bool pipes = (spawn_flags & SPAWN_PIPES) != 0;
 
 #ifdef _WIN32
+    const bool console = (spawn_flags & SPAWN_CONSOLE) != 0;
     std::string cmd = "\"" + path + "\"";
     for (auto &a : args) cmd += " " + a;
     std::vector<char> buf(cmd.begin(), cmd.end());
@@ -2382,12 +3138,15 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
 
     HANDLE hWrite = nullptr;
     HANDLE hInRead = nullptr;
-    DWORD flags = CREATE_NEW_CONSOLE;
-    if (redirect) {
-        /* Hidden console + anonymous pipes: stdout/stderr → reader thread,
-         * stdin ← SETP lines for runtime reconfigure. CREATE_NO_WINDOW still
-         * allocates a console so AttachConsole() in stopChild() keeps working. */
-        flags = CREATE_NO_WINDOW;
+    /* Console and pipe are independent: the console bit only chooses whether a
+     * visible cmd window is allocated. CREATE_NO_WINDOW still allocates a
+     * (hidden) console, so AttachConsole() in stopChild() keeps working either
+     * way; with both bits set the child gets a visible console while its
+     * stdout/stderr go to the pipe. */
+    DWORD flags = console ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
+    if (pipes) {
+        /* Anonymous pipes: stdout/stderr → reader thread, stdin ← AUTH/RX/SETP
+         * lines. This is the channel the --gui receiver protocol depends on. */
         SECURITY_ATTRIBUTES sa{};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
@@ -2407,7 +3166,7 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
     }
 
     BOOL ok = CreateProcessA(path.c_str(), buf.data(), nullptr, nullptr,
-                             redirect ? TRUE : FALSE, flags,
+                             pipes ? TRUE : FALSE, flags,
                              nullptr, nullptr, &si, &child.pi);
     if (hWrite) CloseHandle(hWrite);        /* parent copy: EOF when child dies */
     if (hInRead) CloseHandle(hInRead);
@@ -2423,9 +3182,9 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
         return false;
     }
     child.active = true;
-    if (redirect && child.stdout_read) {
+    if (pipes && child.stdout_read) {
         HANDLE hRead = child.stdout_read;
-        child.reader = std::thread([hRead] {
+        child.reader = std::thread([hRead, is_receiver, epoch] {
             char chunk[4096];
             std::string partial;
             for (;;) {
@@ -2438,24 +3197,24 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
                     std::string line = partial.substr(0, pos);
                     partial.erase(0, pos + 1);
                     if (!line.empty() && line.back() == '\r') line.pop_back();
-                    handleChildLine(line);
+                    handleChildLine(line, is_receiver, epoch);
                 }
             }
-            if (!partial.empty()) handleChildLine(partial);
+            if (!partial.empty()) handleChildLine(partial, is_receiver, epoch);
         });
     }
     return true;
 #else
     int fds[2] = {-1, -1};
     int in_fds[2] = {-1, -1};
-    if (redirect) {
+    if (pipes) {
         if (pipe(fds) != 0) return false;
         if (pipe(in_fds) != 0) { close(fds[0]); close(fds[1]); return false; }
     }
 
     pid_t pid = fork();
     if (pid == 0) {
-        if (redirect) {
+        if (pipes) {
             close(fds[0]);
             dup2(fds[1], 1);
             dup2(fds[1], 2);
@@ -2474,19 +3233,19 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
         _exit(127);
     }
     if (pid < 0) {
-        if (redirect) {
+        if (pipes) {
             close(fds[0]); close(fds[1]);
             close(in_fds[0]); close(in_fds[1]);
         }
         return false;
     }
-    if (redirect) {
+    if (pipes) {
         close(fds[1]);
         child.stdout_fd = fds[0];
         close(in_fds[0]);
         child.stdin_fd = in_fds[1];
         int fd = fds[0];
-        child.reader = std::thread([fd] {
+        child.reader = std::thread([fd, is_receiver, epoch] {
             char chunk[4096];
             std::string partial;
             for (;;) {
@@ -2498,10 +3257,10 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
                     std::string line = partial.substr(0, pos);
                     partial.erase(0, pos + 1);
                     if (!line.empty() && line.back() == '\r') line.pop_back();
-                    handleChildLine(line);
+                    handleChildLine(line, is_receiver, epoch);
                 }
             }
-            if (!partial.empty()) handleChildLine(partial);
+            if (!partial.empty()) handleChildLine(partial, is_receiver, epoch);
         });
     }
     child.pid = pid;
@@ -2510,27 +3269,61 @@ static bool spawnChild(ChildProc &child, const std::string &path, const std::vec
 #endif
 }
 
-/* Graceful stop: Ctrl+C (Windows) / SIGINT (POSIX) so the sender runs its
- * cleanup path including vddShutdown(). Falls back to hard kill after 8 s
- * (vddShutdown + SetDisplayConfig can take a few seconds), then force-
- * detaches the virtual display so it can never linger after a stop.
- * DO NOT reorder this sequence — CREATE_NO_WINDOW still has a hidden
- * console, so AttachConsole keeps working. */
+#ifdef _WIN32
+/* A NULL handler (SetConsoleCtrlHandler(nullptr, TRUE)) only swallows Ctrl+C,
+ * not Ctrl+Break. The GUI attaches to the child's console before broadcasting
+ * a break, so it needs a handler that also covers CTRL_BREAK_EVENT — otherwise
+ * the stop signal would kill this process. Everything else stays default. */
+static BOOL WINAPI stopIgnoreCtrlHandler(DWORD type)
+{
+    return (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ? TRUE : FALSE;
+}
+#endif
+
+/* Graceful stop: ask the child over its stdin pipe, falling back to a console
+ * event, then to a hard kill. The pipe line (shared with the receiver) is the
+ * primary path: on current Windows (verified on 11 26200) a GUI parent cannot
+ * deliver Ctrl+C to a child console at all — GenerateConsoleCtrlEvent returns
+ * success but no handler ever runs — so the old Ctrl+C-only sequence always
+ * sat out the full 8 s timeout before TerminateProcess. Ctrl+Break *is*
+ * delivered and remains the fallback for the visible-status-console launch
+ * (no stdin pipe). Either way cleanup (stats flush, vddShutdown) still runs
+ * before the 8 s cap, and a hard kill then force-detaches the virtual display
+ * so it can never linger after a stop. */
 static void stopChild(ChildProc &child, bool extend = false)
 {
     if (!child.active) return;
 #ifdef _WIN32
-    FreeConsole();
-    SetConsoleCtrlHandler(nullptr, TRUE);          /* GUI ignores Ctrl+C */
     bool hard_kill = false;
-    if (AttachConsole(child.pi.dwProcessId)) {
-        GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-        if (WaitForSingleObject(child.pi.hProcess, 8000) == WAIT_TIMEOUT) {
-            TerminateProcess(child.pi.hProcess, 1);
-            hard_kill = true;
-        }
+    bool exited = false;
+    const DWORD deadline = GetTickCount() + 8000;
+
+    /* 1) stdin command. The line is longer than the 8-character password
+     * rule, so a child waiting at the interactive prompt cannot mistake it
+     * for a password. */
+    const bool asked = sendToChild(child, "STOP|mivara");
+    if (asked)
+        exited = WaitForSingleObject(child.pi.hProcess, 8000) == WAIT_OBJECT_0;
+
+    /* 2) console fallback: no pipe (visible status console), or a child that
+     * ignored the command. Never broadcast without the guard handler. */
+    if (!exited) {
+        const DWORD left = deadline > GetTickCount()
+                               ? deadline - GetTickCount() : 0;
         FreeConsole();
-    } else {
+        SetConsoleCtrlHandler(stopIgnoreCtrlHandler, TRUE);
+        if (AttachConsole(child.pi.dwProcessId)) {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+            /* Detach BEFORE waiting: when the child exits the visible console
+             * is torn down and an attached process is terminated by the
+             * resulting close event (verified — it survives only if this
+             * FreeConsole happens first). */
+            FreeConsole();
+            exited = WaitForSingleObject(child.pi.hProcess, left) == WAIT_OBJECT_0;
+        }
+        SetConsoleCtrlHandler(stopIgnoreCtrlHandler, FALSE);
+    }
+    if (!exited) {
         TerminateProcess(child.pi.hProcess, 1);
         hard_kill = true;
     }
@@ -2591,6 +3384,60 @@ static bool childExited(ChildProc &child, const char *name)
     }
     return false;
 #endif
+}
+
+/* A control line (AUTH reply, RX|reload) did not reach the receiver. Report
+ * the real reason: a dead child and a live-but-stuck child are different
+ * states and must not both look like "saved". */
+static void noteReceiverControlFailure(const char *what)
+{
+    if (childExited(g_receiver, "receiver")) {
+        drainChildStats();
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_peer.clear();
+        if (g_recv_error.empty()) g_recv_error = "receiver_exited";
+        g_recv_state = RSV_FAILED;
+        g_status_note = "接收进程已退出，操作未生效";
+        logPush(std::string("[gui] ") + what + "失败：接收进程已退出");
+    } else {
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_error = "receiver_unresponsive";
+        g_recv_state = RSV_FAILED;
+        g_status_note = std::string(what) + "未生效：接收进程无响应";
+        logPush(std::string("[gui] ") + what + "失败：接收进程无响应");
+    }
+}
+
+/* Every sender stop path must also leave the connection phase: a dead child
+ * must never keep the home screen showing 等待授权/会话进行中. */
+static void stopSender()
+{
+    stopChild(g_sender, g_child_extend);
+    g_child_extend = false;
+    g_send_phase = SP_IDLE;
+    g_auth_wait_note.clear();
+}
+
+/* A receiver that never reports ready is not "正在开启" forever. Ten seconds
+ * covers a cold start plus service-thread startup; the child is killed so a
+ * retry can bind the ports. */
+static void tickRecvState()
+{
+    if (g_recv_state.load() != RSV_STARTING || g_recv_started_at == 0) return;
+    if (SDL_GetTicks() - g_recv_started_at <= 10000) return;
+    ++g_recv_epoch;
+    if (g_receiver.active) stopChild(g_receiver);
+    closeAuthAsk(-1);
+    {
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_peer.clear();
+        g_recv_error = "start_timeout";
+    }
+    g_recv_started_at = 0;
+    g_recv_state = RSV_FAILED;
+    g_status_note = "启动接收超时，请重试";
+    logPush("[gui] 启动接收超时（10 秒未就绪）");
+    if (g_screen == SCR_RECEIVING) setScreen(SCR_HOME);
 }
 
 static bool binaryExists(const std::string &p)
@@ -2747,19 +3594,30 @@ static void processSearchUpdates()
 static void launchStream(std::string ip, int port, int mode, std::string name,
                          const char *stitch_side = nullptr)
 {
+    /* One sender per process: a second start would fail in spawnChild() and
+     * leave the user staring at an error while the real session runs unseen. */
+    if (g_sender.active) {
+        g_status_note = "已有发送会话";
+        setScreen(SCR_STREAMING);
+        return;
+    }
     const bool extend = (mode == SEND_EXTEND);
     const bool stitch = (mode == SEND_STITCH);
+    g_send_phase = SP_CONNECTING;
+    g_auth_wait_note.clear();
     std::string path = sibling("sender.exe");
 #ifndef _WIN32
     path = sibling("sender");
 #endif
     if (!binaryExists(path)) {
         g_status_note = "找不到 sender 程序，请先运行 make";
+        g_send_phase = SP_FAILED;
         setScreen(SCR_NOT_FOUND);
         return;
     }
     if (stitch && !kvmSupported()) {
         g_status_note = "拼接模式目前仅支持 Windows";
+        g_send_phase = SP_FAILED;
         logPush("[gui] stitch is unavailable on this platform");
         return;
     }
@@ -2806,6 +3664,7 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
             ? "无法连接 " + ip + ":" + std::to_string(probe_port) +
                   "（对方需先启动接收）"
             : "无法连接 " + ip + ":" + std::to_string(port);
+        g_send_phase = SP_FAILED;
         setScreen(stitch ? SCR_FOUND : SCR_HOME);
         return;
     }
@@ -2822,9 +3681,14 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
                 (allow ? "enabled" : "disabled by config"));
     }
 #endif
-    if (!spawnChild(g_sender, path, args)) {
+    /* Sender keeps its old console semantics: 状态控制台 on = its own visible
+     * console (no pipe), off = hidden child with the SETP/STAT pipes. */
+    const unsigned spawn_flags =
+        g_cfg.show_status_console ? SPAWN_CONSOLE : SPAWN_PIPES;
+    if (!spawnChild(g_sender, path, args, spawn_flags)) {
         logPush("[gui] spawn sender failed");
         g_status_note = "启动 sender 失败";
+        g_send_phase = SP_FAILED;
         setScreen(SCR_NOT_FOUND);
         return;
     }
@@ -2850,6 +3714,12 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
 static void openStitchDialog(const std::string &ip, int port,
                              const std::string &name)
 {
+    /* 授权 has the higher modal priority; stacking the direction chooser under
+     * it would leave a dialog whose clicks cannot reach it. */
+    if (g_auth_ask.open) {
+        g_status_note = "请先处理连接授权请求";
+        return;
+    }
     if (!kvmSupported()) {           /* launchStream reports the error */
         launchStream(ip, port, SEND_STITCH, name);
         return;
@@ -2879,46 +3749,398 @@ static void chooseStitchSide(int side)
 static void startSendMode(const std::string &ip, int port, int mode,
                           const std::string &name)
 {
+    if (g_sender.active) {           /* launchStream() also guards, defensively */
+        g_status_note = "已有发送会话";
+        setScreen(SCR_STREAMING);
+        return;
+    }
     if (mode == SEND_STITCH) openStitchDialog(ip, port, name);
     else launchStream(ip, port, mode, name);
 }
 
+/* True while the receive service is actually up. Derived exclusively from the
+ * state machine — never from a persisted preference (auto_receive is only the
+ * next-launch preference; the old allow_receive key is ignored at startup). */
+static bool receiveRunning()
+{
+    const int st = g_recv_state.load();
+    return st == RSV_STARTING || st == RSV_WAITING || st == RSV_AUTH ||
+           st == RSV_STREAMING;
+}
+
+static void stopReceiver();
+
+/* Receiving is a background state: starting it keeps the user on the home
+ * screen, where the status bar tracks it. Callers that must stay on their
+ * screen (设置 → 接收开关) save/restore g_screen around this call. */
 static void launchReceiver()
 {
     std::string path = sibling("receiver.exe");
 #ifndef _WIN32
     path = sibling("receiver");
 #endif
+    if (g_receiver.active) {
+        if (g_recv_state.load() != RSV_FAILED) {
+            g_status_note = "接收服务已在运行";
+            return;
+        }
+        /* A failed child (corrupt record / unresponsive) may still own 8081
+         * and the SSDP socket. Take the single stop path first, then start a
+         * fresh process; spawning on top would only fail or double-bind. */
+        stopReceiver();
+    }
     if (!binaryExists(path)) {
         g_status_note = "找不到 receiver 程序，请先运行 make";
+        {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_error = "not_installed";
+            g_recv_peer.clear();
+            g_recv_services = RecvServices{};
+        }
+        g_recv_state = RSV_FAILED;
+        g_recv_started_at = 0;
         setScreen(SCR_HOME);
         return;
     }
-    if (!spawnChild(g_receiver, path, {})) {
+    {
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_error.clear();
+        g_recv_peer.clear();
+        g_recv_policy = g_cfg.auth_mode;
+        g_recv_services = RecvServices{};
+    }
+    g_recv_state = RSV_STARTING;
+    g_recv_started_at = SDL_GetTicks();
+    const unsigned long epoch = ++g_recv_epoch;
+    /* --gui: approval requests travel over stdout/stdin (STAT event=auth ↔
+     * AUTH|id=…|allow). The pipe is therefore mandatory; 状态控制台 only adds a
+     * visible console window (whose stdout is still the pipe, which is why the
+     * in-app log window is opened below). */
+    const unsigned flags =
+        (unsigned)SPAWN_PIPES |
+        (g_cfg.show_status_console ? (unsigned)SPAWN_CONSOLE : 0u);
+    if (!spawnChild(g_receiver, path, {"--gui"}, flags, /*is_receiver=*/true,
+                    epoch)) {
         g_status_note = "启动 receiver 失败";
+        {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_error = "spawn_failed";
+        }
+        g_recv_state = RSV_FAILED;
+        g_recv_started_at = 0;
         setScreen(SCR_HOME);
         return;
     }
     g_status_note.clear();
-    g_session_screen = SCR_RECEIVING;
-    setScreen(SCR_RECEIVING);
+    g_recv_started_at = SDL_GetTicks();
+    if (g_cfg.show_status_console) {
+        if (!g_hidden) {
+            openLogWindow();
+            if (g_log_win) SDL_RaiseWindow(g_log_win);
+        }
+        logPush("[gui] 状态控制台模式：receiver 输出显示在应用内日志窗口");
+    }
+    setScreen(SCR_HOME);
+}
+
+/* The single stop path for the receiver. Bumping the generation BEFORE the
+ * join invalidates every teardown STAT line the reader may still enqueue, so
+ * a queued ready/waiting/stop can never resurrect 等待连接. */
+static void stopReceiver()
+{
+    ++g_recv_epoch;
+    if (g_receiver.active) stopChild(g_receiver);
+    closeAuthAsk(-1);
+    g_recv_started_at = 0;
+    g_recv_state = RSV_OFF;
+    {
+        std::lock_guard<std::mutex> lk(g_recv_mtx);
+        g_recv_peer.clear();
+        g_recv_error.clear();
+        g_recv_services = RecvServices{};
+    }
+    if (g_screen == SCR_RECEIVING) setScreen(SCR_HOME);
 }
 
 static void openSettings()
 {
     g_cfg_edit = g_cfg;
+    g_status_note.clear();       /* a stale home-screen note would read as new */
     g_screen = SCR_SETTINGS;
 }
 
+/* ── receive status bar ──────────────────────────────────────────────────── */
+struct RecvView {
+    int         state = RSV_OFF;
+    std::string policy = "manual";
+    std::string peer;
+    std::string error;
+    RecvServices services;
+};
+
+static RecvView recvView()
+{
+    RecvView v;
+    v.state = g_recv_state.load();
+    std::lock_guard<std::mutex> lk(g_recv_mtx);
+    v.policy = g_recv_policy;
+    v.peer = g_recv_peer;
+    v.error = g_recv_error;
+    v.services = g_recv_services;
+    return v;
+}
+
+static const char *recvStateLabel(int st)
+{
+    switch (st) {
+    case RSV_STARTING:  return "正在开启";
+    case RSV_WAITING:   return "等待连接";
+    case RSV_AUTH:      return "等待授权";
+    case RSV_STREAMING: return "正在接收";
+    case RSV_FAILED:    return "开启失败";
+    default:            return "接收已关闭";
+    }
+}
+
+static std::string recvStateDetail(const RecvView &v)
+{
+    std::string base;
+    switch (v.state) {
+    case RSV_STARTING:
+        base = "正在启动接收服务…";
+        break;
+    case RSV_WAITING:
+        base = v.policy == "open"
+                   ? "任何设备都可连接（无验证）"
+                   : (v.policy == "password" ? "仅允许密码连接"
+                                             : "每次连接都需要你在本机确认");
+        break;
+    case RSV_AUTH:
+        base = v.peer.empty() ? "有一台设备正在请求连接"
+                              : v.peer + " 请求连接";
+        break;
+    case RSV_STREAMING:
+        base = v.peer.empty() ? "会话进行中" : v.peer;
+        break;
+    case RSV_FAILED:
+        return v.error.empty() ? "接收服务无法启动" : receiverErrorText(v.error);
+    default:
+        return "未开启，其他设备无法连接到此电脑";
+    }
+    /* A side service that failed to bind is not a dead receiver, but the user
+     * must still see that something is missing (and on which port). */
+    if (v.state == RSV_WAITING || v.state == RSV_AUTH ||
+        v.state == RSV_STREAMING) {
+        const std::string issue = recvServicesIssue(v.services);
+        if (!issue.empty()) base += " · " + issue;
+    }
+    return base;
+}
+
+/* One contextual action per state — the single source for the home status
+ * bar's right-hand button. Derived from RecvView only, never from config. */
+enum RecvAction { RA_NONE, RA_START, RA_STOP, RA_RETRY, RA_SETTINGS };
+
+static RecvAction recvActionFor(const RecvView &v)
+{
+    switch (v.state) {
+    case RSV_OFF:       return RA_START;
+    case RSV_STARTING:  return RA_NONE;
+    case RSV_WAITING:
+    case RSV_AUTH:
+    case RSV_STREAMING: return RA_STOP;
+    case RSV_FAILED:
+        /* A corrupt password record can only be fixed in 接收与安全. */
+        return (v.error == "auth_config") ? RA_SETTINGS : RA_RETRY;
+    default:            return RA_NONE;
+    }
+}
+
+static const char *recvActionLabel(const RecvView &v)
+{
+    switch (recvActionFor(v)) {
+    case RA_START:    return "开启接收";
+    case RA_STOP:     return "停止接收";
+    case RA_RETRY:    return "重试";
+    case RA_SETTINGS: return "去设置";
+    default:          return "";
+    }
+}
+
+static int recvActionButton(const RecvView &v)
+{
+    switch (recvActionFor(v)) {
+    case RA_START:
+    case RA_RETRY:    return BTN_HOME_RECV_START;
+    case RA_STOP:     return BTN_HOME_RECEIVE_STOP;
+    case RA_SETTINGS: return BTN_HOME_RECV_SETTINGS;
+    default:          return BTN_NONE;
+    }
+}
+
+static SDL_Color recvStateColor(int st)
+{
+    switch (st) {
+    case RSV_WAITING:
+    case RSV_STREAMING: return THEME.success;
+    case RSV_AUTH:      return THEME.warning;
+    case RSV_FAILED:    return THEME.danger;
+    case RSV_STARTING:  return THEME.primary;
+    default:            return THEME.textDim;
+    }
+}
+
+/* ── tray / exit ─────────────────────────────────────────────────────────── */
+/* Only an established session (or a pending approval) counts. A receiver that
+ * is merely listening — automatic receive with no peer yet — is not a session
+ * and must not add a confirmation to 退出. */
+static bool hasActiveSession()
+{
+    if (g_sender.active) return true;
+    const int st = g_recv_state.load();
+    return st == RSV_AUTH || st == RSV_STREAMING;
+}
+
+static bool confirmExit()
+{
+#ifdef _WIN32
+    if (!hasActiveSession()) return true;
+    return MessageBoxW(nullptr,
+                       L"当前有进行中的会话。退出 Mivara 将结束会话、关闭接收服务"
+                       L"并移除虚拟显示器。\n\n确定要退出吗？",
+                       L"Mivara 幻屏",
+                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 |
+                           MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
+#else
+    /* No tray on POSIX: closing the window keeps its old meaning and the
+     * session screen still offers a deliberate stop. */
+    return true;
+#endif
+}
+
+/** Exit for real (tray 退出 / ESC on the home screen / 退出 buttons). The
+ *  SDL_QUIT handler in main() performs the confirmation exactly once. */
+static void requestQuit(bool no_confirm = false)
+{
+    g_exit_no_confirm = no_confirm;
+    g_exit_requested = true;
+    SDL_Event q;
+    q.type = SDL_QUIT;
+    SDL_PushEvent(&q);
+}
+
+static void hideToTray()
+{
+    if (!g_tray_ok || g_hidden) return;
+    /* A pending prompt (approval / password) is time-limited; hiding the
+     * window would make it unanswerable while the deadline keeps running. */
+    if (g_auth_ask.open || g_pw_ask.open || g_stitch_ask.open || g_set_pw.open)
+        return;
+    SDL_HideWindow(g_win);
+    if (g_log_win && g_log_open) SDL_HideWindow(g_log_win);
+    g_hidden = true;
+    if (!g_cfg.tray_hint_shown) {
+        /* One time only; the flag lives in config.ini and changes nothing
+         * else about the user's settings. */
+        trayNotify("Mivara 仍在运行",
+                   "关闭窗口不会中断会话。单击托盘图标可恢复，右键可退出。");
+        g_cfg.tray_hint_shown = 1;
+        configSave(g_cfg);
+    }
+}
+
+static void showFromTray()
+{
+    if (!g_hidden) {
+        SDL_RaiseWindow(g_win);
+        return;
+    }
+    g_hidden = false;
+    SDL_ShowWindow(g_win);
+    SDL_RestoreWindow(g_win);
+    SDL_RaiseWindow(g_win);
+    if (g_log_win && g_log_open) SDL_ShowWindow(g_log_win);
+}
+
+/* State summary for the tray tooltip (≤127 chars after conversion). */
+static std::string trayTooltip()
+{
+    const RecvView rv = recvView();
+    std::string s = "Mivara · ";
+    if (g_sender.active) {
+        s += (g_child_mode == SEND_STITCH) ? "拼接控制中" : "投屏中";
+    } else {
+        /* Derived from the receive state machine only. g_cfg.allow_receive is
+         * deliberately not consulted: it is no longer a truth source. */
+        switch (rv.state) {
+        case RSV_STARTING:  s += "正在开启接收";   break;
+        case RSV_WAITING:   s += "接收：等待连接"; break;
+        case RSV_AUTH:      s += "接收：等待授权"; break;
+        case RSV_STREAMING: s += "接收：正在接收"; break;
+        case RSV_FAILED:    s += "接收开启失败";   break;
+        default:            s += "接收已关闭";     break;
+        }
+    }
+    return s;
+}
+
 /* ── screen building ─────────────────────────────────────────────────────── */
+/* One modal stack shared by buildButtons(), renderScreen() and onButton().
+ * Priority (low → high): 普通页面 < 密码/设置密码 < 拼接方向 < 连接授权. The old
+ * code built the stitch buttons first (so first-match-wins hit them) while
+ * painting and dispatching by a different order, which made a visible 授权
+ * dialog unclickable. All three consumers now ask topModal(). */
+enum Modal { MODAL_NONE = 0, MODAL_SETPW, MODAL_PW, MODAL_STITCH, MODAL_AUTH };
+
+static Modal topModal()
+{
+    if (g_auth_ask.open)   return MODAL_AUTH;
+    if (g_stitch_ask.open) return MODAL_STITCH;
+    if (g_pw_ask.open)     return MODAL_PW;
+    if (g_set_pw.open)     return MODAL_SETPW;
+    return MODAL_NONE;
+}
+
 static void buildButtons()
 {
     g_buttons.clear();
 
-    /* The direction chooser is modal: only its own pads and 取消 are live, so
-     * a click cannot fall through to the device row or the history list that
-     * opened it. */
-    if (g_stitch_ask.open) {
+    /* Only the top modal owns the input; lower dialogs stay open but inert
+     * (so a pending password/chooser survives a 30 s authorization prompt). */
+    switch (topModal()) {
+    case MODAL_AUTH: {
+        const int y = AUTH_DLG_Y + AUTH_DLG_H - 58;
+        addButton(AUTH_DLG_X + 200, y, 110, 38, "拒绝", BTN_AUTH_DENY,
+                  BTN_V_SECONDARY);
+        addButton(AUTH_DLG_X + 322, y, 114, 38, "允许一次", BTN_AUTH_ALLOW,
+                  BTN_V_PRIMARY);
+        return;
+    }
+    case MODAL_PW: {
+        const SDL_Rect show{PW_SHOW_X, PW_SHOW_Y, 116, 26};
+        addButton(show.x, show.y, show.w, show.h,
+                  g_pw_ask.show ? "隐藏密码" : "显示密码", BTN_PW_SHOW,
+                  BTN_V_LINK);
+        const int y = PW_DLG_Y + PW_DLG_H - 58;
+        addButton(PW_DLG_X + 200, y, 110, 38, "取消", BTN_PW_CANCEL,
+                  BTN_V_SECONDARY);
+        addButton(PW_DLG_X + 322, y, 114, 38, "连 接", BTN_PW_CONNECT,
+                  BTN_V_PRIMARY);
+        return;
+    }
+    case MODAL_SETPW: {
+        addButton(SETPW_FIELD_X, SETPW_A_Y, SETPW_FIELD_W, SETPW_FIELD_H, "",
+                  BTN_SETPW_FIELD_A, BTN_V_GHOST);
+        addButton(SETPW_SHOW_X, SETPW_SHOW_Y - 6, 116, 24, "", BTN_SETPW_SHOW,
+                  BTN_V_GHOST);
+        const int y = SETPW_DLG_Y + SETPW_DLG_H - 58;
+        addButton(SETPW_DLG_X + 200, y, 110, 38, "取消", BTN_SETPW_CANCEL,
+                  BTN_V_SECONDARY);
+        addButton(SETPW_DLG_X + 322, y, 114, 38, "保 存", BTN_SETPW_OK,
+                  BTN_V_PRIMARY);
+        return;
+    }
+    case MODAL_STITCH: {
         const int cur = stitchSideFromConfig();
         for (int i = 0; i < 4; i++) {
             const SDL_Rect r = rcSidePad(i);
@@ -2929,6 +4151,9 @@ static void buildButtons()
         addButton(c.x, c.y, c.w, c.h, "取 消", BTN_STITCH_SIDE_CANCEL,
                   BTN_V_SECONDARY);
         return;
+    }
+    default:
+        break;
     }
 
     /* ── header: appearance switcher (on every screen) ───────────────────── */
@@ -2973,21 +4198,37 @@ static void buildButtons()
                 addButton(BODY_X, HOME_BAND_Y, BODY_W, 36, "", BTN_UPD_NOTICE,
                           BTN_V_GHOST);
         }
-        /* Stop buttons BEFORE the cards: they are nested inside the card
-         * rect, so registering the card first would swallow every click. */
-        for (int i = 0; i < 2; i++) {
-            const bool active = (i == 0) ? g_receiver.active : g_sender.active;
-            if (!active) continue;
-            SDL_Rect s = rcHomeStop(i);
-            addButton(s.x, s.y, s.w, s.h, i == 0 ? "停止接收" : "停止发送",
-                      i == 0 ? BTN_HOME_RECEIVE_STOP : BTN_HOME_SENDER_STOP,
-                      BTN_V_DANGER);
+        if (g_sender.active) {
+            /* Returning to 主页 must never strand a running session: the hero
+             * card becomes the session card with real 返回会话 / 停止 buttons,
+             * and the connect entry is not registered (a second sender cannot
+             * start anyway). */
+            addButton(HOME_SESSION_BACK_X, HOME_SESSION_BTN_Y,
+                      HOME_SESSION_BACK_W, HOME_SESSION_BTN_H, "返回会话",
+                      BTN_RETURN_SESSION, BTN_V_SECONDARY);
+            addButton(HOME_SESSION_STOP_X, HOME_SESSION_BTN_Y,
+                      HOME_SESSION_STOP_W, HOME_SESSION_BTN_H, "停止",
+                      BTN_HOME_SENDER_STOP, BTN_V_DANGER);
+        } else {
+            addButton(HOME_CARD_X(0), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H, "",
+                      BTN_HOME_CONNECT, BTN_V_GHOST);
         }
-        for (int i = 0; i < 2; i++) {
-            const bool active = (i == 0) ? g_receiver.active : g_sender.active;
-            if (active) continue;          /* the stop button owns this card */
-            addButton(HOME_CARD_X(i), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H, "",
-                      i == 0 ? BTN_HOME_RECEIVE : BTN_HOME_SEND, BTN_V_GHOST);
+
+        /* 接收状态栏：右侧动作按钮必须先注册。命中测试是 first-match-wins，
+         * 而整条详情热区覆盖动作按钮；绘制顺序则让动作按钮盖在上面，所以
+         * “先动作、后详情”是唯一同时满足视觉与点击的顺序。 */
+        {
+            const RecvView rv = recvView();
+            const RecvAction act = recvActionFor(rv);
+            const int actId = recvActionButton(rv);
+            if (actId != BTN_NONE)
+                addButton(RECV_BAR_ACT_X, RECV_BAR_ACT_Y, RECV_BAR_ACT_W,
+                          RECV_BAR_ACT_H, recvActionLabel(rv),
+                          actId, (act == RA_STOP) ? BTN_V_DANGER
+                                                  : BTN_V_SECONDARY);
+            if (rv.state != RSV_OFF)
+                addButton(BODY_X, RECV_BAR_Y, BODY_W, RECV_BAR_H, "",
+                          BTN_HOME_RECV_DETAIL, BTN_V_GHOST);
         }
         /* connection history rows */
         for (int i = 0; i < HIST_VISIBLE; i++) {
@@ -3074,6 +4315,15 @@ static void buildButtons()
         break;
 
     case SCR_SETTINGS: {
+        /* tab chips (drawn by drawButton) sit in the title row */
+        {
+            static const char *kTab[2] = {"常规", "接收与安全"};
+            for (int i = 0; i < 2; i++)
+                addChoice(SET_TAB_X(i), SET_TAB_Y, SET_TAB_W, SET_TAB_H,
+                          kTab[i], BTN_SET_TAB_BASE + i, g_set_tab == i);
+        }
+
+        if (g_set_tab == 0) {
         /* codec: a 3x2 choice grid, not a segmented control — six cells at
          * 93px do not fit on one row next to their label */
         const char *codecLabels[] = {"自动", "H.264", "H.265", "AV1", "原始", "RLE"};
@@ -3157,6 +4407,19 @@ static void buildButtons()
                                                                : BTN_SET_UPD_CHECK;
             }
             addButton(710, y, 126, 32, lbl, id, BTN_V_PRIMARY);
+        }
+        } else {
+            /* 接收与安全: the two switches, three policy radios, password row */
+            const int tog[2] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV};
+            for (int i = 0; i < 2; i++)
+                addButton(SEC_ROW_X, SEC_TOGGLE_Y(i), SEC_ROW_W, 32, "", tog[i],
+                          BTN_V_GHOST);
+            for (int i = 0; i < 3; i++)
+                addButton(SEC_ROW_X, SEC_POLICY_Y(i), SEC_ROW_W, 38, "",
+                          kAuthModeBtn[i], BTN_V_GHOST);
+            addButton(SEC_ROW_X + SEC_ROW_W - 96, SEC_PW_ROW_Y - 8, 96, 28,
+                      g_cfg_edit.auth_hash.empty() ? "设置" : "修改",
+                      BTN_SET_PW_EDIT, BTN_V_SECONDARY);
         }
 
         addButton(cx - 168, SET_ACT_Y, 160, SET_ACT_H, "确 定", BTN_SET_OK,
@@ -3251,8 +4514,8 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
         return;
     }
     if (s.event == "error") {
-        drawText(ren, fitText("错误：" + s.msg, g_font, maxW), x, card.y + 54,
-                 THEME.danger, g_font);
+        drawText(ren, fitText("错误：" + senderErrorText(s.msg), g_font, maxW),
+                 x, card.y + 54, THEME.danger, g_font);
         return;
     }
     if (s.event == "start" || s.event == "stop") {
@@ -3307,6 +4570,102 @@ static void drawStitchSideDialog(SDL_Renderer *ren)
     const SDL_Rect me = rcSideCenter();
     fillRoundRect(ren, me, THEME.radius - 3, THEME.surfaceAlt);
     drawTextIn(ren, "本机", me, THEME.textDim, g_fontS, ALIGN_CENTER);
+}
+
+/* ── authorization modals ─────────────────────────────────────────────────
+ * Both dialogs are overlays: the receiver's approval request and the sender's
+ * password prompt. They are drawn above the current screen but below the
+ * buttons, which buildButtons() limits to the dialog's own cells. */
+static void drawAuthDialogs(SDL_Renderer *ren)
+{
+    if (g_auth_ask.open) {
+        fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
+        const SDL_Rect card{AUTH_DLG_X, AUTH_DLG_Y, AUTH_DLG_W, AUTH_DLG_H};
+        drawCard(ren, card, CARD_R);
+        const int x = AUTH_DLG_X + 24;
+        drawText(ren, "有一台设备请求连接", x, AUTH_DLG_Y + 22, THEME.text,
+                 g_fontB);
+        const std::string name = g_auth_ask.dev.empty() ? "未知设备"
+                                                        : g_auth_ask.dev;
+        drawText(ren, fitText(name, g_font, AUTH_DLG_W - 48), x,
+                 AUTH_DLG_Y + 62, THEME.text, g_font);
+        drawText(ren, g_auth_ask.ip.empty() ? "地址未知" : g_auth_ask.ip, x,
+                 AUTH_DLG_Y + 90, THEME.textDim, g_fontS);
+        drawText(ren,
+                 g_auth_ask.req == "stitch"
+                     ? "请求：拼接控制（键盘与鼠标）"
+                     : "请求：投屏 / 扩展连接（视频）",
+                 x, AUTH_DLG_Y + 116, THEME.textDim, g_fontS);
+        const long leftMs = (long)g_auth_ask.deadline - (long)SDL_GetTicks();
+        const int secs = leftMs > 0 ? (int)(leftMs / 1000) + 1 : 0;
+        drawText(ren, secs > 0 ? "若 " + std::to_string(secs) +
+                                     " 秒内未选择，将自动拒绝"
+                               : "正在自动拒绝…",
+                 x, AUTH_DLG_Y + 142, THEME.textDim, g_fontS);
+        return;
+    }
+    if (g_pw_ask.open) {
+        fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
+        const SDL_Rect card{PW_DLG_X, PW_DLG_Y, PW_DLG_W, PW_DLG_H};
+        drawCard(ren, card, CARD_R);
+        const int x = PW_DLG_X + 24;
+        drawText(ren, "对方要求连接密码", x, PW_DLG_Y + 22, THEME.text, g_fontB);
+        drawText(ren, "请输入接收端设置的 4–8 个字符连接密码（字母不区分大小写）", x, PW_DLG_Y + 54,
+                 THEME.textDim, g_fontS);
+
+        const SDL_Rect field{PW_FIELD_X, PW_FIELD_Y, PW_FIELD_W, PW_FIELD_H};
+        drawRoundRect(ren, field, THEME.radius, THEME.surfaceAlt,
+                      g_pw_ask.error.empty() ? THEME.border : THEME.danger);
+        std::string shown = g_pw_ask.show
+                                ? g_pw_ask.text
+                                : std::string(g_pw_ask.text.size(), '*');
+        drawTextIn(ren, shown.empty() ? "密码" : shown, field,
+                   shown.empty() ? THEME.textDim : THEME.text, g_font,
+                   ALIGN_LEFT, 14);
+        /* caret */
+        if (!shown.empty())
+            drawHairline(ren, field.x + 14 + 0, field.y + field.h - 8, 1, 1,
+                         THEME.border);
+
+        drawText(ren, "支持 Ctrl+V 粘贴", x, PW_SHOW_Y + 2, THEME.textDim,
+                 g_fontS);
+        if (!g_pw_ask.error.empty())
+            drawText(ren, g_pw_ask.error, x, PW_SHOW_Y + 26, THEME.danger,
+                     g_fontS);
+        return;
+    }
+    if (g_set_pw.open) {
+        fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
+        const SDL_Rect card{SETPW_DLG_X, SETPW_DLG_Y, SETPW_DLG_W, SETPW_DLG_H};
+        drawCard(ren, card, CARD_R);
+        const int x = SETPW_DLG_X + 24;
+        const bool changing = !g_cfg_edit.auth_hash.empty();
+        drawText(ren, changing ? "修改连接密码" : "设置连接密码", x,
+                 SETPW_DLG_Y + 18, THEME.text, g_fontB);
+        drawText(ren, "4–8 个字符，字母不区分大小写；仅用于连接准入，不加密画面", x,
+                 SETPW_DLG_Y + 52, THEME.textDim, g_fontS);
+
+        auto pwField = [&](const std::string &val, int y) {
+            const SDL_Rect rc{x, y, SETPW_FIELD_W, SETPW_FIELD_H};
+            drawRoundRect(ren, rc, THEME.radius, THEME.surfaceAlt,
+                          g_set_pw.err.empty() ? THEME.primary
+                                               : THEME.danger);
+            std::string shown = g_set_pw.show ? val
+                                             : std::string(val.size(), '*');
+            drawTextIn(ren, shown.empty() ? "请输入" : shown, rc,
+                       shown.empty() ? THEME.textDim : THEME.text, g_font,
+                       ALIGN_LEFT, 12);
+        };
+        pwField(g_set_pw.a, SETPW_A_Y);
+
+        drawTextV(ren, g_set_pw.show ? "隐藏密码" : "显示密码", SETPW_SHOW_X,
+                  SETPW_SHOW_Y + 8, THEME.primary, g_fontS, ALIGN_LEFT);
+        drawText(ren, "支持 Ctrl+V 粘贴", x, SETPW_SHOW_Y,
+                 THEME.textDim, g_fontS);
+        if (!g_set_pw.err.empty())
+            drawText(ren, fitText(g_set_pw.err, g_fontS, SETPW_FIELD_W), x,
+                     SETPW_SHOW_Y + 24, THEME.danger, g_fontS);
+    }
 }
 
 /* ── screen rendering ────────────────────────────────────────────────────── */
@@ -3393,34 +4752,65 @@ static void renderScreen(int mousex, int mousey)
                       g_fontS, ALIGN_RIGHT);
         drawText(g_ren, "快捷操作", BODY_X, HOME_CAPTION_Y, THEME.textDim, g_fontBS);
 
-        /* hero cards */
-        static const char *kTitle[2]   = {"接收", "发送"};
-        static const char *kCaption[2] = {"作为接收端，等待其他设备投屏",
-                                          "搜索接收端并开始投屏"};
-        static const int   kGlyph[2]   = {GLYPH_ARROW_DOWN, GLYPH_ARROW_UP};
-        for (int i = 0; i < 2; i++) {
-            const SDL_Rect card = rcHomeCard(i);
-            const bool active = (i == 0) ? g_receiver.active : g_sender.active;
+        /* 连接设备 — the one primary entry. 接收 used to sit next to it as an
+         * equal-weight card, which read as "start a second app"; it is now a
+         * background state with its own status bar below. While a sender
+         * session runs the same rect becomes a session card. */
+        {
+            const SDL_Rect card = rcHomeCard(0);
             drawCard(g_ren, card, CARD_R);
 
-            SDL_Rect tile{HOME_CARD_X(i) + 16, HOME_CARD_Y + 16, 40, 40};
-            fillRoundRect(g_ren, tile, 12,
-                          i == 0 ? THEME.successTint : THEME.primaryTint);
-            drawGlyph(g_ren, kGlyph[i], tile.x + 20, tile.y + 20, 20,
-                      i == 0 ? THEME.onSuccessTint : THEME.onPrimaryTint);
+            SDL_Rect tile{card.x + 18, card.y + 26, 46, 46};
+            fillRoundRect(g_ren, tile, 14,
+                          g_sender.active ? THEME.successTint
+                                          : THEME.primaryTint);
+            drawGlyph(g_ren, g_sender.active ? GLYPH_MONITOR : GLYPH_ARROW_UP,
+                      tile.x + 23, tile.y + 23, 22,
+                      g_sender.active ? THEME.onSuccessTint
+                                      : THEME.onPrimaryTint);
 
-            drawTextV(g_ren, kTitle[i], card.x + 72, card.y + 36, THEME.text,
-                      g_fontB, ALIGN_LEFT);
-            drawText(g_ren, kCaption[i], card.x + 16, card.y + 72, THEME.textDim,
-                     g_fontS);
+            if (g_sender.active) {
+                drawTextV(g_ren, "正在" + g_child_label, card.x + 82,
+                          card.y + 42, THEME.success, g_fontB, ALIGN_LEFT);
+                std::string sub = g_last_name.empty() ? g_last_ip : g_last_name;
+                if (!g_last_ip.empty())
+                    sub += " · " + g_last_ip + ":" +
+                           std::to_string(g_child_mode == SEND_STITCH
+                                              ? KVM_PORT
+                                              : g_last_port);
+                drawText(g_ren,
+                         fitText(sub, g_fontS,
+                                 HOME_SESSION_BACK_X - 12 - (card.x + 82)),
+                         card.x + 82, card.y + 66, THEME.textDim, g_fontS);
+            } else {
+                if (g_hot == BTN_HOME_CONNECT || g_press == BTN_HOME_CONNECT)
+                    fillRoundRect(g_ren, card, CARD_R, THEME.hover);
+                drawTextV(g_ren, "连接设备", card.x + 82, card.y + 42,
+                          THEME.text, g_fontB, ALIGN_LEFT);
+                drawText(g_ren, "搜索局域网内的接收端，开始投屏、扩展或拼接",
+                         card.x + 82, card.y + 66, THEME.textDim, g_fontS);
+                drawTextV(g_ren, "›", card.x + card.w - 22, card.y + card.h / 2,
+                          THEME.textDim, g_fontL, ALIGN_RIGHT);
+            }
+        }
 
-            const SDL_Rect chip = rcHomeChip(i);
-            fillRoundRect(g_ren, chip, chip.h / 2,
-                          active ? THEME.successTint : THEME.surfaceAlt);
-            drawTextIn(g_ren,
-                       active ? (i == 0 ? "接收中" : "发送中") : "未运行",
-                       chip, active ? THEME.onSuccessTint : THEME.textDim,
-                       g_fontS, ALIGN_CENTER);
+        /* 接收状态栏 —低权重，但各种状态都可见、可操作。 */
+        {
+            const RecvView rv = recvView();
+            const SDL_Rect bar{BODY_X, RECV_BAR_Y, BODY_W, RECV_BAR_H};
+            drawRoundRect(g_ren, bar, THEME.radiusCard - 6, THEME.surface,
+                          THEME.border);
+
+            setColor(g_ren, recvStateColor(rv.state));
+            fillCircle(g_ren, bar.x + 20, bar.y + 24, 5);
+
+            const int textW = RECV_BAR_ACT_X - 12 - (bar.x + 36);
+            drawText(g_ren, fitText(std::string("接收 · ") +
+                                        recvStateLabel(rv.state),
+                                    g_fontBS, textW),
+                     bar.x + 36, bar.y + 14, THEME.text, g_fontBS);
+            drawText(g_ren, fitText(recvStateDetail(rv), g_fontS, textW),
+                     bar.x + 36, bar.y + 38, THEME.textDim, g_fontS);
         }
 
         /* connection history — the card shrinks when there is nothing to list,
@@ -3474,22 +4864,53 @@ static void renderScreen(int mousex, int mousey)
     }
 
     case SCR_RECEIVING: {
+        const RecvView rv = recvView();
         std::string ip = getLocalIPAddress();
-        drawText(g_ren, "正在接收", cx, 162, THEME.success, g_fontL, true);
-        drawText(g_ren, "其他设备搜索到本机后即可开始投屏或拼接", cx, 210,
-                 THEME.textDim, g_font, true);
+        drawText(g_ren, recvStateLabel(rv.state), cx, 162,
+                 recvStateColor(rv.state), g_fontL, true);
+        drawText(g_ren, recvStateDetail(rv), cx, 210, THEME.textDim, g_font, true);
 
         const SDL_Rect card{BODY_X, 246, BODY_W, 256};
         drawCard(g_ren, card, CARD_R);
         const int lx = card.x + 20;
         drawText(g_ren, "本机 IP", lx, card.y + 24, THEME.textDim, g_fontS);
         drawText(g_ren, ip, lx, card.y + 48, THEME.text, g_fontB);
-        drawText(g_ren, "视频 8081  ·  计算 8082  ·  端口 8083  ·  拼接 8084  ·  发现 UDP 1900",
-                 lx, card.y + 96, THEME.textDim, g_fontS);
+        /* Live service state. 8082/8083/8084 are not fatal on their own, but
+         * a silent failure would leave the user believing 拼屏/旁路可用. */
+        auto svcText = [](const char *label, const RecvServiceState &st) {
+            std::string t = std::string(label) + " " + std::to_string(st.port);
+            if (st.state == 0)      t += " 正常";
+            else if (st.state == 2) t += " 不适用";
+            else if (st.state == 1) {
+                t += " 未启动";
+                const std::string why = recvServiceErrorText(st.err);
+                if (!why.empty()) t += "（" + why + "）";
+            } else                  t += " 未确认";
+            return t;
+        };
+        const bool videoUp = (rv.state == RSV_WAITING || rv.state == RSV_AUTH ||
+                              rv.state == RSV_STREAMING);
+        const std::string svcLine =
+            std::string("视频 8081 ") + (videoUp ? "已就绪" : "未就绪") + " · " +
+            svcText("计算", rv.services.gpu) + " · " +
+            svcText("端口", rv.services.ports) + " · " +
+            svcText("拼接", rv.services.kvm) + " · 发现 UDP 1900";
+        drawText(g_ren, fitText(svcLine, g_fontS, card.w - 40), lx,
+                 card.y + 90, THEME.textDim, g_fontS);
+        {
+            const std::string issue = recvServicesIssue(rv.services);
+            if (!issue.empty())
+                drawText(g_ren, fitText(issue, g_fontS, card.w - 40), lx,
+                         card.y + 110, THEME.warning, g_fontS);
+        }
         drawHairline(g_ren, lx, card.y + 132, card.w - 40, 1, THEME.border);
-        drawText(g_ren, "状态：等待发送端连接…", lx, card.y + 150, THEME.text, g_font);
-        drawText(g_ren, "也可在发送端执行  sender " + ip, lx, card.y + 186,
-                 THEME.textDim, g_fontS);
+        drawText(g_ren, "授权方式：" +
+                            std::string(rv.policy == "open" ? "允许任意连接"
+                                        : rv.policy == "password" ? "仅允许密码连接"
+                                                                  : "每次手动授权"),
+                 lx, card.y + 150, THEME.text, g_font);
+        drawText(g_ren, "收流期间的密码验证只用于准入，画质数据并未加密",
+                 lx, card.y + 186, THEME.textDim, g_fontS);
         break;
     }
 
@@ -3570,21 +4991,85 @@ static void renderScreen(int mousex, int mousey)
         break;
     }
 
-    case SCR_STREAMING:
-        drawText(g_ren, "正在" + g_child_label, cx, 200, THEME.success, g_fontL, true);
-        if (!g_status_note.empty())
-            drawText(g_ren, g_status_note, cx, 258, THEME.text, g_font, true);
-        drawText(g_ren, "会话进行中 · 关闭窗口不会中断，请点下方按钮结束", cx, 290,
-                 THEME.textDim, g_fontS, true);
+    case SCR_STREAMING: {
+        /* The phase, not the last STAT payload, decides the copy: while the
+         * password is being checked or the peer is deciding, this screen must
+         * not claim 正在投屏/会话进行中. */
+        std::string title;
+        std::string note;           /* g_auth_wait_note, drawn prominently */
+        SDL_Color col = THEME.primary;
+        switch (g_send_phase) {
+        case SP_PASSWORD:
+            title = "需要连接密码";
+            note = g_auth_wait_note.empty() ? "请输入对方设置的连接密码"
+                                            : g_auth_wait_note;
+            col = THEME.warning;
+            break;
+        case SP_VERIFY:
+            title = "正在验证连接密码…";
+            note = g_auth_wait_note.empty() ? "正在验证连接密码…"
+                                            : g_auth_wait_note;
+            col = THEME.warning;
+            break;
+        case SP_WAIT_AUTH:
+            title = "等待对方授权…";
+            note = g_auth_wait_note.empty()
+                       ? "已发送连接请求，等待对方确认（最多 30 秒）…"
+                       : g_auth_wait_note;
+            col = THEME.warning;
+            break;
+        case SP_GRANTED:
+            title = "对方已允许连接";
+            note = g_auth_wait_note.empty() ? "正在建立会话…" : g_auth_wait_note;
+            col = THEME.success;
+            break;
+        case SP_LIVE:
+            title = "正在" + g_child_label;
+            note = "会话进行中 · 关闭窗口不会中断，请点下方按钮结束";
+            col = THEME.success;
+            break;
+        case SP_FAILED:
+            title = "连接失败";
+            col = THEME.danger;
+            break;
+        case SP_CONNECTING:
+        case SP_IDLE:
+        default:
+            title = "正在连接对方…";
+            col = THEME.primary;
+            break;
+        }
+        drawText(g_ren, title, cx, 200, col, g_fontL, true);
+        if (g_send_phase == SP_FAILED) {
+            const std::string why = g_status_note.empty()
+                                        ? "连接未建立，请返回重试"
+                                        : g_status_note;
+            drawText(g_ren, why, cx, 258, THEME.danger, g_font, true);
+        } else {
+            if (!g_status_note.empty())
+                drawText(g_ren, g_status_note, cx, 258, THEME.text, g_font,
+                         true);
+            if (!note.empty())
+                drawText(g_ren, note, cx, 290,
+                         g_send_phase == SP_LIVE ? THEME.textDim : col,
+                         g_send_phase == SP_LIVE ? g_fontS : g_font, true);
+        }
         drawStatPanel(g_ren, SDL_Rect{ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W,
                                       ST_PANEL_H});
         break;
+    }
 
     case SCR_SETTINGS: {
         drawText(g_ren, "设 置", BODY_X, TITLE_Y, THEME.text, g_fontB);
-        drawTextV(g_ren, "修改后点「确定」保存到 config.ini", BODY_R, TITLE_Y + 12,
-                  THEME.textDim, g_fontS, ALIGN_RIGHT);
+        /* tab chips are painted by drawButton (BTN_V_CHOICE) */
+        if (!g_status_note.empty()) {
+            const int nx = BODY_X + 82;
+            drawText(g_ren, fitText(g_status_note, g_fontS,
+                                    SET_TAB_X(0) - 16 - nx),
+                     nx, TITLE_Y + 8, THEME.danger, g_fontS);
+        }
 
+        if (g_set_tab == 0) {
         /* ── left column: 画质与编码 ────────────────────────────────────── */
         {
             const SDL_Rect card{SET_COL_L, SET_CARD_Y, SET_COL_W, SET_L_H};
@@ -3670,14 +5155,112 @@ static void renderScreen(int mousex, int mousey)
             }
         }
 
+        } else {
+            /* ── 接收与安全 ─────────────────────────────────────────────── */
+            {
+                const SDL_Rect card{BODY_X, SEC_SWITCH_Y, BODY_W, SEC_SWITCH_H};
+                drawCard(g_ren, card, CARD_R);
+                drawText(g_ren, "接收开关", SEC_ROW_X, card.y + 18,
+                         THEME.textDim, g_fontBS);
+                static const char *kSwitch[2] = {"允许其他设备连接到此电脑",
+                                                 "启动软件时自动开启接收"};
+                /* The first switch reflects the live service, not a stored
+                 * preference; the second is the next-launch preference. */
+                const bool on[2] = {receiveRunning(),
+                                    g_cfg_edit.auto_receive != 0};
+                const int id[2] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV};
+                for (int i = 0; i < 2; i++) {
+                    const int y = SEC_TOGGLE_Y(i);
+                    if (g_hot == id[i] || g_press == id[i])
+                        fillRoundRect(g_ren, SDL_Rect{SEC_ROW_X, y, SEC_ROW_W, 32},
+                                      THEME.radius - 3, THEME.hover);
+                    drawTextV(g_ren, kSwitch[i], SEC_ROW_X + 4, y + 16, THEME.text,
+                              g_font, ALIGN_LEFT);
+                    drawToggle(g_ren,
+                               SDL_Rect{SEC_ROW_X + SEC_ROW_W - 48, y + 4, 44, 24},
+                               on[i]);
+                }
+                drawText(g_ren, "「开机自启动」只决定 Mivara 是否随 Windows 登录启动；",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 142, THEME.textDim, g_fontS);
+                drawText(g_ren, "「自动开启接收」只决定下次启动是否直接进入接收状态；",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 162, THEME.textDim, g_fontS);
+                drawText(g_ren, "上方开关只改变本次运行，不会修改自动接收偏好。",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 182, THEME.textDim, g_fontS);
+            }
+
+            {
+                const SDL_Rect card{BODY_X, SEC_AUTH_Y, BODY_W, SEC_AUTH_H};
+                drawCard(g_ren, card, CARD_R);
+                drawText(g_ren, "连接授权方式", SEC_ROW_X, card.y + 18,
+                         THEME.textDim, g_fontBS);
+
+                static const char *kPolicy[3] = {
+                    "允许任意连接",
+                    "仅允许密码连接",
+                    "每次手动授权（推荐）"};
+                static const char *kPolicySub[3] = {
+                    "同一网络中任何人都可以连接，不需要任何确认",
+                    "知道连接密码的设备才能连接",
+                    "每次连接都需要你在本机弹窗确认"};
+                const int cur = (g_cfg_edit.auth_mode == "open")     ? 0
+                                : (g_cfg_edit.auth_mode == "password") ? 1
+                                                                       : 2;
+                for (int i = 0; i < 3; i++) {
+                    const int y = SEC_POLICY_Y(i);
+                    const SDL_Rect row{SEC_ROW_X, y, SEC_ROW_W, 38};
+                    if (cur == i) fillRoundRect(g_ren, row, THEME.radius - 4,
+                                                THEME.surfaceAlt);
+                    /* radio mark */
+                    setColor(g_ren, cur == i ? THEME.primary : THEME.border);
+                    fillCircle(g_ren, SEC_POLICY_X, y + 15, 7);
+                    if (cur == i) {
+                        setColor(g_ren, THEME.bg);
+                        fillCircle(g_ren, SEC_POLICY_X, y + 15, 3);
+                    }
+                    drawText(g_ren, kPolicy[i], SEC_POLICY_X + 18, y + 2,
+                             THEME.text, g_fontS);
+                    drawText(g_ren, kPolicySub[i], SEC_POLICY_X + 18, y + 20,
+                             i == 0 ? THEME.danger : THEME.textDim, g_fontS);
+                }
+
+                /* password record row: only meaningful in 密码 mode */
+                const bool pwMode = (cur == 1);
+                drawText(g_ren, "连接密码", SEC_ROW_X + 4, SEC_PW_ROW_Y,
+                         pwMode ? THEME.text : THEME.textDim, g_fontS);
+                const bool havePw = !g_cfg_edit.auth_hash.empty();
+                drawText(g_ren, havePw ? "已设置（4–8 个字符）" : "尚未设置",
+                         SEC_ROW_X + 92, SEC_PW_ROW_Y,
+                         havePw ? THEME.textDim : THEME.danger, g_fontS);
+                drawText(g_ren, "密码只用于连接准入，画面传输并未加密",
+                         SEC_ROW_X + 4, SEC_PW_ROW_Y + 30, THEME.textDim, g_fontS);
+                if (cur == 0)
+                    drawText(g_ren,
+                             "风险：任何能访问本机的设备都会直接接入，请只在完全可信的网络中使用",
+                             SEC_ROW_X + 4, SEC_PW_ROW_Y + 54, THEME.danger,
+                             g_fontS);
+            }
+        }
+
         /* ── 确定 / 恢复默认 / 返回会话 ─────────────────────────────────── */
         break;
     }
     }
 
-    /* Modal last: it dims whatever screen is underneath, and the chooser's own
-     * cells live in g_buttons, so they paint on top of the scrim. */
-    if (g_stitch_ask.open) drawStitchSideDialog(g_ren);
+    /* Modal last: it dims whatever screen is underneath, and the modal's own
+     * cells live in g_buttons, so they paint on top of the scrim. Exactly one
+     * dialog is painted — the same one topModal() gave buildButtons/onButton. */
+    switch (topModal()) {
+    case MODAL_AUTH:
+    case MODAL_PW:
+    case MODAL_SETPW:
+        drawAuthDialogs(g_ren);
+        break;
+    case MODAL_STITCH:
+        drawStitchSideDialog(g_ren);
+        break;
+    default:
+        break;
+    }
 
     for (auto &b : g_buttons) drawButton(g_ren, b);
 
@@ -3710,9 +5293,7 @@ static void startInstall()
     g_upd_installing = true;
     if (updateLaunchInstaller()) {
         logPush("[gui] 已启动安装程序，Mivara 退出");
-        SDL_Event q;
-        q.type = SDL_QUIT;
-        SDL_PushEvent(&q);
+        requestQuit(true);       /* Setup already waited for a free binary */
     } else {
         logPush("[gui] 启动安装程序失败");
         g_upd_installing = false;                /* allow a retry */
@@ -3721,13 +5302,31 @@ static void startInstall()
 
 static void onButton(int id)
 {
-    /* 拼接 direction chooser: modal, so nothing else may act while it is up */
-    if (g_stitch_ask.open) {
+    /* Exactly one modal owns the input — the same one buildButtons() rendered
+     * and renderScreen() painted. A lower dialog stays open but inert. */
+    switch (topModal()) {
+    case MODAL_AUTH:
+        if (id == BTN_AUTH_ALLOW)      answerAuthAsk(true);
+        else if (id == BTN_AUTH_DENY)  answerAuthAsk(false);
+        return;
+    case MODAL_PW:
+        if (id == BTN_PW_CONNECT)      submitPassword();
+        else if (id == BTN_PW_CANCEL)  closePasswordAsk(true);
+        else if (id == BTN_PW_SHOW)    g_pw_ask.show = !g_pw_ask.show;
+        return;
+    case MODAL_SETPW:
+        if (id == BTN_SETPW_OK)            submitSetPassword();
+        else if (id == BTN_SETPW_CANCEL)   closeSetPwAsk();
+        else if (id == BTN_SETPW_SHOW)     g_set_pw.show = !g_set_pw.show;
+        return;
+    case MODAL_STITCH:
         if (id >= BTN_STITCH_SIDE_BASE && id < BTN_STITCH_SIDE_BASE + 4)
             chooseStitchSide(id - BTN_STITCH_SIDE_BASE);
         else if (id == BTN_STITCH_SIDE_CANCEL)
             g_stitch_ask.open = false;
         return;
+    default:
+        break;
     }
     /* Live side switch on the session screen */
     if (id >= BTN_STITCH_SWITCH_BASE && id < BTN_STITCH_SWITCH_BASE + 4) {
@@ -3747,7 +5346,7 @@ static void onButton(int id)
              * claiming the switch is already live. */
             const std::string ip = g_last_ip, nm = g_last_name;
             const int port = g_last_port;
-            stopChild(g_sender, g_child_extend);
+            stopSender();
             launchStream(ip, port, SEND_STITCH, nm, key.c_str());
             /* launchStream leaves its own failure note (and screen) alone. */
             if (g_sender.active)
@@ -3803,23 +5402,32 @@ static void onButton(int id)
         if (g_screen != SCR_SETTINGS) openSettings();
         break;
     case BTN_HOME_RECEIVE:
-        launchReceiver();
+    case BTN_HOME_CONNECT:
+        g_status_note.clear();
+        startSearch();
         break;
     case BTN_HOME_SEND:
         g_status_note.clear();
         startSearch();
         break;
+    case BTN_HOME_RECV_START:
+        launchReceiver();
+        break;
+    case BTN_HOME_RECV_DETAIL:
+        setScreen(SCR_RECEIVING);
+        break;
     case BTN_HOME_RECEIVE_STOP:
-        stopChild(g_receiver);
+        stopReceiver();
         break;
     case BTN_HOME_SENDER_STOP:
-        stopChild(g_sender, g_child_extend);
-        g_child_extend = false;
+        stopSender();
+        g_child_mode = SEND_MIRROR;
+        g_status_note = "会话已结束";
+        setScreen(SCR_HOME);
         break;
 
     case BTN_RECV_STOP:
-        stopChild(g_receiver);
-        setScreen(SCR_HOME);
+        stopReceiver();              /* also returns to 主页 and clears state */
         break;
     case BTN_RECV_LOG:
         toggleLogWindow();
@@ -3848,10 +5456,9 @@ static void onButton(int id)
         g_status_note.clear();
         startSearch();
         break;
-    case BTN_NF_QUIT: {
-        SDL_Event e2; e2.type = SDL_QUIT; SDL_PushEvent(&e2);
+    case BTN_NF_QUIT:
+        requestQuit();
         break;
-    }
 
     case BTN_MANUAL_CONNECT: {
         std::string ip = g_manual_ip;
@@ -3878,8 +5485,7 @@ static void onButton(int id)
         break;
 
     case BTN_STREAM_STOP:
-        stopChild(g_sender, g_child_extend);
-        g_child_extend = false;
+        stopSender();
         setScreen(SCR_HOME);
         break;
     case BTN_STREAM_LOG:
@@ -3910,6 +5516,10 @@ static void onButton(int id)
         break;
     case BTN_SET_CONSOLE:
         g_cfg_edit.show_status_console = !g_cfg_edit.show_status_console;
+        /* The flag is read when a child is spawned; a running receiver keeps
+         * the mode it was started with. Say so instead of implying it is live. */
+        if (g_receiver.active)
+            g_status_note = "状态控制台将在下次启动接收时生效";
         break;
     case BTN_SET_LOGWIN:
         g_cfg_edit.show_log_window = !g_cfg_edit.show_log_window;
@@ -3921,6 +5531,42 @@ static void onButton(int id)
         break;
     case BTN_SET_AUTORECV:
         g_cfg_edit.auto_receive = !g_cfg_edit.auto_receive;
+        /* 自动接收 is a next-launch preference only — never toggle the service
+         * from here (PRD: 手动开关只改变当前状态). */
+        g_status_note = "「自动接收」只影响下次启动，本次不会开启或关闭接收";
+        break;
+    case BTN_SET_TAB_BASE:
+    case BTN_SET_TAB_BASE + 1:
+        g_set_tab = id - BTN_SET_TAB_BASE;
+        break;
+    case BTN_SET_ALLOW_RECV: {
+        /* The switch is the live run state: start/stop now, and stay on this
+         * settings page. 确定 later only reloads the policy of a running
+         * receiver; it never starts or stops one. */
+        const Screen keep = g_screen;
+        const Screen keep_session = g_session_screen;
+        if (receiveRunning()) stopReceiver();
+        else                  launchReceiver();
+        g_screen = keep;
+        g_session_screen = keep_session;
+        break;
+    }
+    case BTN_SET_POLICY_OPEN:
+    case BTN_SET_POLICY_PASSWORD:
+    case BTN_SET_POLICY_MANUAL: {
+        const int idx = id - BTN_SET_POLICY_OPEN;
+        g_cfg_edit.auth_mode = kAuthModeKey[idx];
+        /* 密码 mode without a record is not a usable policy: open the editor
+         * now rather than letting 确定 fail later. */
+        if (idx == 1 && g_cfg_edit.auth_hash.empty()) openSetPwAsk();
+        break;
+    }
+    case BTN_SET_PW_EDIT:
+        openSetPwAsk();
+        break;
+    case BTN_HOME_RECV_SETTINGS:
+        openSettings();
+        g_set_tab = 1;
         break;
     case BTN_SET_AUTOCHECK:
         g_cfg_edit.auto_check_update = !g_cfg_edit.auto_check_update;
@@ -3980,6 +5626,23 @@ static void onButton(int id)
         break;
     }
     case BTN_SET_OK: {
+        /* 仅允许密码连接 is only a policy when a usable KDF record exists.
+         * Refusing here keeps a half-configured receiver from either rejecting
+         * every peer or (on an older build) degrading to 任意连接. */
+        if (g_cfg_edit.auth_mode == "password") {
+            uint8_t salt[16], hash[32];
+            std::string why;
+            const bool ok =
+                mivaraHexDecode(g_cfg_edit.auth_salt, salt, sizeof(salt)) &&
+                mivaraHexDecode(g_cfg_edit.auth_hash, hash, sizeof(hash)) &&
+                mivaraAuthRecordUsable(hash, salt,
+                                       (uint32_t)g_cfg_edit.auth_iter, &why);
+            if (!ok) {
+                g_set_tab = 1;
+                g_status_note = "请先设置连接密码，再启用「仅允许密码连接」";
+                break;
+            }
+        }
         const int want = g_cfg_edit.auto_start ? 1 : 0;
         const int had = g_cfg.auto_start ? 1 : 0;
         /* Update metadata is runtime state, not a user setting: preserve it
@@ -3991,12 +5654,25 @@ static void onButton(int id)
         g_cfg.last_update_check = keep_last;
         g_cfg.ignored_version   = keep_ign;
         configSave(g_cfg);
+        /* 授权方式：确定只做策略热更新。接收的启动/停止由「允许其他设备连接」
+         * 开关立即完成，这里绝不隐式启动或停止服务；已建立的会话不受影响。 */
+        {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_policy = g_cfg.auth_mode;
+        }
+        bool reloadFailed = false;
+        if (g_receiver.active) {
+            if (!sendToChild(g_receiver, "RX|reload")) {
+                noteReceiverControlFailure("接收策略热更新");
+                reloadFailed = true;
+            }
+        }
         /* Re-register whenever auto_start is on so a moved exe path stays
          * current; drop the task when it was just switched off. */
         if (want != had || want == 1) {
             if (!applyAutoStart(want))
                 g_status_note = "计划任务写入失败（需管理员）";
-            else
+            else if (!reloadFailed)
                 g_status_note.clear();
         }
         /* Live-apply transfer params to a running sender session. A stitch
@@ -4023,7 +5699,7 @@ static void onButton(int id)
                     const int mode = g_child_mode;
                     const std::string ip = g_last_ip, nm = g_last_name;
                     const int port = g_last_port;
-                    stopChild(g_sender, g_child_extend);
+                    stopSender();
                     g_status_note = "控制台模式：已按新参数重启会话";
                     launchStream(ip, port, mode, nm);
                     return;
@@ -4157,12 +5833,29 @@ int main(int argc, char *argv[])
         themeSetMode(m);
     }
 
+    /* Second launch: wake the copy that is already running (and keep exactly
+     * one receiver competing for the ports) instead of starting a second tray. */
+    if (!traySingleInstance()) {
+        std::cout << "Mivara 已在运行，已唤起现有窗口。\n";
+        TTF_Quit();
+        SDL_Quit();
+        return 0;
+    }
+
     g_win = SDL_CreateWindow("Mivara v" MIVARA_VERSION, SDL_WINDOWPOS_CENTERED,
                              SDL_WINDOWPOS_CENTERED, uiPx(WIN_W), uiPx(WIN_H), 0);
     g_ren = SDL_CreateRenderer(g_win, -1,
                                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!g_win || !g_ren) {
         std::cerr << "SDL_CreateWindow/Renderer: " << SDL_GetError() << "\n";
+        /* traySingleInstance() may already own the wake thread; leaving a
+         * joinable std::thread behind turns the exit into std::terminate. */
+        if (g_ren) SDL_DestroyRenderer(g_ren);
+        if (g_win) SDL_DestroyWindow(g_win);
+        trayShutdown();
+        traySingleInstanceRelease();
+        TTF_Quit();
+        SDL_Quit();
         return 1;
     }
     /* Required by fillRoundRect: the tint chips, hairlines and the stacked
@@ -4171,6 +5864,12 @@ int main(int argc, char *argv[])
     /* Every shape primitive below is in logical units; this is what maps them
      * onto the larger back buffer. */
     SDL_RenderSetScale(g_ren, g_uiScale, g_uiScale);
+
+    /* Windows tray: the close button hides the window instead of ending a
+     * session. Unsupported platforms keep the normal close-to-exit behaviour. */
+    g_tray_ok = trayInit(trayTooltip());
+    g_tray_tip_last = trayTooltip();
+    if (g_tray_ok) logPush("[gui] 托盘图标已创建");
 
     if (g_cfg.show_log_window) openLogWindow();
 
@@ -4190,6 +5889,8 @@ int main(int argc, char *argv[])
     }
     updateStartupSweep();       /* drop installers left by an earlier run */
 
+    /* auto_receive is the only startup preference. A manual stop in the
+     * previous run is not a reason to stay off this time. */
     if (g_cfg.auto_receive) launchReceiver();
 
     /* first automatic update check ~3 s in, after startup has settled; the
@@ -4202,12 +5903,27 @@ int main(int argc, char *argv[])
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
-                running = false;
+                if (g_exit_no_confirm) {
+                    g_exit_no_confirm = false;
+                    running = false;              /* installer hand-over */
+                } else if (g_exit_requested) {
+                    g_exit_requested = false;
+                    if (confirmExit()) {
+                        stopReceiver();       /* single stop path, even on quit */
+                        running = false;
+                    }
+                } else if (g_tray_ok) {
+                    hideToTray();                 /* window X: keep running */
+                } else {
+                    running = false;
+                }
             }
             else if (ev.type == SDL_WINDOWEVENT &&
                      ev.window.event == SDL_WINDOWEVENT_CLOSE) {
                 if (g_log_win && ev.window.windowID == SDL_GetWindowID(g_log_win))
                     closeLogWindow();
+                else if (g_tray_ok)
+                    hideToTray();
                 else
                     running = false;
             }
@@ -4251,7 +5967,15 @@ int main(int argc, char *argv[])
                 }
             }
             else if (ev.type == SDL_TEXTINPUT) {
-                if (g_screen == SCR_MANUAL_IP) {
+                /* Text goes to the TOP modal only; a lower dialog keeps its
+                 * contents but does not receive keystrokes. */
+                if (topModal() == MODAL_SETPW) {
+                    appendPasswordInput(g_set_pw.a, ev.text.text, g_set_pw.err);
+                } else if (topModal() == MODAL_PW) {
+                    appendPasswordInput(g_pw_ask.text, ev.text.text,
+                                        g_pw_ask.error);
+                } else if (topModal() == MODAL_NONE &&
+                           g_screen == SCR_MANUAL_IP) {
                     for (const char *c = ev.text.text; *c; c++) {
                         if ((isdigit((unsigned char)*c) || *c == '.') &&
                             g_manual_ip.size() < 15)
@@ -4260,24 +5984,74 @@ int main(int argc, char *argv[])
                 }
             }
             else if (ev.type == SDL_KEYDOWN) {
+                const Modal modal = topModal();
+                if (modal == MODAL_SETPW) {
+                    if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                        closeSetPwAsk();
+                    } else if (ev.key.keysym.sym == SDLK_RETURN ||
+                               ev.key.keysym.sym == SDLK_KP_ENTER) {
+                        submitSetPassword();
+                    } else if (ev.key.keysym.sym == SDLK_BACKSPACE) {
+                        if (!g_set_pw.a.empty()) g_set_pw.a.pop_back();
+                        g_set_pw.err.clear();
+                    } else if ((ev.key.keysym.mod & KMOD_CTRL) &&
+                               ev.key.keysym.sym == SDLK_v) {
+                        char *clip = SDL_GetClipboardText();
+                        if (clip) {
+                            appendPasswordInput(g_set_pw.a, clip, g_set_pw.err);
+                            SDL_free(clip);
+                        }
+                    }
+                    continue;
+                }
+                if (modal == MODAL_PW) {
+                    if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                        closePasswordAsk(true);
+                    } else if (ev.key.keysym.sym == SDLK_RETURN ||
+                               ev.key.keysym.sym == SDLK_KP_ENTER) {
+                        submitPassword();
+                    } else if (ev.key.keysym.sym == SDLK_BACKSPACE) {
+                        if (!g_pw_ask.text.empty()) g_pw_ask.text.pop_back();
+                        g_pw_ask.error.clear();
+                    } else if ((ev.key.keysym.mod & KMOD_CTRL) &&
+                               ev.key.keysym.sym == SDLK_v) {
+                        /* Ctrl+V: SDL only turns a paste into SDL_TEXTINPUT on
+                         * some platforms, so read the clipboard directly. */
+                        char *clip = SDL_GetClipboardText();
+                        if (clip) {
+                            appendPasswordInput(g_pw_ask.text, clip,
+                                                g_pw_ask.error);
+                            SDL_free(clip);
+                        }
+                    }
+                    continue;
+                }
+                if (modal == MODAL_AUTH) {
+                    if (ev.key.keysym.sym == SDLK_ESCAPE)
+                        answerAuthAsk(false);   /* default answer is 拒绝 */
+                    continue;
+                }
+                if (modal == MODAL_STITCH) {
+                    if (ev.key.keysym.sym == SDLK_ESCAPE)
+                        g_stitch_ask.open = false;   /* dismiss the chooser */
+                    continue;
+                }
                 if (ev.key.keysym.sym == SDLK_ESCAPE) {
-                    if (g_stitch_ask.open) {
-                        g_stitch_ask.open = false;   /* dismiss the chooser only */
-                    } else if (g_screen == SCR_MANUAL_IP) {
+                    if (g_screen == SCR_MANUAL_IP) {
                         SDL_StopTextInput();
                         setScreen(SCR_HOME);
                     } else if (g_screen == SCR_SETTINGS) {
                         g_screen = resolveHomeScreen();
                     } else if (g_screen == SCR_STREAMING) {
-                        stopChild(g_sender, g_child_extend);
-                        g_child_extend = false;
+                        stopSender();
                         setScreen(SCR_HOME);
                     } else if (g_screen == SCR_RECEIVING) {
-                        stopChild(g_receiver);
-                        setScreen(SCR_HOME);
+                        stopReceiver();      /* single stop path; also goes home */
                     } else if (g_screen != SCR_HOME) {
                         setScreen(SCR_HOME);
-                    } else running = false;
+                    } else {
+                        requestQuit();      /* ESC on 主页: ask, then exit */
+                    }
                 }
                 else if (g_screen == SCR_MANUAL_IP &&
                          ev.key.keysym.sym == SDLK_BACKSPACE) {
@@ -4291,6 +6065,9 @@ int main(int argc, char *argv[])
         }
 
         processSearchUpdates();
+        drainChildStats();          /* STAT lines from the reader threads */
+        tickAuthDialogs();
+        tickRecvState();            /* STARTING must not last forever */
 
         /* async update check / download completion (main thread only) */
         {
@@ -4342,17 +6119,81 @@ int main(int argc, char *argv[])
 
         /* child exit tracking */
         if (g_sender.active && childExited(g_sender, "sender")) {
+            /* childExited() joined the reader, so every final STAT line is
+             * queued; apply them now or the last error is missed. */
+            drainChildStats();
             g_child_extend = false;
             g_child_mode = SEND_MIRROR;
+            /* Keep the sender's last failure visible: the streaming panel is
+             * gone by the time the user reaches Home, and "会话已结束" alone
+             * would hide a wrong password or a busy peer. */
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lk(g_stats_mtx);
+                if (g_stats.valid && g_stats.event == "error" &&
+                    !g_stats.msg.empty())
+                    err = g_stats.msg;
+            }
+            /* The connection phase must not outlive the child either: a dead
+             * sender can never be "正在投屏" or "等待授权". */
+            g_send_phase = err.empty() ? SP_IDLE : SP_FAILED;
+            g_auth_wait_note.clear();
             if (g_screen == SCR_STREAMING) {
-                g_status_note = "会话已结束";
+                g_status_note = err.empty()
+                                    ? "会话已结束"
+                                    : "连接失败：" + senderErrorText(err);
+                setScreen(SCR_HOME);
+            } else if (!err.empty()) {
+                g_status_note = "连接失败：" + senderErrorText(err);
+            }
+            if (g_hidden)
+                trayNotify("会话已结束", err.empty() ? "投屏会话已结束，单击托盘图标查看"
+                                                     : senderErrorText(err));
+        }
+        if (g_receiver.active && childExited(g_receiver, "receiver")) {
+            /* Apply the final lines with the launch generation (so a bind /
+             * auth_config token survives), then bump it so nothing this dead
+             * process queued can ever write WAITING again. A user stop goes
+             * through stopReceiver(), which already made active=false, so
+             * reaching this block means an unexpected exit. */
+            drainChildStats();
+            ++g_recv_epoch;
+            closeAuthAsk(-1);
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lk(g_recv_mtx);
+                err = g_recv_error;
+                g_recv_peer.clear();
+                if (err.empty()) g_recv_error = "receiver_exited";
+                g_recv_services = RecvServices{};
+                g_recv_state = RSV_FAILED;
+                err = g_recv_error;
+            }
+            g_recv_started_at = 0;
+            logPush("[gui] 接收服务意外退出：" + receiverErrorText(err));
+            if (g_screen == SCR_RECEIVING) {
+                g_status_note = "接收服务已退出：" + receiverErrorText(err);
                 setScreen(SCR_HOME);
             }
         }
-        if (g_receiver.active && childExited(g_receiver, "receiver")) {
-            if (g_screen == SCR_RECEIVING) {
-                g_status_note = "接收会话已结束";
-                setScreen(SCR_HOME);
+
+        /* tray requests: 显示主界面 / 退出 (never touches the settings).
+         * Drain unconditionally: the single-instance wake channel outlives the
+         * icon, so a shell-rejected icon must not strand a second launch's
+         * show request (issue 19). Only the tooltip needs a live icon. */
+        {
+            const TrayRequests tr = trayTakeRequests();
+            if (tr.show) showFromTray();
+            if (tr.quit && confirmExit()) {
+                stopReceiver();           /* single stop path */
+                running = false;
+            }
+            if (g_tray_ok) {
+                const std::string tip = trayTooltip();
+                if (tip != g_tray_tip_last) {
+                    g_tray_tip_last = tip;
+                    traySetTooltip(tip);
+                }
             }
         }
 
@@ -4391,6 +6232,8 @@ int main(int argc, char *argv[])
     updateJoin();               /* abort + join any in-flight check/download */
     stopChild(g_sender, g_child_extend);
     stopChild(g_receiver);
+    trayShutdown();             /* remove the icon before the window goes away */
+    traySingleInstanceRelease();
     closeLogWindow();
     cleanupSockets();
     if (g_font)  TTF_CloseFont(g_font);

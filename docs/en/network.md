@@ -4,7 +4,7 @@
 
 This page covers the ports Mivara uses on the LAN, the firewall rules the receiver needs, and link-level requirements. For the full port definitions and what each service speaks, see [Architecture & Protocol · Network Ports](architecture.md#network-ports); this page does not repeat the port table.
 
-> **Trusted LAN only.** Mivara provides no transport encryption or peer authentication. Never expose UDP 1900 or TCP 8081–8084 to the internet, and do not port-forward them. See [SECURITY.md](../../SECURITY.md) for the full threat model.
+> **Trusted LAN only.** The receiver can require manual approval or a password (the same policy for 8081 and 8084), and 8082/8083 only accept the current session token — but **no channel is encrypted**, and authorization only decides who may connect. Never expose UDP 1900 or TCP 8081–8084 to the internet, and do not port-forward them. See [SECURITY.md](../../SECURITY.md) for the full threat model.
 
 ## Firewall Rules (Receiver)
 
@@ -28,11 +28,12 @@ sudo ufw allow 8083/tcp comment 'Mivara Port Inspector'
 sudo ufw allow 8084/tcp comment 'Mivara Stitch KVM'
 ```
 
-## Port Inspector (8083) Security Notice
+## Authorization and Sidecar Security Notice
 
-The `8083` port inspector has **no authentication**: any LAN peer that can reach the port can issue LIST/GET/KILL to inspect or terminate receiver-side processes. Keep it on a trusted LAN only — never expose the port to the public internet or forward it through a router.
-
-The stitch channel 8084 is also unencrypted and does not authenticate the peer; security rests entirely on the receiver's per-session confirmation. As with 8083, keep it on a trusted LAN only.
+- **8081 / 8084** obey the same policy from Settings → Receiving & Security: allow any connection / password only / manual approval (the default). They share one active-session slot: while either has a session, the other is answered "busy". Only a PBKDF2 record is stored locally and the password never crosses the wire (a fresh nonce is answered with a proof domain-separated per port), but **the video and input events are not encrypted**.
+- **8082 / 8083** require the 32-byte token of the current authorized 8081 session. It is presented on connect and **re-checked before every request**; the gate is cleared when the session ends, so an already-open sidecar connection loses access on its next request and a new connection with the old token is refused. They are still unencrypted, so a device sniffing the link can read query results or kill requests.
+- "Allow any connection" lets any reachable device in — use it only on a network you fully control.
+- Keep the ports on a trusted LAN only — never expose them to the internet or forward them through a router.
 
 ## Network Requirements
 

@@ -54,6 +54,7 @@
 #include <iomanip>
 #include <fstream>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -271,12 +272,15 @@ static int send_all_stop(int sock, const void *buf, size_t size, ports_stop_fn s
 
 #ifdef _WIN32
 /* ─── Windows socket initialization ──────────────────────────── */
-static bool ensure_winsock()
+static bool ensure_winsock(int *error_out = nullptr)
 {
     WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    const int rc = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (rc != 0)
     {
-        fprintf(stderr, "[PORTS] WSAStartup failed\n");
+        if (error_out)
+            *error_out = rc;
+        fprintf(stderr, "[PORTS] WSAStartup failed: %d\n", rc);
         return false;
     }
     return true;
@@ -983,8 +987,71 @@ static std::vector<PortEntry> collect_ports(uint8_t proto_filter)
  * RECEIVER-SIDE SERVER
  * ════════════════════════════════════════════════════════════════ */
 
+static ports_token_check_fn g_token_check = nullptr;
+
+void ports_service_set_token_check(ports_token_check_fn fn)
+{
+    g_token_check = fn;
+}
+
+/* ─── 8083 监听启动状态（receiver 在发 ready 之前读取） ──────────
+ * state: 0 = starting, 1 = listening, -1 = failed
+ * stage: 0 = none, 1 = socket, 2 = winsock, 3 = bind, 4 = listen
+ * error_code: 原生 errno / WSAGetLastError()，成功为 0。 */
+#define PORTS_START_STAGE_SOCKET 1
+#define PORTS_START_STAGE_WINSOCK 2
+#define PORTS_START_STAGE_BIND 3
+#define PORTS_START_STAGE_LISTEN 4
+
+static std::atomic<int> g_start_state{0};
+static std::atomic<int> g_start_stage{0};
+static std::atomic<int> g_start_error{0};
+static const uint16_t g_start_port = PORTS_SERVICE_PORT;
+
+static void ports_set_startup_status(int state, int stage, int error)
+{
+    /* 先写 error/stage，再 release 写 state：读取方 acquire 后能看到完整结果。 */
+    g_start_error.store(error, std::memory_order_relaxed);
+    g_start_stage.store(stage, std::memory_order_relaxed);
+    g_start_state.store(state, std::memory_order_release);
+}
+
+ports_startup_status ports_service_status(void)
+{
+    ports_startup_status st;
+    st.state = g_start_state.load(std::memory_order_acquire);
+    st.stage = g_start_stage.load(std::memory_order_relaxed);
+    st.error_code = g_start_error.load(std::memory_order_relaxed);
+    st.port = g_start_port;
+    return st;
+}
+
+/* 8083 的令牌只在连接建立时校验一次；视频会话结束后接收端会清零全局令牌。
+ * 因此每个请求边界都要复查，否则旧连接会带着上一会话的权限一直可用。
+ * 未安装回调时保持 PORTS_MAIN 独立服务器的旧行为（不鉴权）。 */
+static bool ports_token_live(const uint8_t token[32])
+{
+    if (!g_token_check || g_token_check(token, 32) != 0)
+        return true;
+    fprintf(stderr, "[PORTS-SVC] Session token revoked – closing\n");
+    return false;
+}
+
 void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
 {
+    uint8_t token[32] = {};
+    if (g_token_check)
+    {
+        /* 8083 can list sockets and kill processes: it is only reachable with
+         * the token of an authorized 8081 session. */
+        if (recv_all_stop(client_sock, token, sizeof(token), should_stop) < 0 ||
+            !g_token_check(token, sizeof(token)))
+        {
+            fprintf(stderr, "[PORTS-SVC] Unauthorized client – closing\n");
+            return;
+        }
+    }
+
     char client_ip[INET_ADDRSTRLEN] = "unknown";
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
@@ -1003,11 +1070,18 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
         if (should_stop && should_stop())
             break;
 
+        /* 会话令牌可能已在上一会话结束时被清除：每个请求边界都复查。 */
+        if (!ports_token_live(token))
+            break;
+
         if (recv_all_stop(client_sock, &req, sizeof(req), should_stop) < 0)
         {
             DEBUG_PRINT("Client disconnected or recv failed");
             break;
         }
+
+        if (!ports_token_live(token))
+            break;
 
         uint32_t magic = ntohl(req.magic);
         if (magic != PORTS_MAGIC)
@@ -1023,6 +1097,8 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
         /* PING */
         if (op == PORTS_OP_PING)
         {
+            if (!ports_token_live(token))
+                break;
             PortResponse resp = {};
             resp.magic = htonl(PORTS_MAGIC);
             resp.status = 0;
@@ -1039,6 +1115,10 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
             proto_filter = 0;
         else if (op == PORTS_OP_LIST_UDP)
             proto_filter = 1;
+
+        /* collect_ports() 开销较大，且结果只在授权仍有效时才有意义。 */
+        if (!ports_token_live(token))
+            break;
 
         auto entries = collect_ports(proto_filter);
 
@@ -1062,6 +1142,10 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
         /* KILL: send SIGTERM to each process on that port */
         if (op == PORTS_OP_KILL_PORT)
         {
+            /* 高风险操作：执行前再校验一次，不能依赖连接建立时的授权。 */
+            if (!ports_token_live(token))
+                break;
+
             bool killed = false;
             for (auto &e : entries)
             {
@@ -1094,6 +1178,9 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
                 }
             }
 
+            if (!ports_token_live(token))
+                break;
+
             PortResponse resp = {};
             resp.magic = htonl(PORTS_MAGIC);
             resp.status = killed ? 0 : 1;
@@ -1105,6 +1192,9 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
         }
 
         /* Send response header for LIST/GET operations */
+        if (!ports_token_live(token))
+            break;
+
         PortResponse resp = {};
         resp.magic = htonl(PORTS_MAGIC);
         resp.status = 0;
@@ -1146,21 +1236,33 @@ void ports_service_handle_client(int client_sock, ports_stop_fn should_stop)
 
 void ports_service_run(ports_stop_fn should_stop)
 {
+    ports_set_startup_status(0, 0, 0);
+
 #ifdef _WIN32
-    if (!ensure_winsock())
-        return;
+    {
+        int winsock_error = 0;
+        if (!ensure_winsock(&winsock_error))
+        {
+            ports_set_startup_status(-1, PORTS_START_STAGE_WINSOCK, winsock_error);
+            return;
+        }
+    }
 
     SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
     if (server == INVALID_SOCKET)
     {
-        fprintf(stderr, "[PORTS-SVC] socket() failed: %d\n", WSAGetLastError());
+        const int err = WSAGetLastError();
+        fprintf(stderr, "[PORTS-SVC] socket() failed: %d\n", err);
+        ports_set_startup_status(-1, PORTS_START_STAGE_SOCKET, err);
         return;
     }
 #else
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0)
     {
-        fprintf(stderr, "[PORTS-SVC] socket() failed: %s\n", strerror(errno));
+        const int err = errno;
+        fprintf(stderr, "[PORTS-SVC] socket() failed: %s\n", strerror(err));
+        ports_set_startup_status(-1, PORTS_START_STAGE_SOCKET, err);
         return;
     }
 
@@ -1168,9 +1270,20 @@ void ports_service_run(ports_stop_fn should_stop)
     signal(SIGPIPE, SIG_IGN);
 #endif
 
+#ifdef _WIN32
+    /* Windows 的 SO_REUSEADDR 允许抢占已被监听的端口，端口被占用时 bind
+     * 仍可能成功，启动结果就永远报不了失败；SO_EXCLUSIVEADDRUSE 才会让
+     * 冲突时的 bind() 失败（WSAEADDRINUSE）。 */
+    {
+        int exclusive = 1;
+        setsockopt(server, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   (const char *)&exclusive, sizeof(exclusive));
+    }
+#else
     int reuse = 1;
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR,
                (const char *)&reuse, sizeof(reuse));
+#endif
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -1179,39 +1292,43 @@ void ports_service_run(ports_stop_fn should_stop)
 
     if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        fprintf(stderr, "[PORTS-SVC] bind() failed on port %d: %s\n",
-                PORTS_SERVICE_PORT,
 #ifdef _WIN32
-                strerror(WSAGetLastError())
+        const int err = WSAGetLastError();
+        fprintf(stderr, "[PORTS-SVC] bind() failed on port %d: WSA error %d\n",
+                PORTS_SERVICE_PORT, err);
 #else
-                strerror(errno)
+        const int err = errno;
+        fprintf(stderr, "[PORTS-SVC] bind() failed on port %d: %s\n",
+                PORTS_SERVICE_PORT, strerror(err));
 #endif
-        );
 #ifdef _WIN32
         closesocket(server);
 #else
         close(server);
 #endif
+        ports_set_startup_status(-1, PORTS_START_STAGE_BIND, err);
         return;
     }
 
     if (listen(server, 10) < 0)
     {
-        fprintf(stderr, "[PORTS-SVC] listen() failed: %s\n",
 #ifdef _WIN32
-                strerror(WSAGetLastError())
+        const int err = WSAGetLastError();
+        fprintf(stderr, "[PORTS-SVC] listen() failed: WSA error %d\n", err);
 #else
-                strerror(errno)
+        const int err = errno;
+        fprintf(stderr, "[PORTS-SVC] listen() failed: %s\n", strerror(err));
 #endif
-        );
 #ifdef _WIN32
         closesocket(server);
 #else
         close(server);
 #endif
+        ports_set_startup_status(-1, PORTS_START_STAGE_LISTEN, err);
         return;
     }
 
+    ports_set_startup_status(1, 0, 0);
     printf("[PORTS-SVC] ✓ Port service listening on TCP %d\n", PORTS_SERVICE_PORT);
     printf("[PORTS-SVC] Press Ctrl+C to stop\n");
 
@@ -1487,7 +1604,8 @@ static bool ports_connect_bounded(ports_sock_t sock, const sockaddr_in &addr)
     return true;
 }
 
-ports_sock_t ports_remote_connect(const char *receiver_ip)
+ports_sock_t ports_remote_connect(const char *receiver_ip,
+                                  const uint8_t *token)
 {
 #ifdef _WIN32
     if (!ensure_winsock())
@@ -1533,6 +1651,24 @@ ports_sock_t ports_remote_connect(const char *receiver_ip)
         close(sock);
 #endif
         return PORTS_INVALID_SOCK;
+    }
+
+    /* Session token first (32 bytes); the service rejects a missing/wrong
+     * token before it parses any request. */
+    {
+        uint8_t tok[32] = {};
+        if (token)
+            memcpy(tok, token, sizeof(tok));
+        if (send_all((int)sock, tok, sizeof(tok)) < 0)
+        {
+            fprintf(stderr, "[PORTS] Failed to send session token\n");
+#ifdef _WIN32
+            closesocket(sock);
+#else
+            close(sock);
+#endif
+            return PORTS_INVALID_SOCK;
+        }
     }
 
     /* Ping handshake */
@@ -1770,7 +1906,7 @@ int main(int argc, char *argv[])
         const char *ip = argv[2];
         uint16_t port = (argc >= 4) ? (uint16_t)atoi(argv[3]) : 0;
 
-        ports_sock_t sock = ports_remote_connect(ip);
+        ports_sock_t sock = ports_remote_connect(ip, nullptr);
         if (sock == PORTS_INVALID_SOCK)
         {
             fprintf(stderr, "Failed to connect to %s\n", ip);
@@ -1819,7 +1955,7 @@ int main(int argc, char *argv[])
 
         printf("Attempting to kill process on port %d at %s...\n", port, ip);
 
-        ports_sock_t sock = ports_remote_connect(ip);
+        ports_sock_t sock = ports_remote_connect(ip, nullptr);
         if (sock == PORTS_INVALID_SOCK)
         {
             fprintf(stderr, "Failed to connect to %s\n", ip);
@@ -1843,7 +1979,7 @@ int main(int argc, char *argv[])
         const char *ip = argv[2];
         uint16_t port = (uint16_t)atoi(argv[3]);
 
-        ports_sock_t sock = ports_remote_connect(ip);
+        ports_sock_t sock = ports_remote_connect(ip, nullptr);
         if (sock == PORTS_INVALID_SOCK)
         {
             fprintf(stderr, "Failed to connect to %s\n", ip);

@@ -111,6 +111,11 @@ bool validExtendRes(const std::string &v)
            (w % 2) == 0 && (h % 2) == 0;
 }
 
+/* Unknown keys are ignored on purpose. In particular the legacy
+ * "allow_receive" key is no longer applied: whether receiving is running is
+ * a runtime state owned by the app, never a startup preference (only
+ * auto_receive is persisted). Old config.ini files therefore keep loading
+ * without error and the stale key has no effect. */
 void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
 {
     if (key == "codec") {
@@ -164,6 +169,22 @@ void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
         /* unknown value → keep the default (right) rather than a broken edge */
         if (val == "left" || val == "right" || val == "top" || val == "bottom")
             cfg.stitch_side = val;
+    } else if (key == "auth_mode") {
+        /* An unknown/corrupt value falls back to manual (fail closed); it can
+         * never become "open" by accident. */
+        if (val == "open" || val == "password" || val == "manual")
+            cfg.auth_mode = val;
+        else
+            cfg.auth_mode = "manual";
+    } else if (key == "auth_salt") {
+        if (val.size() <= 64) cfg.auth_salt = val;   /* validated on use */
+    } else if (key == "auth_hash") {
+        if (val.size() <= 128) cfg.auth_hash = val;
+    } else if (key == "auth_iter") {
+        int v = atoi(val.c_str());
+        cfg.auth_iter = clampInt(v, 1, 10000000);    /* validated on use */
+    } else if (key == "tray_hint_shown") {
+        cfg.tray_hint_shown = (val == "1") ? 1 : 0;
     } else if (key == "last_update_check") {
         /* runtime metadata: reject garbage and future clock skew */
         long long v = strtoll(val.c_str(), nullptr, 10);
@@ -259,11 +280,23 @@ bool configSave(const AppConfig &cfg)
     fprintf(f, "show_log_window=%d\n", cfg.show_log_window ? 1 : 0);
     fprintf(f, "auto_start=%d\n", cfg.auto_start ? 1 : 0);
     fprintf(f, "auto_receive=%d\n", cfg.auto_receive ? 1 : 0);
+    /* allow_receive is runtime-only and deliberately never written: a stale
+     * key from an older config is dropped on the next save. */
     fprintf(f, "auto_check_update=%d\n", cfg.auto_check_update ? 1 : 0);
     fprintf(f, "theme=%s\n", cfg.theme.c_str());
     fprintf(f, "extend_res=%s\n", cfg.extend_res.c_str());
     fprintf(f, "vdd_mode_write=%s\n", cfg.vdd_mode_write.c_str());
     fprintf(f, "stitch_side=%s\n", cfg.stitch_side.c_str());
+    /* ── 接收与安全 ────────────────────────────────────────────────────────
+     * Only the policy spelling and the KDF record are written; the password
+     * itself is never persisted (see auth.h). */
+    fprintf(f, "auth_mode=%s\n", cfg.auth_mode.c_str());
+    if (!cfg.auth_salt.empty())
+        fprintf(f, "auth_salt=%s\n", cfg.auth_salt.c_str());
+    if (!cfg.auth_hash.empty())
+        fprintf(f, "auth_hash=%s\n", cfg.auth_hash.c_str());
+    fprintf(f, "auth_iter=%d\n", cfg.auth_iter);
+    fprintf(f, "tray_hint_shown=%d\n", cfg.tray_hint_shown ? 1 : 0);
     fprintf(f, "last_update_check=%lld\n", cfg.last_update_check);
     fprintf(f, "ignored_version=%s\n", cfg.ignored_version.c_str());
     fclose(f);

@@ -32,10 +32,31 @@ typedef int gpu_sock_t;
     /** Return non-zero when the service should stop (NULL = never stop). */
     typedef int (*gpu_stop_fn)(void);
 
+    /** Session authorization hook. The receiver installs one; every client
+     *  must present the 32-byte token of an authorized 8081 session as the
+     *  first bytes on the connection. Returns non-zero if the token is valid.
+     *  Without a hook (old behaviour) the service is unauthenticated. */
+    typedef int (*gpu_token_check_fn)(const uint8_t *token, uint32_t len);
+    void gpu_service_set_token_check(gpu_token_check_fn fn);
+
+    /** Real startup result of the 8082 listener (same fields as the ports
+     *  service). state 0 = starting, 1 = listening, -1 = failed. */
+    typedef struct gpu_startup_status
+    {
+        int      state;
+        int      stage;
+        int      error_code;
+        uint16_t port;
+    } gpu_startup_status;
+    gpu_startup_status gpu_service_status(void);
+
     /* ── Sender-side (client) ─────────────────────────────────────── */
 
-    /** Connect to the receiver's GPU service. Returns socket fd or -1. */
-    gpu_sock_t gpu_remote_connect(const char *receiver_ip);
+    /** Connect to the receiver's GPU service. Returns socket fd or -1.
+     *  `token` is the 32-byte session token from the v3 handshake; the
+     *  receiver's service refuses the connection without it. */
+    gpu_sock_t gpu_remote_connect(const char *receiver_ip,
+                                  const uint8_t *token);
 
     /** Compress a raw RGB frame on the receiver's GPU.
      *  Allocates *out_buf; caller must free(). Returns compressed size or -1. */

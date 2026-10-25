@@ -25,9 +25,10 @@ struct VddInfo {
 /* Is the virtual display driver present (monitor exposed at all)? */
 bool vddInstalled();
 
-/* Attach the virtual monitor (if not already active), place it right of the
- * real desktop at reqW x reqH @60Hz, and adopt ownership so vddShutdown()
- * will detach it when the session ends. If the driver does not expose the
+/* Attach the virtual monitor through an independent source without changing
+ * the existing display layout, place it right of the real desktop at
+ * reqW x reqH @60Hz, and adopt ownership so vddShutdown() will detach it when
+ * the session ends. If the driver does not expose the
  * requested size, the closest advertised mode is used instead.
  * reloadFirst restarts an already-loaded driver once (needed after
  * vddEnsureMode() appended a mode to vdd_settings.xml).

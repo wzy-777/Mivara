@@ -21,7 +21,14 @@ struct AppConfig
     int show_status_console = 0;     /* 1 = classic cmd console for children */
     int show_log_window = 0;         /* 1 = auto-open the log window */
     int auto_start = 0;              /* 1 = launch at logon (Task Scheduler) */
-    int auto_receive = 0;            /* 1 = enter receive mode on app open */
+    int auto_receive = 0;            /* the ONLY persisted startup preference:
+                                        1 = enter receive mode on app open */
+    int allow_receive = 1;           /* runtime mirror only — NOT persisted and
+                                        NOT read from config.ini. Whether the
+                                        receiver is running lives in the app's
+                                        recv state; at startup only
+                                        auto_receive decides whether to start
+                                        receiving. */
     int auto_check_update = 1;       /* 1 = check for updates on app open */
     std::string theme = "system";    /* light|dark|system (GUI appearance) */
     std::string extend_res = "auto"; /* extend mode VDD size: auto|WxH
@@ -32,6 +39,15 @@ struct AppConfig
     std::string stitch_side = "right";  /* 拼接: left|right|top|bottom –
                                            which edge the peer sits on (the
                                            GUI preselects it in the dialog) */
+    /* ── 接收与安全 ────────────────────────────────────────────────────────
+     * Connection policy. The default for a new install (and for an upgraded
+     * config with no policy key) is manual approval — never open. */
+    std::string auth_mode = "manual";   /* open|password|manual */
+    std::string auth_salt;              /* 32 hex chars, 16 bytes */
+    std::string auth_hash;              /* 64 hex chars — PBKDF2 output, NOT
+                                           the password (see auth.h) */
+    int auth_iter = 120000;             /* PBKDF2-HMAC-SHA256 iterations */
+    int tray_hint_shown = 0;            /* one-time "still running in tray" hint */
     long long last_update_check = 0; /* unix seconds of the last attempt (runtime metadata) */
     std::string ignored_version;     /* e.g. "v0.9.2"; runtime metadata */
 };

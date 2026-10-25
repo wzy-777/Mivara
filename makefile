@@ -125,9 +125,10 @@ ifeq ($(OS),Windows_NT)
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi -ladvapi32 -luser32
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32
     # app: -lwinhttp (update check/download), -lbcrypt (SHA-256 via CNG),
-    #      -ladvapi32 (SetNamedSecurityInfo + SDDL on the update directory)
+    #      -ladvapi32 (SetNamedSecurityInfo + SDDL on the update directory),
+    #      -lshell32 + -luser32 (tray icon, balloons, exit confirmation)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -lsetupapi \
-                     -lwinhttp -lbcrypt -ladvapi32
+                     -lwinhttp -lbcrypt -ladvapi32 -lshell32 -luser32
     # requireAdministrator manifest resource for sender + app
     RES_ADMIN := $(BUILDDIR)/admin_rc.o
 endif
@@ -176,6 +177,8 @@ OBJ_RECEIVER := $(BUILDDIR)/receiver.o
 OBJ_UPDATE   := $(BUILDDIR)/update.o
 OBJ_THEME    := $(BUILDDIR)/theme.o
 OBJ_KVM      := $(BUILDDIR)/kvm.o
+OBJ_AUTH     := $(BUILDDIR)/auth.o
+OBJ_TRAY     := $(BUILDDIR)/tray.o
 
 # ============================================================================
 # PHONY TARGET DECLARATIONS
@@ -229,24 +232,26 @@ $(OBJ_CONFIG): $(SRCDIR)/config.h
 $(OBJ_HISTORY): $(SRCDIR)/history.h
 $(OBJ_UPDATE): $(SRCDIR)/update.h $(SRCDIR)/version.h
 $(OBJ_THEME): $(SRCDIR)/theme.h
-$(OBJ_KVM): $(SRCDIR)/kvm.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
-$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h
+$(OBJ_KVM): $(SRCDIR)/kvm.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h
+$(OBJ_AUTH): $(SRCDIR)/auth.h
+$(OBJ_TRAY): $(SRCDIR)/tray.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
+$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h
 
 # ============================================================================
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
-$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) | $(BINDIR)
+$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_CONFIG) | $(BINDIR)
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
-$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(RES_ADMIN) | $(BINDIR)
+$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(OBJ_AUTH) $(OBJ_TRAY) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
 	@echo "Built $(APP_BIN)"
 
@@ -325,7 +330,8 @@ check:
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
                kvm.cpp kvm.h \
                config.cpp config.h history.cpp history.h \
-	               update.cpp update.h version.h theme.cpp theme.h; do \
+	               update.cpp update.h version.h theme.cpp theme.h \
+               auth.cpp auth.h tray.cpp tray.h; do \
         if [ -f $(SRCDIR)/$$f ]; then \
             echo "    OK  $$f"; \
         else \

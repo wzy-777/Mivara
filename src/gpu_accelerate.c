@@ -245,7 +245,7 @@ static void gpu_close_sock(gpu_sock_t sock)
 #endif
 }
 
-gpu_sock_t gpu_remote_connect(const char *receiver_ip)
+gpu_sock_t gpu_remote_connect(const char *receiver_ip, const uint8_t *token)
 {
     gpu_sock_t sock = socket(AF_INET, SOCK_STREAM, 0);
     if (!GPU_SOCK_VALID(sock)) return GPU_INVALID_SOCK;
@@ -287,6 +287,17 @@ gpu_sock_t gpu_remote_connect(const char *receiver_ip)
         gpu_close_sock(sock);
         fprintf(stderr, "[GPU] Cannot connect to %s:%d\n", receiver_ip, GPU_ACCEL_PORT);
         return GPU_INVALID_SOCK;
+    }
+
+    /* Present the session token before any request (32 bytes, once). */
+    {
+        uint8_t tok[32];
+        memset(tok, 0, sizeof(tok));
+        if (token) memcpy(tok, token, sizeof(tok));
+        if (send_all((int)sock, tok, sizeof(tok)) < 0) {
+            gpu_close_sock(sock);
+            return GPU_INVALID_SOCK;
+        }
     }
 
     GpuRequest ping;
@@ -388,13 +399,75 @@ void gpu_remote_disconnect(gpu_sock_t gpu_sock)
  * RECEIVER-SIDE SERVER
  * ═══════════════════════════════════════════════════════════════ */
 
+static gpu_token_check_fn g_token_check = NULL;
+
+void gpu_service_set_token_check(gpu_token_check_fn fn)
+{
+    g_token_check = fn;
+}
+
+/* ─── 8082 监听启动状态（receiver 在发 ready 之前读取） ──────────
+ * state: 0 = starting, 1 = listening, -1 = failed
+ * stage: 0 = none, 1 = socket, 2 = winsock, 3 = bind, 4 = listen
+ * error_code: 原生 errno / WSAGetLastError()，成功为 0。 */
+#define GPU_START_STAGE_SOCKET  1
+#define GPU_START_STAGE_WINSOCK 2
+#define GPU_START_STAGE_BIND    3
+#define GPU_START_STAGE_LISTEN  4
+
+static volatile int g_start_state = 0;
+static volatile int g_start_stage = 0;
+static volatile int g_start_error = 0;
+static volatile int g_start_port  = GPU_ACCEL_PORT;
+
+/* 先写 stage/error，再写 state：读取方看到非 0 state 时其余字段已就绪。 */
+static void gpu_set_startup_status(int state, int stage, int error)
+{
+    g_start_error = error;
+    g_start_stage = stage;
+    g_start_state = state;
+}
+
+gpu_startup_status gpu_service_status(void)
+{
+    gpu_startup_status st;
+    st.state      = g_start_state;
+    st.stage      = g_start_stage;
+    st.error_code = g_start_error;
+    st.port       = (uint16_t)g_start_port;
+    return st;
+}
+
+/* 8082 的令牌只在连接建立时校验一次；视频会话结束后接收端会清零全局令牌。
+ * 因此每个请求边界都要复查，否则旧连接会带着上一会话的权限一直可用。
+ * 未安装回调时保持旧行为（不鉴权）。 */
+static int gpu_token_live(const uint8_t token[32])
+{
+    if (!g_token_check || g_token_check(token, 32) != 0)
+        return 1;
+    fprintf(stderr, "[GPU-SVC] Session token revoked – closing\n");
+    return 0;
+}
+
 void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
 {
+    uint8_t token[32];
+    memset(token, 0, sizeof(token));
+    if (g_token_check) {
+        /* 8082 is part of the receive surface: no token, no service. */
+        if (recv_all_stop(client_sock, token, sizeof(token), should_stop) < 0 ||
+            !g_token_check(token, sizeof(token))) {
+            fprintf(stderr, "[GPU-SVC] Unauthorized client – closing\n");
+            return;
+        }
+    }
     printf("[GPU-SVC] Client connected\n");
     for (;;) {
         GpuRequest req;
         if (should_stop && should_stop()) break;
+        if (!gpu_token_live(token)) break;
         if (recv_all_stop(client_sock, &req, sizeof(req), should_stop) < 0) break;
+        if (!gpu_token_live(token)) break;
         if (ntohl(req.magic) != GPU_MAGIC || req.version != GPU_VERSION) {
             fprintf(stderr, "[GPU-SVC] Bad magic or version\n"); break;
         }
@@ -406,6 +479,7 @@ void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
 
         if (op == GPU_OP_PING) {
             GpuResponse resp;
+            if (!gpu_token_live(token)) break;
             memset(&resp, 0, sizeof(resp));
             resp.magic     = htonl(GPU_MAGIC);
             resp.status    = 0;
@@ -422,11 +496,14 @@ void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
             break;
         }
 
+        if (!gpu_token_live(token)) break;
         uint8_t *buf = (uint8_t *)malloc(data_sz);
         if (!buf) break;
 
         double t0 = now_ms();
+        if (!gpu_token_live(token)) { free(buf); break; }
         if (recv_all_stop(client_sock, buf, data_sz, should_stop) < 0) { free(buf); break; }
+        if (!gpu_token_live(token)) { free(buf); break; }
 
         uint8_t  *result    = NULL;
         uint32_t  result_sz = 0;
@@ -470,6 +547,9 @@ void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
             printf("[GPU-SVC] Colorfix %ux%u in %.2f ms\n", width, height, ms);
         }
 
+        /* 发送结果前再校验一次；会话已结束时丢弃结果直接关闭。 */
+        if (!gpu_token_live(token)) { free(result); break; }
+
         GpuResponse resp;
         memset(&resp, 0, sizeof(resp));
         resp.magic       = htonl(GPU_MAGIC);
@@ -488,30 +568,79 @@ void gpu_service_handle_client(int client_sock, gpu_stop_fn should_stop)
 
 void gpu_service_run(gpu_stop_fn should_stop)
 {
+    gpu_set_startup_status(0, 0, 0);
 #ifdef _WIN32
     SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server == INVALID_SOCKET) { fprintf(stderr, "[GPU-SVC] socket() failed\n"); return; }
+    if (server == INVALID_SOCKET) {
+        const int err = WSAGetLastError();
+        fprintf(stderr, "[GPU-SVC] socket() failed: WSA error %d\n", err);
+        gpu_set_startup_status(-1, GPU_START_STAGE_SOCKET, err);
+        return;
+    }
 #else
     int server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server < 0) { fprintf(stderr, "[GPU-SVC] socket() failed\n"); return; }
+    if (server < 0) {
+        const int err = errno;
+        fprintf(stderr, "[GPU-SVC] socket() failed: %s\n", strerror(err));
+        gpu_set_startup_status(-1, GPU_START_STAGE_SOCKET, err);
+        return;
+    }
 #endif
-    int reuse = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
+#ifdef _WIN32
+    /* Windows 的 SO_REUSEADDR 允许抢占已被监听的端口，端口被占用时 bind
+     * 仍可能成功，启动结果就永远报不了失败；SO_EXCLUSIVEADDRUSE 才会让
+     * 冲突时的 bind() 失败（WSAEADDRINUSE）。 */
+    {
+        int exclusive = 1;
+        setsockopt(server, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   (const char *)&exclusive, sizeof(exclusive));
+    }
+#else
+    {
+        int reuse = 1;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse));
+    }
+#endif
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(GPU_ACCEL_PORT);
     if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[GPU-SVC] bind() failed on port %d\n", GPU_ACCEL_PORT);
+#ifdef _WIN32
+        const int err = WSAGetLastError();
+        fprintf(stderr, "[GPU-SVC] bind() failed on port %d: WSA error %d\n",
+                GPU_ACCEL_PORT, err);
+#else
+        const int err = errno;
+        fprintf(stderr, "[GPU-SVC] bind() failed on port %d: %s\n",
+                GPU_ACCEL_PORT, strerror(err));
+#endif
 #ifdef _WIN32
         closesocket(server);
 #else
         close(server);
 #endif
+        gpu_set_startup_status(-1, GPU_START_STAGE_BIND, err);
         return;
     }
-    listen(server, 4);
+    if (listen(server, 4) < 0) {
+#ifdef _WIN32
+        const int err = WSAGetLastError();
+        fprintf(stderr, "[GPU-SVC] listen() failed: WSA error %d\n", err);
+#else
+        const int err = errno;
+        fprintf(stderr, "[GPU-SVC] listen() failed: %s\n", strerror(err));
+#endif
+#ifdef _WIN32
+        closesocket(server);
+#else
+        close(server);
+#endif
+        gpu_set_startup_status(-1, GPU_START_STAGE_LISTEN, err);
+        return;
+    }
+    gpu_set_startup_status(1, 0, 0);
     printf("[GPU-SVC] Compute service listening on TCP %d\n", GPU_ACCEL_PORT);
 #ifndef _WIN32
     /* A peer that vanished mid-frame must not take the receiver with it. */

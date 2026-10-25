@@ -23,7 +23,9 @@
 - **零配置发现** —— SSDP 自动找到局域网内的接收端并显示主机名；多播被网络策略拦截时可直连 IP。
 - **高画质低延迟** —— H.264 / H.265 / AV1，硬件编码优先（NVENC / QSV / AMF / VAAPI），自动回退软件编码；最高 120 FPS。
 - **运行时调参** —— 传输中修改编码、画质、码率、帧率、缩放、色度，秒级生效不断流。
+- **连接授权** —— 三种互斥方式：允许任意连接（有风险提示、非默认）、仅允许密码连接（4–8 个字符，字母不区分大小写，仅在本机保存 PBKDF2 记录，密码不出网）、每次手动授权（30 秒内允许一次或拒绝，超时自动拒绝，重复请求合并）。新装默认每次手动授权；投屏、扩展与拼接共用同一策略。
 - **中文图形界面** —— 主页 / 设置、连接历史、设备列表、实时状态与日志窗口；亮色 / 暗色 / 跟随系统。
+- **关闭不中断** —— Windows 下点关闭按钮只是收进托盘，会话继续；单击托盘图标恢复，右键可显示主界面或退出（有活动会话时退出需确认）；重复启动会唤醒已运行的实例。
 - **开箱即用** —— 开机自启动、自动接收、应用内检查更新与一键安装（SHA-256 校验）。
 - **跨平台** —— Windows 10/11、Linux（X11）、macOS 10.15+。
 
@@ -33,7 +35,7 @@
 
 1. 下载 [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)（也可以到 [Releases](https://github.com/wzy-777/Mivara/releases) 选择版本）。
 2. 双击安装。安装包未做代码签名，可能出现 SmartScreen 提示，见[下文](#windows-smartscreen-提示说明)。
-3. 接收端打开 Mivara 点「接收」；发送端点「发送」，选择设备后点「投屏」「扩展」或「拼接」（拼接需要两端都是 Windows，详见[使用指南](docs/zh/usage.md#拼接软件-kvm)）。
+3. 接收端打开 Mivara，在主页底部的接收状态栏点「开启接收」；发送端点「连接设备」，选择设备后点「投屏」「扩展」或「拼接」（拼接需要两端都是 Windows，详见[使用指南](docs/zh/usage.md#拼接软件-kvm)）。新安装默认「每次手动授权」，接收端会弹窗让你选择「允许一次」或「拒绝」；可在「设置 → 接收与安全」改为「仅允许密码连接」或「允许任意连接」。
 
 > 扩展模式需要安装一次虚拟显示器驱动，详见[虚拟显示器驱动](docs/zh/virtual-display.md)。
 
@@ -65,7 +67,7 @@ make                 # 构建 bin/app、bin/sender、bin/receiver
 | 文档 | 内容 |
 |------|------|
 | [使用指南](docs/zh/usage.md) | 显示模式、界面流程、快捷键、设置与连接历史 |
-| [架构与协议](docs/zh/architecture.md) | 目录结构、工作流程、协议 v2、编解码与附加服务 |
+| [架构与协议](docs/zh/architecture.md) | 目录结构、工作流程、协议 v3 与连接授权、编解码与附加服务 |
 | [构建与打包](docs/zh/building.md) | 环境要求、依赖安装、编译、Windows 安装包 |
 | [虚拟显示器驱动](docs/zh/virtual-display.md) | MttVDD 驱动安装与分辨率配置 |
 | [网络与防火墙](docs/zh/network.md) | 端口、防火墙规则、网络要求 |
@@ -87,15 +89,17 @@ Get-FileHash "$HOME\Downloads\Mivara-Setup.exe" -Algorithm SHA256
 
 ## 安全
 
-Mivara 面向**可信局域网**设计：8081–8084 端口没有加密，8083（端口检查）与 8084（拼接键鼠）没有身份认证。请勿把端口映射到公网。漏洞报告方式与完整威胁模型见 [SECURITY.md](SECURITY.md)。
+Mivara 面向**可信局域网**设计。接收端可要求每次手动授权、密码连接或允许任意连接；8081（视频与授权）、8084（拼接键鼠）执行同一策略，8082（计算卸载）与 8083（端口检查）只接受本次已授权会话的令牌。请仍然注意：
+
+- **授权≠加密**。密码只用于准入校验（本机保存 PBKDF2 记录，验证用 HMAC 应答，密码不出网），**画面与拼接事件本身不加密**，链路上的其他设备仍可截获内容。
+- 「允许任意连接」会让任何能访问该端口的设备直接接入，只在完全可控的网络里使用。
+- 不要把这些端口映射到公网。漏洞报告方式与完整威胁模型见 [SECURITY.md](SECURITY.md)。
 
 ## 致谢
 
 虚拟显示器驱动来自 **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**。
 
 第三方组件及其许可证见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
-
-Windows 安装包代码签名（申请中）：由 [SignPath.io](https://signpath.io) 免费提供、证书由 [SignPath Foundation](https://signpath.org) 持有——详见 [Code signing policy](CODE_SIGNING_POLICY.md)。
 
 ## 许可证
 

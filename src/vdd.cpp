@@ -133,17 +133,176 @@ static bool vddWaitFor(const std::function<bool()> &pred, int ms)
     return pred();
 }
 
-/* Match a CCD target whose friendly monitor name identifies the VDD
- * ("VDD by MTT" / "MTT1337" family). Real monitors never match. */
-static bool vddNameMatch(const WCHAR *wname)
+struct VddDisplayState {
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+};
+
+struct VddTarget {
+    LUID adapter;
+    UINT32 id;
+};
+
+static VddDisplayState g_vdd_base;
+static bool g_vdd_restore_base = false;
+static std::vector<VddTarget> g_vdd_targets;
+
+static bool vddSameLuid(const LUID &a, const LUID &b)
 {
-    char buf[128];
-    int  n = 0;
-    for (; wname && wname[n] && n < 127; n++)
-        buf[n] = (char)wname[n];
-    buf[n] = '\0';
-    for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
-    return strstr(buf, "vdd") || strstr(buf, "mtt");
+    return a.HighPart == b.HighPart && a.LowPart == b.LowPart;
+}
+
+static bool vddSameId(LUID a, UINT32 ai, LUID b, UINT32 bi)
+{
+    return vddSameLuid(a, b) && ai == bi;
+}
+
+static std::string vddWideLower(const WCHAR *s)
+{
+    std::string out;
+    for (; s && *s; ++s)
+        out += (char)tolower((unsigned char)*s);
+    return out;
+}
+
+static std::string vddLowerText(const char *s)
+{
+    std::string out;
+    for (; s && *s; ++s)
+        out += (char)tolower((unsigned char)*s);
+    return out;
+}
+
+static bool vddMttName(const std::string &name)
+{
+    return name == "vdd by mtt" || name == "mttvdd" || name == "mtt1337";
+}
+
+static bool vddQuery(UINT32 flags, VddDisplayState &state)
+{
+    flags |= QDC_VIRTUAL_MODE_AWARE;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(flags, &np, &nm) != ERROR_SUCCESS)
+            return false;
+        VddDisplayState next;
+        next.paths.assign(np, DISPLAYCONFIG_PATH_INFO{});
+        next.modes.assign(nm, DISPLAYCONFIG_MODE_INFO{});
+        const LONG r = QueryDisplayConfig(
+            flags, &np, next.paths.empty() ? nullptr : next.paths.data(),
+            &nm, next.modes.empty() ? nullptr : next.modes.data(), nullptr);
+        if (r == ERROR_INSUFFICIENT_BUFFER) continue;
+        if (r != ERROR_SUCCESS) return false;
+        next.paths.resize(np);
+        next.modes.resize(nm);
+        state = next;
+        return true;
+    }
+    return false;
+}
+
+static bool vddTargetName(const DISPLAYCONFIG_PATH_INFO &p,
+                          DISPLAYCONFIG_TARGET_DEVICE_NAME &tn)
+{
+    tn = {};
+    tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tn.header.size = sizeof(tn);
+    tn.header.adapterId = p.targetInfo.adapterId;
+    tn.header.id = p.targetInfo.id;
+    return DisplayConfigGetDeviceInfo(&tn.header) == ERROR_SUCCESS;
+}
+
+static bool vddIsMtt(const DISPLAYCONFIG_PATH_INFO &p)
+{
+    for (const VddTarget &t : g_vdd_targets) {
+        if (vddSameId(t.adapter, t.id, p.targetInfo.adapterId, p.targetInfo.id))
+            return true;
+    }
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tn;
+    if (!vddTargetName(p, tn)) return false;
+    const std::string path = vddWideLower(tn.monitorDevicePath);
+    const std::string name = vddWideLower(tn.monitorFriendlyDeviceName);
+    if (path.find("#mtt1337#") == std::string::npos && !vddMttName(name))
+        return false;
+    g_vdd_targets.push_back({p.targetInfo.adapterId, p.targetInfo.id});
+    return true;
+}
+
+static UINT32 vddSourceModeIndex(const DISPLAYCONFIG_PATH_INFO &p)
+{
+    return (p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+               ? p.sourceInfo.sourceModeInfoIdx : p.sourceInfo.modeInfoIdx;
+}
+
+static UINT32 vddTargetModeIndex(const DISPLAYCONFIG_PATH_INFO &p)
+{
+    return (p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+               ? p.targetInfo.targetModeInfoIdx : p.targetInfo.modeInfoIdx;
+}
+
+static UINT32 vddDesktopModeIndex(const DISPLAYCONFIG_PATH_INFO &p)
+{
+    return (p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+               ? p.targetInfo.desktopModeInfoIdx
+               : DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID;
+}
+
+static void vddSetSourceModeIndex(DISPLAYCONFIG_PATH_INFO &p, UINT32 index)
+{
+    if (p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+        p.sourceInfo.sourceModeInfoIdx =
+            index >= DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID
+                ? DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID : index;
+    else
+        p.sourceInfo.modeInfoIdx = index;
+}
+
+static void vddSetTargetModeIndex(DISPLAYCONFIG_PATH_INFO &p, UINT32 index)
+{
+    if (p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+        p.targetInfo.targetModeInfoIdx =
+            index >= DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID
+                ? DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID : index;
+    else
+        p.targetInfo.modeInfoIdx = index;
+}
+
+static UINT32 vddCopyMode(UINT32 index,
+                          const std::vector<DISPLAYCONFIG_MODE_INFO> &from,
+                          std::vector<DISPLAYCONFIG_MODE_INFO> &to)
+{
+    if (index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || index >= from.size())
+        return DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    to.push_back(from[index]);
+    return (UINT32)to.size() - 1;
+}
+
+static void vddCompactModes(VddDisplayState &state,
+                            const std::vector<DISPLAYCONFIG_MODE_INFO> &original)
+{
+    std::vector<DISPLAYCONFIG_MODE_INFO> compact;
+    for (DISPLAYCONFIG_PATH_INFO &p : state.paths) {
+        if (!(p.flags & DISPLAYCONFIG_PATH_ACTIVE)) {
+            p.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            p.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            continue;
+        }
+        const UINT32 si = vddSourceModeIndex(p);
+        const UINT32 ti = vddTargetModeIndex(p);
+        vddSetSourceModeIndex(p, vddCopyMode(si, original, compact));
+        vddSetTargetModeIndex(p, vddCopyMode(ti, original, compact));
+        if (p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) {
+            const UINT32 di = p.targetInfo.desktopModeInfoIdx;
+            if (di < original.size()) {
+                p.targetInfo.desktopModeInfoIdx = (UINT32)compact.size();
+                compact.push_back(original[di]);
+            } else {
+                p.targetInfo.desktopModeInfoIdx =
+                    DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID;
+            }
+        }
+    }
+    state.modes = compact;
 }
 
 /* Iterate all CCD paths; run fn(path) for every path whose target monitor
@@ -152,34 +311,19 @@ static bool vddNameMatch(const WCHAR *wname)
 template <typename F>
 static bool vddForEachPath(F fn)
 {
-    UINT32 nPaths = 0, nModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &nPaths, &nModes) != ERROR_SUCCESS)
-        return false;
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &nPaths, paths.data(),
-                           &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-
+    VddDisplayState state;
+    if (!vddQuery(QDC_ALL_PATHS, state)) return false;
     bool seen = false;
-    for (UINT32 i = 0; i < nPaths; i++) {
-        DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
-        tn.header.type       = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        tn.header.size       = sizeof(tn);
-        tn.header.adapterId  = paths[i].targetInfo.adapterId;
-        tn.header.id         = paths[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS)
-            continue;
-        if (!vddNameMatch(tn.monitorFriendlyDeviceName))
-            continue;
+    const UINT32 nPaths = (UINT32)state.paths.size();
+    const UINT32 nModes = (UINT32)state.modes.size();
+    for (DISPLAYCONFIG_PATH_INFO &p : state.paths) {
+        if (!vddIsMtt(p)) continue;
         seen = true;
-        if (!fn(paths[i], nPaths, paths, nModes, modes))
-            break;
+        if (!fn(p, nPaths, state.paths, nModes, state.modes)) break;
     }
     return seen;
 }
 
-/* Does the VDD driver expose a monitor at all (active or not)? */
 bool vddInstalled()
 {
     return vddForEachPath([](DISPLAYCONFIG_PATH_INFO &,
@@ -189,10 +333,6 @@ bool vddInstalled()
     });
 }
 
-/* Is a VDD path ACTIVE, i.e. attached to the desktop right now? Writing the
- * settings file or restarting the device in that state would yank a display
- * a live session may be showing, so both are deferred until no path is
- * active (the next session after a clean shutdown). */
 static bool vddHasActivePath()
 {
     bool active = false;
@@ -201,68 +341,219 @@ static bool vddHasActivePath()
                        UINT32, std::vector<DISPLAYCONFIG_MODE_INFO> &) {
         if (p.flags & DISPLAYCONFIG_PATH_ACTIVE) {
             active = true;
-            return false;             /* stop scanning */
+            return false;
         }
         return true;
     });
     return active;
 }
 
-/* Activate / deactivate every VDD path via the CCD topology. */
-static bool vddApplyTopology(bool active)
+static bool vddCaptureNonMtt(VddDisplayState &out)
 {
-    UINT32 nPaths = 0, nModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &nPaths, &nModes) != ERROR_SUCCESS)
-        return false;
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &nPaths, paths.data(),
-                           &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-
-    bool touched = false;
-    for (UINT32 i = 0; i < nPaths; i++) {
-        DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
-        tn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        tn.header.size      = sizeof(tn);
-        tn.header.adapterId = paths[i].targetInfo.adapterId;
-        tn.header.id        = paths[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS) continue;
-        if (!vddNameMatch(tn.monitorFriendlyDeviceName))            continue;
-
-        if (active) paths[i].flags |=  DISPLAYCONFIG_PATH_ACTIVE;
-        else        paths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;
-        touched = true;
+    VddDisplayState active;
+    if (!vddQuery(QDC_ONLY_ACTIVE_PATHS, active)) return false;
+    VddDisplayState kept;
+    for (const DISPLAYCONFIG_PATH_INFO &p : active.paths) {
+        if (!vddIsMtt(p)) kept.paths.push_back(p);
     }
-    if (!touched) {
-        std::cerr << "VDD: no CCD paths matched the MTT/VDD monitor name\n";
-        return false;
-    }
-
-    LONG st = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
-                               SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY);
-    if (st != ERROR_SUCCESS)
-        std::cerr << "VDD: SetDisplayConfig failed (" << st << ")\n";
-    return st == ERROR_SUCCESS;
+    vddCompactModes(kept, active.modes);
+    out = kept;
+    return true;
 }
 
-/* Find the GDI device name (\\.\DISPLAYn) of the *active* VDD monitor. */
+static bool vddApplyState(VddDisplayState state, const char *what)
+{
+    if (state.paths.empty()) return true;
+    const LONG r = SetDisplayConfig(
+        (UINT32)state.paths.size(), state.paths.data(),
+        (UINT32)state.modes.size(), state.modes.empty() ? nullptr : state.modes.data(),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES |
+        SDC_VIRTUAL_MODE_AWARE);
+    if (r != ERROR_SUCCESS)
+        std::cerr << "VDD: " << what << " failed (" << r << ")\n";
+    return r == ERROR_SUCCESS;
+}
+
+static const DISPLAYCONFIG_MODE_INFO *vddModeAt(
+    const VddDisplayState &state, UINT32 index)
+{
+    if (index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || index >= state.modes.size())
+        return nullptr;
+    return &state.modes[index];
+}
+
+static bool vddSameMode(const DISPLAYCONFIG_MODE_INFO *a,
+                        const DISPLAYCONFIG_MODE_INFO *b)
+{
+    if (!a || !b) return a == b;
+    if (a->infoType != b->infoType || a->id != b->id ||
+        !vddSameLuid(a->adapterId, b->adapterId)) return false;
+    size_t bytes = 0;
+    if (a->infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+        bytes = sizeof(DISPLAYCONFIG_SOURCE_MODE);
+    else if (a->infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+        bytes = sizeof(DISPLAYCONFIG_TARGET_MODE);
+    else if (a->infoType == DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE)
+        bytes = sizeof(DISPLAYCONFIG_DESKTOP_IMAGE_INFO);
+    return bytes != 0 && std::memcmp(&a->sourceMode, &b->sourceMode, bytes) == 0;
+}
+
+static bool vddSamePath(const DISPLAYCONFIG_PATH_INFO &a,
+                        const VddDisplayState &am,
+                        const DISPLAYCONFIG_PATH_INFO &b,
+                        const VddDisplayState &bm)
+{
+    if (!vddSameId(a.sourceInfo.adapterId, a.sourceInfo.id,
+                   b.sourceInfo.adapterId, b.sourceInfo.id) ||
+        !vddSameId(a.targetInfo.adapterId, a.targetInfo.id,
+                   b.targetInfo.adapterId, b.targetInfo.id) ||
+        a.targetInfo.rotation != b.targetInfo.rotation ||
+        a.targetInfo.scaling != b.targetInfo.scaling)
+        return false;
+    if ((a.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) !=
+        (b.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)) return false;
+    if ((a.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) &&
+        a.sourceInfo.cloneGroupId != b.sourceInfo.cloneGroupId) return false;
+    return vddSameMode(vddModeAt(am, vddSourceModeIndex(a)),
+                       vddModeAt(bm, vddSourceModeIndex(b))) &&
+           vddSameMode(vddModeAt(am, vddTargetModeIndex(a)),
+                       vddModeAt(bm, vddTargetModeIndex(b))) &&
+           vddSameMode(vddModeAt(am, vddDesktopModeIndex(a)),
+                       vddModeAt(bm, vddDesktopModeIndex(b)));
+}
+
+static bool vddStateMatches(const VddDisplayState &expected)
+{
+    VddDisplayState current;
+    if (!vddCaptureNonMtt(current) ||
+        current.paths.size() != expected.paths.size()) return false;
+    for (const DISPLAYCONFIG_PATH_INFO &a : expected.paths) {
+        bool found = false;
+        for (const DISPLAYCONFIG_PATH_INFO &b : current.paths) {
+            if (vddSamePath(a, expected, b, current)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+static bool vddSourceUsed(const VddDisplayState &state,
+                          const DISPLAYCONFIG_PATH_INFO &candidate)
+{
+    for (const DISPLAYCONFIG_PATH_INFO &p : state.paths) {
+        if (vddSameId(candidate.sourceInfo.adapterId, candidate.sourceInfo.id,
+                      p.sourceInfo.adapterId, p.sourceInfo.id)) return true;
+    }
+    return false;
+}
+
+static UINT32 vddNextCloneGroup(const VddDisplayState &state)
+{
+    for (UINT32 group = 0; group < DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID; ++group) {
+        bool used = false;
+        for (const DISPLAYCONFIG_PATH_INFO &p : state.paths) {
+            if ((p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) &&
+                p.sourceInfo.cloneGroupId == group) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) return group;
+    }
+    return DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID;
+}
+
+static bool vddAttachIndependent()
+{
+    VddDisplayState keep, all;
+    if (!vddCaptureNonMtt(keep) || !vddQuery(QDC_ALL_PATHS, all)) return false;
+    DISPLAYCONFIG_PATH_INFO candidate = {};
+    int best = -1;
+    for (const DISPLAYCONFIG_PATH_INFO &p : all.paths) {
+        if (!p.targetInfo.targetAvailable || !vddIsMtt(p) ||
+            vddSourceUsed(keep, p)) continue;
+        const int score =
+            (vddSameLuid(p.sourceInfo.adapterId, p.targetInfo.adapterId) ? 2 : 0) +
+            ((p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) ? 1 : 0);
+        if (score > best) {
+            best = score;
+            candidate = p;
+        }
+    }
+    if (best < 0) {
+        std::cerr << "VDD: no independent MttVDD CCD source path is available\n";
+        return false;
+    }
+    candidate.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+    if (candidate.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) {
+        const UINT32 group = vddNextCloneGroup(keep);
+        if (group == DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID) return false;
+        candidate.sourceInfo.cloneGroupId = group;
+        candidate.sourceInfo.sourceModeInfoIdx =
+            DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID;
+        candidate.targetInfo.targetModeInfoIdx =
+            DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID;
+        candidate.targetInfo.desktopModeInfoIdx =
+            DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID;
+    } else {
+        candidate.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        candidate.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    }
+    keep.paths.push_back(candidate);
+    return vddApplyState(keep, "activate independent MttVDD");
+}
+
+static bool vddDetachMtt()
+{
+    if (!vddHasActivePath()) return true;
+    VddDisplayState keep;
+    if (!vddCaptureNonMtt(keep)) return false;
+    return vddApplyState(keep, "detach MttVDD");
+}
+
+/* Resolve the actual active CCD source; an MTT monitor under a shared GDI
+ * source is a clone, not an independent capture target. */
 static bool vddFindActiveDevice(std::string &out)
 {
-    for (DWORD i = 0; ; i++) {
+    VddDisplayState state;
+    if (!vddQuery(QDC_ONLY_ACTIVE_PATHS, state)) return false;
+    for (UINT32 i = 0; i < state.paths.size(); ++i) {
+        const DISPLAYCONFIG_PATH_INFO &p = state.paths[i];
+        if (!(p.flags & DISPLAYCONFIG_PATH_ACTIVE) || !vddIsMtt(p)) continue;
+        bool independent = true;
+        for (UINT32 j = 0; j < state.paths.size() && independent; ++j) {
+            if (i == j || !(state.paths[j].flags & DISPLAYCONFIG_PATH_ACTIVE)) continue;
+            const DISPLAYCONFIG_PATH_INFO &q = state.paths[j];
+            if (vddSameId(p.sourceInfo.adapterId, p.sourceInfo.id,
+                          q.sourceInfo.adapterId, q.sourceInfo.id)) {
+                independent = false;
+            } else if ((p.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) &&
+                       (q.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) &&
+                       p.sourceInfo.cloneGroupId != DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID &&
+                       p.sourceInfo.cloneGroupId == q.sourceInfo.cloneGroupId) {
+                independent = false;
+            }
+        }
+        if (!independent) continue;
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {};
+        sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = sizeof(sn);
+        sn.header.adapterId = p.sourceInfo.adapterId;
+        sn.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) continue;
+        char device[CCHDEVICENAME] = {};
+        if (!WideCharToMultiByte(CP_UTF8, 0, sn.viewGdiDeviceName, -1,
+                                 device, sizeof(device), nullptr, nullptr)) continue;
         DISPLAY_DEVICEA dd = {};
         dd.cb = sizeof(dd);
-        if (!EnumDisplayDevicesA(NULL, i, &dd, 0)) break;
-        if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE) ||
-            !(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
-            continue;
-        DISPLAY_DEVICEA mon = {};
-        mon.cb = sizeof(mon);
-        if (EnumDisplayDevicesA(dd.DeviceName, 0, &mon, 0) &&
-            (strstr(mon.DeviceID, "MTT") || strstr(mon.DeviceString, "VDD"))) {
-            out = dd.DeviceName;
-            return true;
-        }
+        if (!EnumDisplayDevicesA(device, 0, &dd, 0) ||
+            !(dd.StateFlags & DISPLAY_DEVICE_ACTIVE) ||
+            !(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+        out = device;
+        return true;
     }
     return false;
 }
@@ -610,12 +901,14 @@ static bool vddModeAvailable(const std::string &dev, int w, int h)
 /* Is this GDI display device backed by the virtual display driver? */
 static bool isVddMonitorDevice(const char *gdiDevice)
 {
-    DISPLAY_DEVICEA mon = {};
-    mon.cb = sizeof(mon);
-    if (EnumDisplayDevicesA(gdiDevice, 0, &mon, 0))
-        return strstr(mon.DeviceID, "MTT")   ||
-               strstr(mon.DeviceID, "VDD")   ||
-               strstr(mon.DeviceString, "VDD");
+    for (DWORD i = 0;; ++i) {
+        DISPLAY_DEVICEA mon = {};
+        mon.cb = sizeof(mon);
+        if (!EnumDisplayDevicesA(gdiDevice, i, &mon, EDD_GET_DEVICE_INTERFACE_NAME))
+            break;
+        if (vddLowerText(mon.DeviceID).find("mtt1337") != std::string::npos ||
+            vddMttName(vddLowerText(mon.DeviceString))) return true;
+    }
     return false;
 }
 
@@ -676,13 +969,16 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
 {
     if (w < 1 || w > 7680) w = 1920;
     if (h < 1 || h > 4320) h = 1080;
+    g_vdd_base = VddDisplayState{};
+    g_vdd_restore_base = false;
+    if (!vddCaptureNonMtt(g_vdd_base)) {
+        std::cerr << "Cannot save the current display topology; MttVDD was not enabled.\n";
+        return false;
+    }
+    g_vdd_restore_base = true;
 
-    /* vddEnsureMode() appended a mode to vdd_settings.xml while the driver
-     * may still be loaded with the old list (leftover from a crashed
-     * session). One bounded disable/enable cycle makes the UMDF stack
-     * re-read the file; disabling an already-disabled device is a no-op and
-     * the re-enable below is what performs the reload. Never restart while
-     * a VDD path is active – that would yank a display a live session owns. */
+    /* The driver reads its mode list once at start-up. Never restart it while
+     * a VDD path is active. */
     if (reloadFirst && !vddHasActivePath()) {
         std::cout << "Restarting virtual display driver to load the new mode...\n";
         vddEnableDevice(false);
@@ -692,16 +988,17 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
                      "the next session.\n";
     }
 
-    /* Re-enable the Root\MttVDD device first: a disabled device exposes no
-     * CCD path, so vddInstalled() would wrongly report "not installed".
-     * No-op when the device is already enabled (leftover / first run). */
     const bool enabled = vddEnableDevice(true);
-    if (!enabled && !vddDevicePresent()) {
+    const bool present = vddDevicePresent();
+    if (!enabled && !present) {
+        g_vdd_base = VddDisplayState{};
+        g_vdd_restore_base = false;
         std::cerr << "Virtual display driver is not installed on the sender.\n"
                      "  Reinstall Mivara with the virtual display driver task enabled,\n"
                      "  or run vdd\\install_vdd.ps1 from an administrator PowerShell.\n";
         return false;
     }
+    g_vdd_own = true;
     if (!enabled)
         std::cerr << "MttVDD is installed, but Windows could not enable it.\n"
                      "  Check the Root\\MttVDD device status in Device Manager.\n";
@@ -709,55 +1006,44 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         std::cerr << "MttVDD is installed, but no virtual monitor was exposed.\n"
                      "  Check the device for a driver error, review vdd\\install_log.txt,\n"
                      "  or reinstall the virtual display driver.\n";
-        return false;
-    }
-
-    /* Adopt the VDD for this session even if it is already active (e.g. a
-     * leftover from a crashed/killed session): the session end must ALWAYS
-     * detach it again, otherwise the virtual monitor sticks around forever. */
-    g_vdd_own = true;
-
-    bool alreadyActive = false;
-    vddForEachPath([&](DISPLAYCONFIG_PATH_INFO &p, UINT32,
-                       std::vector<DISPLAYCONFIG_PATH_INFO> &,
-                       UINT32, std::vector<DISPLAYCONFIG_MODE_INFO> &) {
-        if (p.flags & DISPLAYCONFIG_PATH_ACTIVE) alreadyActive = true;
-        return !alreadyActive;   /* stop early once found */
-    });
-
-    /* Compute the anchor BEFORE attaching: right edge of the real desktop
-     * (VDD excluded), so the virtual display lands right after it. */
-    int x = desktopRightEdge();
-
-    if (!alreadyActive) {
-        std::cout << "Activating virtual display...\n";
-        if (!vddApplyTopology(true)) {
-            std::cerr << "Failed to activate virtual display\n";
-            vddShutdown();
-            return false;
-        }
-        /* Let the topology settle: poll until the GDI device shows up. */
-        vddWaitFor([] {
-            std::string d;
-            return vddFindActiveDevice(d);
-        }, 5000);
-        Sleep(300);
-    }
-
-    std::string dev;
-    if (!vddFindActiveDevice(dev)) {
-        std::cerr << "Virtual display did not come up (no active MTT device)\n";
         vddShutdown();
         return false;
     }
 
-    /* If the requested size is not in the driver's mode list (the XML could
-     * not be extended), switch to the closest advertised mode. Scaling a
-     * slightly different size uniformly looks far better than a rejected
-     * mode, and the receiver aspect-fits whatever we send. */
-    /* A freshly (re)loaded driver may take a moment to refresh the mode list
-     * exposed through EnumDisplaySettings; polling briefly avoids a needless
-     * downgrade to a different size. */
+    /* Enabling an IddCx device can automatically clone it with physical
+     * targets. Remove that path, restore the saved non-MTT layout, then add
+     * MttVDD through an independently sourced CCD path. */
+    if (vddHasActivePath() && !vddDetachMtt()) {
+        std::cerr << "Failed to remove the automatic MttVDD clone\n";
+        vddShutdown();
+        return false;
+    }
+    if (!vddApplyState(g_vdd_base, "restore the pre-enable display layout")) {
+        vddShutdown();
+        return false;
+    }
+
+    std::cout << "Activating independent virtual display...\n";
+    if (!vddAttachIndependent()) {
+        std::cerr << "Failed to activate an independent virtual display\n";
+        vddShutdown();
+        return false;
+    }
+
+    std::string dev;
+    if (!vddWaitFor([&] { return vddFindActiveDevice(dev); }, 5000)) {
+        std::cerr << "Virtual display did not come up as an independent MTT source\n";
+        vddShutdown();
+        return false;
+    }
+    if (!vddStateMatches(g_vdd_base)) {
+        std::cerr << "Activating MttVDD changed the existing display layout\n";
+        vddShutdown();
+        return false;
+    }
+    const int x = desktopRightEdge();
+
+    /* A freshly (re)loaded driver may take a moment to refresh its modes. */
     if (!vddModeAvailable(dev, w, h)) {
         for (int t = 0; t < 3 && !vddModeAvailable(dev, w, h); t++)
             Sleep(300);
@@ -773,16 +1059,11 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         }
     }
 
-    /* Deterministic placement: requested mode @60 right of the real desktop.
-     * A freshly attached display may reject mode changes for a moment,
-     * so retry a few times before falling back. */
     bool ok = false;
     for (int attempt = 0; attempt < 4 && !ok; attempt++) {
         ok = vddConfigure(dev, x, 0, w, h, 60);
         if (!ok) Sleep(600);
     }
-    /* Some driver lists use 30 Hz for a mode while the global list adds 60;
-     * a 60 Hz rejection is not necessarily a rejected size. */
     if (!ok) {
         for (int attempt = 0; attempt < 2 && !ok; attempt++) {
             ok = vddConfigure(dev, x, 0, w, h, 30);
@@ -798,7 +1079,7 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         }
     }
     if (!ok)
-        std::cerr << "Mode change not applied – streaming current mode\n";
+        std::cerr << "Mode change not applied – checking the current mode and position\n";
     Sleep(800);
 
     VddInfo info;
@@ -808,8 +1089,33 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         vddShutdown();
         return false;
     }
+    bool positioned = info.x == x && info.y == 0;
+    for (int attempt = 0; attempt < 4 && !positioned; ++attempt) {
+        vddConfigure(dev, x, 0, info.w, info.h, attempt == 3 ? 30 : 60);
+        Sleep(300);
+        if (vddFindMonitorRect(dev, info.x, info.y, info.w, info.h))
+            positioned = info.x == x && info.y == 0;
+    }
+    if (!positioned) {
+        std::cerr << "Virtual display position could not be applied\n";
+        vddShutdown();
+        return false;
+    }
+    std::string active;
+    if (!vddFindActiveDevice(active) || active != dev) {
+        std::cerr << "Virtual display became unavailable or shared during mode setup\n";
+        vddShutdown();
+        return false;
+    }
+    if (!vddStateMatches(g_vdd_base)) {
+        std::cerr << "Mode setup changed the existing display layout\n";
+        vddShutdown();
+        return false;
+    }
 
     out = info;
+    g_vdd_base = VddDisplayState{};
+    g_vdd_restore_base = false;
     std::cout << "Virtual display ready: " << dev << "  "
               << info.w << "x" << info.h
               << " @(" << info.x << "," << info.y << ")\n";
@@ -822,13 +1128,27 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
 void vddShutdown()
 {
     if (!g_vdd_own.exchange(false)) return;
+    VddDisplayState restore;
+    bool haveRestore = false;
+    if (g_vdd_restore_base) {
+        restore = g_vdd_base;
+        haveRestore = true;
+    } else {
+        haveRestore = vddCaptureNonMtt(restore);
+    }
     std::cout << "Deactivating virtual display...\n";
-    if (!vddApplyTopology(false))
+    if (!vddDetachMtt())
         std::cerr << "Warning: failed to detach virtual display\n";
-    Sleep(300);                   /* let the topology settle */
+    Sleep(300);
     if (!vddEnableDevice(false))
         std::cerr << "Warning: failed to disable MttVDD device "
                      "(not elevated?) – it may still appear in Settings\n";
+    if (haveRestore && !vddStateMatches(restore) &&
+        !vddApplyState(restore, "restore the non-MttVDD display layout")) {
+        std::cerr << "Warning: failed to restore the non-MttVDD display layout\n";
+    }
+    g_vdd_base = VddDisplayState{};
+    g_vdd_restore_base = false;
 }
 
 /* Unconditional detach + device disable – GUI safety net after a hard-killed
@@ -837,11 +1157,19 @@ void vddShutdown()
 bool vddForceDetach()
 {
     g_vdd_own = false;
-    bool ok = vddApplyTopology(false);
+    g_vdd_base = VddDisplayState{};
+    g_vdd_restore_base = false;
+    VddDisplayState restore;
+    const bool haveRestore = vddCaptureNonMtt(restore);
+    const bool ok = vddDetachMtt();
     Sleep(300);
     if (!vddEnableDevice(false))
         std::cerr << "Warning: failed to disable MttVDD device "
                      "(not elevated?) – it may still appear in Settings\n";
+    if (haveRestore && !vddStateMatches(restore) &&
+        !vddApplyState(restore, "restore the non-MttVDD display layout")) {
+        std::cerr << "Warning: failed to restore the non-MttVDD display layout\n";
+    }
     return ok;
 }
 

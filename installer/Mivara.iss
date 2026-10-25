@@ -48,7 +48,9 @@ begin
   Installer := ExpandConstant('{app}\vdd\install_vdd.ps1');
   LogPath := ExpandConstant('{app}\vdd\install_log.txt');
   Log('Installing the virtual display driver for Extend mode.');
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+  // The 32-bit setup must start 64-bit PowerShell: {sys} is redirected to
+  // SysWOW64 for a 32-bit process, where pnputil.exe does not exist.
+  if not Exec(ExpandConstant('{sysnative}\WindowsPowerShell\v1.0\powershell.exe'),
               '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + Installer + '"',
               ExpandConstant('{app}\vdd'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin

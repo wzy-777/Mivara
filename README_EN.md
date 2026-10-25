@@ -23,7 +23,9 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 - **Zero-config discovery** — SSDP finds receivers on the LAN and shows their hostnames; direct IP connection works when multicast is blocked by network policy.
 - **High quality, low latency** — H.264 / H.265 / AV1 with hardware encoding first (NVENC / QSV / AMF / VAAPI) and automatic software fallback; up to 120 FPS.
 - **Live reconfigure** — change codec, quality, bitrate, frame rate, scale or chroma mid-session; applied within seconds without dropping the stream.
+- **Connection authorization** — three mutually exclusive policies: allow any connection (risk warning, never the default), password only (4–8 characters, letters are case-insensitive; only a PBKDF2 record is stored locally and the password never crosses the wire), or manual approval for every connection (allow once / deny within 30 s, timeout auto-denies, duplicate requests merge). New installs default to manual approval; casting, extending and stitching share the same policy.
 - **Chinese-language GUI** — Home / Settings, connection history, device list, live status and log window; light / dark / follow-system themes.
+- **Close without interrupting** — on Windows the close button hides the window to the notification area and the session keeps running; click the icon to restore, right-click for Show / Quit (quitting with a live session asks first); launching again wakes the running instance.
 - **Ready out of the box** — launch at logon, auto-receive, in-app update check and one-click install (SHA-256 verified).
 - **Cross-platform** — Windows 10/11, Linux (X11), macOS 10.15+.
 
@@ -33,7 +35,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 1. Download [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe) (or pick a version from [Releases](https://github.com/wzy-777/Mivara/releases)).
 2. Run the installer. It is not code-signed, so SmartScreen may prompt — see [below](#windows-smartscreen-notice).
-3. On the receiver, open Mivara and click "Receive"; on the sender click "Send", pick a device, then choose "Cast", "Extend" or "Stitch" (stitch needs Windows on both ends — see the [User Guide](docs/en/usage.md#stitch-software-kvm)).
+3. On the receiver, open Mivara and click "Start receiving" in the receive status bar at the bottom of Home; on the sender click "Connect device", pick a device, then choose "Cast", "Extend" or "Stitch" (stitch needs Windows on both ends — see the [User Guide](docs/en/usage.md#stitch-software-kvm)). New installs default to manual approval, so the receiver asks you to "Allow once" or "Deny"; change this under Settings → Receiving & Security to "Password only" or "Allow any connection".
 
 > Extend mode requires the virtual display driver to be installed once — see [Virtual Display Driver](docs/en/virtual-display.md).
 
@@ -65,7 +67,7 @@ Other platforms and packaging: [Building & Packaging](docs/en/building.md).
 | Document | Contents |
 |----------|----------|
 | [User Guide](docs/en/usage.md) | Display modes, GUI flow, shortcuts, settings and history |
-| [Architecture & Protocol](docs/en/architecture.md) | Directory layout, data flow, protocol v2, codecs and sidecar services |
+| [Architecture & Protocol](docs/en/architecture.md) | Directory layout, data flow, protocol v3 and connection authorization, codecs and sidecar services |
 | [Building & Packaging](docs/en/building.md) | Requirements, dependencies, build targets, Windows installer |
 | [Virtual Display Driver](docs/en/virtual-display.md) | MttVDD installation and resolution configuration |
 | [Network & Firewall](docs/en/network.md) | Ports, firewall rules, network requirements |
@@ -87,15 +89,17 @@ If it matches: browser download bar → "…" → "Keep"; then double-click the 
 
 ## Security
 
-Mivara is designed for **trusted LANs**: ports 8081–8084 are unencrypted, and 8083 (port inspector) and 8084 (stitch keyboard/mouse) have no authentication. Never port-forward them to the public internet. See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerability.
+Mivara is designed for **trusted LANs**. The receiver can require manual approval, a password, or allow any connection; 8081 (video and authorization) and 8084 (stitch keyboard/mouse) obey the same policy, and 8082 (compute offload) and 8083 (port inspector) only accept the token of the current authorized session. Still note:
+
+- **Authorization is not encryption.** The password is only an admission check (a PBKDF2 record is stored locally, the password never crosses the wire and is verified with an HMAC challenge); **the video stream and stitch events are not encrypted**, so other devices on the link can still capture them.
+- "Allow any connection" lets any device that can reach the port in directly — use it only on a network you fully control.
+- Never port-forward these ports to the public internet. See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerability.
 
 ## Acknowledgements
 
 The virtual display driver comes from **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**.
 
 Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
-
-Windows installer code signing (application in progress): provided free of charge by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org) — see the [Code signing policy](CODE_SIGNING_POLICY.md).
 
 ## License
 
