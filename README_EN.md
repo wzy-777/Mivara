@@ -6,7 +6,7 @@
 
 Turn any computer on your LAN into a second screen. The sender captures and streams its display; the receiver shows it fullscreen. In extend mode the system gains a real virtual display, so windows and the mouse can move straight onto it.
 
-[![Version](https://img.shields.io/badge/version-0.10.0-blue)](https://github.com/wzy-777/Mivara)
+[![Version](https://img.shields.io/badge/version-0.11.0-blue)](https://github.com/wzy-777/Mivara)
 [![Download Latest Installer](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#requirements)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#requirements)
