@@ -34,24 +34,69 @@ WizardStyle=modern
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加任务:"
-Name: "installvdd"; Description: "安装虚拟显示驱动（扩展模式需要，推荐）"; GroupDescription: "附加任务:"; Flags: checkedonce
+; Exactly one of the two VDD tasks is shown, decided by VddDevicePresent().
+; A fresh machine gets the checked "install" task; a machine that already has
+; the Root\MttVDD device gets an unchecked "reinstall" task instead.
+Name: "installvdd"; Description: "安装虚拟显示驱动（扩展模式需要，推荐）"; GroupDescription: "附加任务:"; Flags: checkedonce; Check: not VddDevicePresent
+Name: "reinstallvdd"; Description: "重新安装虚拟显示驱动（已检测到驱动，通常无需勾选）"; GroupDescription: "附加任务:"; Flags: unchecked; Check: VddDevicePresent
 
 [Code]
+// True when the Root\MttVDD device exists in any state (including the normal
+// "disabled, code 22" state left behind by vddShutdown). Enum\ROOT\DISPLAY is
+// where the driver's Display-class devnode lives; match the hardware ID rather
+// than a fixed instance number, and never match other vendors' virtual displays.
+function VddDevicePresent(): Boolean;
+var
+  Names: TArrayOfString;
+  Key, Ids, Id: String;
+  I: Integer;
+begin
+  Result := False;
+  if not RegGetSubkeyNames(HKLM, 'SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY', Names) then
+    exit;
+  for I := 0 to GetArrayLength(Names) - 1 do
+  begin
+    Key := 'SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\' + Names[I];
+    // RegQueryMultiStringValue returns the REG_MULTI_SZ items in one String,
+    // separated by #0 (Inno Setup 6.6 signature), not a TArrayOfString.
+    if RegQueryMultiStringValue(HKLM, Key, 'HardwareID', Ids) then
+    begin
+      Ids := Ids + #0;
+      while Ids <> '' do
+      begin
+        Id := Copy(Ids, 1, Pos(#0, Ids) - 1);
+        Ids := Copy(Ids, Pos(#0, Ids) + 1, Length(Ids));
+        if CompareText(Id, 'Root\MttVDD') = 0 then
+        begin
+          Result := True;
+          exit;
+        end;
+      end;
+    end;
+  end;
+end;
+
 procedure InstallVirtualDisplayDriver;
 var
   ResultCode: Integer;
   Installer: String;
   LogPath: String;
+  Params: String;
+  Reinstall: Boolean;
 begin
-  if not IsTaskSelected('installvdd') then
+  Reinstall := IsTaskSelected('reinstallvdd');
+  if (not IsTaskSelected('installvdd')) and (not Reinstall) then
     exit;
   Installer := ExpandConstant('{app}\vdd\install_vdd.ps1');
   LogPath := ExpandConstant('{app}\vdd\install_log.txt');
+  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + Installer + '"';
+  if Reinstall then
+    Params := Params + ' -Reinstall';
   Log('Installing the virtual display driver for Extend mode.');
   // The 32-bit setup must start 64-bit PowerShell: {sys} is redirected to
   // SysWOW64 for a 32-bit process, where pnputil.exe does not exist.
   if not Exec(ExpandConstant('{sysnative}\WindowsPowerShell\v1.0\powershell.exe'),
-              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + Installer + '"',
+              Params,
               ExpandConstant('{app}\vdd'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
     Log(Format('Could not start the VDD installer: %s', [SysErrorMessage(ResultCode)]));

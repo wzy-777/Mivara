@@ -14,17 +14,17 @@ The driver **only needs to be installed once on the sender**; the receiver does 
 
 ### Installation
 
-The Windows installer selects "Install virtual display driver (required for Extend, recommended)" by default. After copying the files it stages the driver, creates the `Root\MttVDD` device and selects the x86/AMD64 or ARM64 package. You can opt out if Extend is not needed; mirroring and receiving do not depend on this driver.
+The Windows installer checks for the `Root\MttVDD` device when it starts: if the driver is missing it shows "Install virtual display driver (required for Extend, recommended)" checked by default, then stages the driver, creates the device and selects the x86/AMD64 or ARM64 package after copying the files; **if the driver is already installed it shows an unchecked "Reinstall virtual display driver" task instead**, so a plain upgrade never touches a working driver. You can opt out if Extend is not needed; mirroring and receiving do not depend on this driver.
 
-The script is safe to rerun: it skips creating an existing device and never overwrites an existing `vdd_settings.xml` during an upgrade. Every critical step is checked. A failure returns a non-zero status and the installer shows the error and log path instead of treating it as success.
+The script is safe to rerun: when the device already exists and no reinstall was requested it exits without touching the driver, and an existing `vdd_settings.xml` is never overwritten; the driver on the device is only updated when the reinstall task is checked. Every critical step is checked. A failure returns a non-zero status and the installer shows the error and log path instead of treating it as success.
 
 ### Manual Installation and Repair
 
-Older installers only copied the driver files. If Extend still fails after upgrading, run this on the sender in an administrator PowerShell:
+Older installers only copied the driver files. If Extend still fails after upgrading, run this on the sender in an administrator PowerShell (`-Reinstall` forces a reinstall of an existing driver):
 
 ```powershell
 cd "C:\Program Files\Mivara\vdd"   # adjust if installed elsewhere
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install_vdd.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install_vdd.ps1 -Reinstall
 ```
 
 The script preserves existing resolution settings and verifies the `Root\MttVDD` device. If it fails, review `install_log.txt` in the same directory. Sender logs also distinguish a missing driver, a device that cannot be enabled, and an installed device that exposes no virtual monitor.
