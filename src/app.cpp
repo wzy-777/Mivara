@@ -126,9 +126,8 @@
 #define HDR_WORD_X 58
 
 /* Header appearance switcher: three icon cells on a track, right-aligned with
- * the content column. The cells carry sun / moon / monitor glyphs, not text —
- * the labelled version of the same control is the 外观 card on the settings
- * screen, which is where a user who does not read the icons will look. */
+ * the content column. The cells carry sun / moon / monitor glyphs, not text;
+ * this is the only appearance control — Settings does not repeat it. */
 #define SEG_Y 13
 #define SEG_H 30
 #define SEG_PAD 2                       /* track inset around the cells         */
@@ -301,16 +300,14 @@ static SDL_Rect rcSideCancel()
 #define SET_RC_X (SET_COL_R + SET_PAD)  /* 540 */
 #define SET_L_H 424
 #define SET_R_H 296                     /* 连接与启动                            */
-#define SET_APPEAR_Y 420                /* 外观                                  */
-#define SET_APPEAR_H 112
 #define SET_UPD_Y 548                   /* 更新 (full width)                     */
 #define SET_UPD_H 88
 #define SET_ACT_Y 648                   /* 确定 / 恢复默认 / 返回会话             */
 #define SET_ACT_H 44
 
 /* Settings tabs: 常规 keeps the existing card layout; 接收与安全 owns the
- * receive switch + connection authorization. The chips sit in the title row
- * so neither tab needs a shifted copy of the layout above. */
+ * receive switches, 开机自启动 and the connection authorization. The chips sit
+ * in the title row so neither tab needs a shifted copy of the layout above. */
 #define SET_TAB_Y 58
 #define SET_TAB_H 34
 #define SET_TAB_W 118
@@ -318,12 +315,12 @@ static SDL_Rect rcSideCancel()
 
 /* 接收与安全 tab */
 #define SEC_SWITCH_Y 108
-#define SEC_SWITCH_H 196
-#define SEC_AUTH_Y 320
-#define SEC_AUTH_H 292
+#define SEC_SWITCH_H 228
+#define SEC_AUTH_Y 348
+#define SEC_AUTH_H 264
 #define SEC_ROW_X (BODY_X + 20)
 #define SEC_ROW_W (BODY_W - 40)
-#define SEC_TOGGLE_Y(i) (SEC_SWITCH_Y + 50 + (i) * 44)
+#define SEC_TOGGLE_Y(i) (SEC_SWITCH_Y + 48 + (i) * 38)
 #define SEC_POLICY_Y(i) (SEC_AUTH_Y + 50 + (i) * 42)
 #define SEC_POLICY_X (BODY_X + 32)
 #define SEC_PW_ROW_Y (SEC_AUTH_Y + 190)
@@ -519,9 +516,8 @@ enum BtnId {
     BTN_NAV_SETTINGS,
     BTN_RETURN_SESSION = 8010,
     /* Header appearance switcher. It shares the 8000 block with the nav ids
-     * (8000..8010) — keep any new nav item below BTN_THEME_LIGHT — and it needs
-     * its own ids because the 外观 card on the settings screen is a second
-     * control for the same setting. See kThemeIds for how they are dispatched. */
+     * (8000..8010) — keep any new nav item below BTN_THEME_LIGHT. See
+     * kThemeIds for how the three ids are dispatched. */
     BTN_THEME_LIGHT = 8020,
     BTN_THEME_DARK,
     BTN_THEME_SYSTEM,
@@ -529,14 +525,6 @@ enum BtnId {
                                          * release is waiting); matches against
                                          * nothing else, so it may sit outside
                                          * the kThemeIds table */
-    /* The settings-screen appearance cells must sit in the GAP between the
-     * settings block (7000..7062, where the update ids are an implicit +1 run
-     * from BTN_SET_AUTOCHECK) and the nav block (8000+). Anything inside that
-     * run would be swallowed by the theme branch in onButton(), which runs
-     * before the switch — that silently turned 「打开下载页」 into "switch to
-     * light" once. The assert below keeps the range pinned to the gap. */
-    BTN_SET_THEME_BASE = 7070,          /* +0 light / +1 dark / +2 system */
-
     /* 拼接 direction: the modal chooser shown right after clicking 拼接, and
      * the live four-way switch on the session screen. Same order as KvmSide
      * (left/right/top/bottom), so id - base indexes the side tables. */
@@ -572,34 +560,24 @@ static const int kAuthModeBtn[3] = {BTN_SET_POLICY_OPEN,
                                     BTN_SET_POLICY_MANUAL};
 static const char *kAuthModeKey[3] = {"open", "password", "manual"};
 
-static_assert(BTN_SET_THEME_BASE > BTN_UPD_NOTICE && BTN_SET_THEME_BASE + 2 < BTN_NAV_HOME,
-              "appearance ids must stay in the gap between the settings and nav ranges");
-
-/* Appearance is the only setting reachable from two places at once — the header
- * switcher (8020..8022) and the 外观 card (7070..7072) — so its ids are matched
- * against a table rather than derived by subtracting a base. The derived form
- * was
+/* Appearance has a single control (the header switcher, 8020..8022), but its
+ * ids are still matched against a table rather than derived by subtracting a
+ * base. The derived form was written for two ranges (the header and the since-
+ * removed settings 外观 card):
  *     (id >= BTN_SET_THEME_BASE) ? id - BTN_SET_THEME_BASE : id - BTN_THEME_LIGHT
- * and that test is true for BOTH ranges (8020 >= 7070), so every header click
- * took the first branch and indexed modes[950] out of bounds. The live mode
- * became garbage, so resolve() fell through to the light palette, no cell drew
- * as selected, and themeModeKey()'s default wrote theme=system to config.ini —
- * i.e. the switcher looked like it always jumped to 亮色 whatever you picked,
- * and a restart then followed the system instead. */
+ * Because that test was true for both ranges, every header click took the first
+ * branch and indexed out of bounds, so the switcher appeared to jump to 亮色.
+ * A table makes that class of bug impossible; keep it even with one range. */
 struct ThemeIdEntry { int id; ThemeMode mode; };
 static constexpr ThemeIdEntry kThemeIds[] = {
-    {BTN_THEME_LIGHT,        ThemeMode::Light},
-    {BTN_THEME_DARK,         ThemeMode::Dark},
-    {BTN_THEME_SYSTEM,       ThemeMode::System},
-    {BTN_SET_THEME_BASE + 0, ThemeMode::Light},
-    {BTN_SET_THEME_BASE + 1, ThemeMode::Dark},
-    {BTN_SET_THEME_BASE + 2, ThemeMode::System},
+    {BTN_THEME_LIGHT,   ThemeMode::Light},
+    {BTN_THEME_DARK,    ThemeMode::Dark},
+    {BTN_THEME_SYSTEM,  ThemeMode::System},
 };
 static constexpr int kThemeIdCount = (int)(sizeof(kThemeIds) / sizeof(kThemeIds[0]));
 
-/* Two ids for the same mode is harmless (there are, deliberately, six entries
- * for three modes); two entries sharing an id is not — that is exactly the
- * collision that once turned 「打开下载页」 into "switch to light". */
+/* Two entries sharing an id would be a collision — the kind that once turned
+ * 「打开下载页」 into "switch to light". */
 constexpr bool themeIdsAreDistinct()
 {
     for (int i = 0; i < kThemeIdCount; i++)
@@ -3489,22 +3467,72 @@ static bool runHiddenW(const std::wstring &cmd)
 #endif
 
 /* Task name must match the [UninstallRun] cleanup in installer/Mivara.iss. */
+#ifdef _WIN32
+static const wchar_t *kAutoStartTask = L"Mivara";
+
+/* Does the logon task exist? schtasks exits non-zero when it does not, which
+ * makes this the read-back used to verify a registration. */
+static bool autoStartRegistered()
+{
+    return runHiddenW(sysExePath(L"schtasks.exe") + L" /query /tn \"" +
+                      kAutoStartTask + L"\"");
+}
+#endif
+
+/* Enable or disable the logon task, then return the state Task Scheduler
+ * reports — never the requested one. A config flag that says "on" while the
+ * task is absent would make the switch lie and launch nothing at logon. */
 static bool applyAutoStart(int enable)
 {
 #ifdef _WIN32
+    const std::wstring schtasks = sysExePath(L"schtasks.exe");
     if (enable) {
         /* /tr value must contain an embedded quoted path (spaces in
-         * "Program Files"), and /rl highest avoids a UAC prompt at logon. */
-        std::wstring cmd = sysExePath(L"schtasks.exe") +
-                           L" /create /tn \"Mivara\" /tr \"\\\"" +
-                           selfExePathW() +
-                           L"\\\"\" /sc onlogon /rl highest /f";
-        return runHiddenW(cmd);
+         * "Program Files"); /rl highest is what lets this requireAdministrator
+         * app start at logon without a UAC prompt. */
+        runHiddenW(schtasks + L" /create /tn \"" + kAutoStartTask +
+                   L"\" /tr \"\\\"" + selfExePathW() +
+                   L"\\\"\" /sc onlogon /rl highest /f");
+    } else if (autoStartRegistered()) {
+        /* Deleting an absent task exits non-zero; only ask when it is there. */
+        runHiddenW(schtasks + L" /delete /tn \"" + kAutoStartTask + L"\" /f");
     }
-    return runHiddenW(sysExePath(L"schtasks.exe") + L" /delete /tn \"Mivara\" /f");
+    return autoStartRegistered();
 #else
     (void)enable;
-    return true; /* no-op outside Windows */
+    return false;   /* auto-start is Windows-only */
+#endif
+}
+
+/* Bring config.ini in line with what Task Scheduler actually holds. When the
+ * preference is on, re-register on every start: this refreshes a moved exe
+ * path and re-enables a task the user disabled by hand. When it is off, drop a
+ * leftover task. A failure rewrites the config to the real state so the
+ * settings switch never claims something logon will not do. */
+static void reconcileAutoStart(AppConfig &cfg)
+{
+#ifdef _WIN32
+    const bool want = (cfg.auto_start != 0);
+    if (want) {
+        if (!applyAutoStart(1)) {
+            cfg.auto_start = 0;
+            configSave(cfg);
+            logPush("[gui] 开机自启动注册失败，已关闭该设置（计划任务不可写）");
+        }
+        return;
+    }
+    if (autoStartRegistered() && !applyAutoStart(0)) {
+        cfg.auto_start = 1;
+        configSave(cfg);
+        logPush("[gui] 残留的开机自启动任务无法删除，已保持该设置为开");
+    }
+#else
+    /* Auto-start is Windows-only: clear a preference stored by an older build
+       or a copied config so the switch does not claim it works here. */
+    if (cfg.auto_start != 0) {
+        cfg.auto_start = 0;
+        configSave(cfg);
+    }
 #endif
 }
 
@@ -4361,23 +4389,12 @@ static void buildButtons()
                       chromaLabels[i], BTN_SET_CHROMA_BASE + i,
                       g_cfg_edit.chroma == chromaIds[i]);
 
-        /* 连接与启动 toggles */
-        const int tog[6] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
-                            BTN_SET_AUTOSTART, BTN_SET_AUTORECV, BTN_SET_AUTOCHECK};
-        for (int i = 0; i < 6; i++)
+        /* 连接与启动 toggles (自动接收 lives on the 接收与安全 tab, never here) */
+        const int tog[4] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
+                            BTN_SET_AUTOCHECK};
+        for (int i = 0; i < 4; i++)
             addButton(SET_RC_X, SET_TOGGLE_Y0 + i * 40, SET_COL_W - SET_PAD * 2, 32,
                       "", tog[i], BTN_V_GHOST);
-
-        /* 外观 */
-        {
-            static const char *lbl[3] = {"亮色", "暗色", "跟随系统"};
-            const ThemeMode m = themeMode();
-            const ThemeMode modes[3] = {ThemeMode::Light, ThemeMode::Dark,
-                                        ThemeMode::System};
-            for (int i = 0; i < 3; i++)
-                addChoice(SET_RC_X + i * 101, SET_APPEAR_Y + 56, 93, 32,
-                          lbl[i], BTN_SET_THEME_BASE + i, m == modes[i]);
-        }
 
         /* update card: three fixed slots so the hit targets never move */
         {
@@ -4409,9 +4426,10 @@ static void buildButtons()
             addButton(710, y, 126, 32, lbl, id, BTN_V_PRIMARY);
         }
         } else {
-            /* 接收与安全: the two switches, three policy radios, password row */
-            const int tog[2] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV};
-            for (int i = 0; i < 2; i++)
+            /* 接收与安全: the three switches, three policy radios, password row */
+            const int tog[3] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV,
+                                BTN_SET_AUTOSTART};
+            for (int i = 0; i < 3; i++)
                 addButton(SEC_ROW_X, SEC_TOGGLE_Y(i), SEC_ROW_W, 32, "", tog[i],
                           BTN_V_GHOST);
             for (int i = 0; i < 3; i++)
@@ -5102,18 +5120,15 @@ static void renderScreen(int mousex, int mousey)
             drawCard(g_ren, card, CARD_R);
             drawText(g_ren, "连接与启动", SET_RC_X, card.y + 20, THEME.textDim,
                      g_fontBS);
-            static const char *kToggle[6] = {"硬件加速", "状态控制台", "日志窗口",
-                                             "开机自启动", "自动接收", "自动检查更新"};
-            const bool on[6] = {g_cfg_edit.hw_accel != 0,
+            static const char *kToggle[4] = {"硬件加速", "状态控制台", "日志窗口",
+                                             "自动检查更新"};
+            const bool on[4] = {g_cfg_edit.hw_accel != 0,
                                 g_cfg_edit.show_status_console != 0,
                                 g_cfg_edit.show_log_window != 0,
-                                g_cfg_edit.auto_start != 0,
-                                g_cfg_edit.auto_receive != 0,
                                 g_cfg_edit.auto_check_update != 0};
-            const int id[6] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
-                               BTN_SET_AUTOSTART, BTN_SET_AUTORECV,
+            const int id[4] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
                                BTN_SET_AUTOCHECK};
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < 4; i++) {
                 const int y = SET_TOGGLE_Y0 + i * 40;
                 const SDL_Rect row{SET_RC_X, y, SET_COL_W - SET_PAD * 2, 32};
                 if (g_hot == id[i] || g_press == id[i])
@@ -5122,14 +5137,6 @@ static void renderScreen(int mousex, int mousey)
                           ALIGN_LEFT);
                 drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
             }
-        }
-
-        /* ── right column: 外观 ─────────────────────────────────────────── */
-        {
-            const SDL_Rect card{SET_COL_R, SET_APPEAR_Y, SET_COL_W, SET_APPEAR_H};
-            drawCard(g_ren, card, CARD_R);
-            drawText(g_ren, "外观", SET_RC_X, card.y + 20, THEME.textDim, g_fontBS);
-            /* the three cells are painted by drawButton (BTN_V_CHOICE) */
         }
 
         /* ── 更新 (full width) ──────────────────────────────────────────── */
@@ -5160,16 +5167,20 @@ static void renderScreen(int mousex, int mousey)
             {
                 const SDL_Rect card{BODY_X, SEC_SWITCH_Y, BODY_W, SEC_SWITCH_H};
                 drawCard(g_ren, card, CARD_R);
-                drawText(g_ren, "接收开关", SEC_ROW_X, card.y + 18,
+                drawText(g_ren, "接收与启动", SEC_ROW_X, card.y + 18,
                          THEME.textDim, g_fontBS);
-                static const char *kSwitch[2] = {"允许其他设备连接到此电脑",
-                                                 "启动软件时自动开启接收"};
+                static const char *kSwitch[3] = {"允许其他设备连接到此电脑",
+                                                 "启动软件时自动开启接收",
+                                                 "开机自启动"};
                 /* The first switch reflects the live service, not a stored
-                 * preference; the second is the next-launch preference. */
-                const bool on[2] = {receiveRunning(),
-                                    g_cfg_edit.auto_receive != 0};
-                const int id[2] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV};
-                for (int i = 0; i < 2; i++) {
+                 * preference; the second is the next-launch preference; the
+                 * third registers the logon task (Windows only). */
+                const bool on[3] = {receiveRunning(),
+                                    g_cfg_edit.auto_receive != 0,
+                                    g_cfg_edit.auto_start != 0};
+                const int id[3] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV,
+                                   BTN_SET_AUTOSTART};
+                for (int i = 0; i < 3; i++) {
                     const int y = SEC_TOGGLE_Y(i);
                     if (g_hot == id[i] || g_press == id[i])
                         fillRoundRect(g_ren, SDL_Rect{SEC_ROW_X, y, SEC_ROW_W, 32},
@@ -5181,11 +5192,11 @@ static void renderScreen(int mousex, int mousey)
                                on[i]);
                 }
                 drawText(g_ren, "「开机自启动」只决定 Mivara 是否随 Windows 登录启动；",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 142, THEME.textDim, g_fontS);
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 168, THEME.textDim, g_fontS);
                 drawText(g_ren, "「自动开启接收」只决定下次启动是否直接进入接收状态；",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 162, THEME.textDim, g_fontS);
-                drawText(g_ren, "上方开关只改变本次运行，不会修改自动接收偏好。",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 182, THEME.textDim, g_fontS);
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 186, THEME.textDim, g_fontS);
+                drawText(g_ren, "上方接收开关只改变本次运行，不会修改这些偏好。",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 204, THEME.textDim, g_fontS);
             }
 
             {
@@ -5373,7 +5384,7 @@ static void onButton(int id)
         g_cfg_edit.chroma = vals[id - BTN_SET_CHROMA_BASE];
         return;
     }
-    /* appearance: the header switcher and the 外观 card both land here */
+    /* appearance: the header switcher ids land here */
     for (int i = 0; i < kThemeIdCount; i++) {
         if (kThemeIds[i].id != id) continue;
         const ThemeMode picked = kThemeIds[i].mode;
@@ -5668,12 +5679,26 @@ static void onButton(int id)
             }
         }
         /* Re-register whenever auto_start is on so a moved exe path stays
-         * current; drop the task when it was just switched off. */
+         * current; drop the task when it was just switched off. Verify the
+         * result against Task Scheduler and, when it differs, write the real
+         * state back so the switch never claims logon will do something it
+         * will not. */
         if (want != had || want == 1) {
-            if (!applyAutoStart(want))
-                g_status_note = "计划任务写入失败（需管理员）";
-            else if (!reloadFailed)
+            const bool now = applyAutoStart(want);
+            if (now != (want != 0)) {
+                g_cfg.auto_start = now ? 1 : 0;
+                g_cfg_edit.auto_start = g_cfg.auto_start;
+                configSave(g_cfg);
+#ifdef _WIN32
+                g_status_note = want ? "开机自启动注册失败（计划任务）"
+                                     : "开机自启动取消失败（计划任务）";
+#else
+                g_status_note = "开机自启动目前仅支持 Windows";
+#endif
+                reloadFailed = true;   /* keep this note below */
+            } else if (!reloadFailed) {
                 g_status_note.clear();
+            }
         }
         /* Live-apply transfer params to a running sender session. A stitch
          * child has no encoder and does not read SETP lines, so applying to
@@ -5841,6 +5866,10 @@ int main(int argc, char *argv[])
         SDL_Quit();
         return 0;
     }
+
+    /* Only the primary instance touches the logon task. This also heals a
+     * task that an earlier failed registration or an uninstall left behind. */
+    reconcileAutoStart(g_cfg);
 
     g_win = SDL_CreateWindow("Mivara v" MIVARA_VERSION, SDL_WINDOWPOS_CENTERED,
                              SDL_WINDOWPOS_CENTERED, uiPx(WIN_W), uiPx(WIN_H), 0);

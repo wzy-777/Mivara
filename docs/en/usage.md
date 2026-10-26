@@ -42,7 +42,7 @@ The GUI is Chinese-only; the screenshots below show the Home screen (light/dark)
 | **Connection authorization** | Three mutually exclusive policies: allow any connection (risk warning, never the default) / password only (4–8 characters, letters are case-insensitive, never sent over the wire; an over-long entry is reported, never silently truncated) / manual approval for every connection (the default; 30 s timeout auto-denies, duplicate requests merge, one prompt at a time); a new install or a missing config always falls back to manual approval |
 | **GUI** | SDL2_ttf interface: left nav (Home / Settings), connect-device entry, low-weight receive status bar, connection history, automatic search, device list (cast/extend/stitch), manual IP entry, live status panel, independent log window; Settings is split into General / Receiving & Security |
 | **Close to tray** | On Windows the close button only hides the window and the session keeps running; click the icon to restore, right-click for Show / Quit; launching again wakes the running instance; hiding and quitting never change receive settings |
-| **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt); "Allow other devices to connect" is the live switch (starts/stops immediately, not persisted), while "Start receiving when the app opens" is the only persisted startup preference (off by default); starting or stopping receive manually never changes it |
+| **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt; applied on OK and verified by reading the task back); "Allow other devices to connect" is the live switch (starts/stops immediately, not persisted), while "Start receiving when the app opens" is the only persisted startup preference (off by default); starting or stopping receive manually never changes it |
 | **Update check** | A "Check for updates" button in Settings plus an automatic check at launch (on by default, at most once per 24 h per machine, can be turned off). A new release can be downloaded in-app (size + SHA-256 verified) and installed with one click, or opened on the release page for a manual download. Only the GitHub release source is contacted; no local data is uploaded |
 | **Performance** | Up to 120 FPS streaming, 4 MB socket buffers, TCP_NODELAY |
 | **CPU offload** | RLE frame compression and color conversion offloaded to the receiver's CPU (TCP 8082, RLE mode only) |
@@ -87,12 +87,12 @@ bin/app
 
 The top-right of the header holds the **appearance switcher** — three icons: sun = Light, moon = Dark, monitor = Follow system. The left side holds the nav bar: **Home** (connect device + receive status bar + connection history) and **Settings** (General / Receiving & Security):
 
-- **Appearance**: three icons in the header (sun = Light, moon = Dark, monitor = Follow system); one click recolours the window and writes `theme` to `config.ini`, with no OK needed. The same setting appears as a labelled three-way switch under Settings · General · Appearance, for anyone who does not read the icons. For "Follow system", see the platform note in [Settings & History](#settings--history)
+- **Appearance**: three icons in the header (sun = Light, moon = Dark, monitor = Follow system); one click recolours the window and writes `theme` to `config.ini`, with no OK needed. For "Follow system", see the platform note in [Settings & History](#settings--history)
 - **Home · Connect device**: opens the discovery screen, whose title reads "Searching", with "Search devices / Search again"; once devices are found (with hostnames), each row offers "Cast" (mirror), "Extend" or "Stitch" (stitch first asks which side the peer is on); streaming can be stopped at any time
 - **Home · Receive status bar**: the low-weight bar at the bottom shows the receiver's real state — "Receiving off / Starting / Waiting for connection / Waiting for approval / Receiving / Failed to start" — and its action follows that state (Start receiving / Stop receiving / Retry / Go to Settings). When receiving is off the bar reads "Receiving off" and the action is "Start receiving"; configuration errors such as a corrupt password record offer "Go to Settings"
 - **Home · Connection history**: the last 20 connections are listed under the connect entry and the status bar — click to connect directly (no search, all three modes); delete single entries or clear all; mouse wheel scrolls
 - **Home · In session**: while casting/receiving you can switch to Settings (the session keeps running); "Back to session" or ESC in Settings returns to the live status, while "Home" goes to the Home screen (shows the session running, with Stop)
-- **Settings · General**: the left column is "Quality & codec" (codec auto/H.264/H.265/AV1/raw/RLE, quality/FPS/bitrate/scale/chroma); the right column is "Connection & startup" (hardware accel / status console / log window / auto-start / auto-receive / auto update check) and "Appearance"; the "Software update" card sits below. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
+- **Settings · General**: the left column is "Quality & codec" (codec auto/H.264/H.265/AV1/raw/RLE, quality/FPS/bitrate/scale/chroma); the right column is "Connection & startup" (hardware accel / status console / log window / auto update check); the "Software update" card sits below. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
 - **Settings · Receiving & Security**: see the next section
 - **Settings · Update**: the bottom "Update" row shows the current version and the check result; a new release offers "Download update" (with progress) → "Install now" (Windows: after verification the app quits and starts the installer; Linux/macOS: opens the release page). You can "Ignore this version"; a new release also shows a banner at the top of Home and a dot on the Settings tab
 - **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same cast/extend choice. If a connection fails or no receiver is ever found, see [Troubleshooting](troubleshooting.md)
@@ -103,14 +103,15 @@ The top-right of the header holds the **appearance switcher** — three icons: s
 
 "Settings → Receiving & Security" controls whether this machine accepts connections and how they are authorized.
 
-### Two independent switches
+### Three switches
 
 | Switch | Default | Description |
 |--------|---------|-------------|
 | Allow other devices to connect to this computer | off (at launch) | **The live receive switch.** Turning it on starts the receive service; turning it off stops it (neither 8081 nor 8084 listens) and the Home bar changes accordingly. It affects this run only and is **not written to config**: whether the next launch receives is decided solely by "Start receiving when the app opens" |
 | Start receiving when the app opens | off | **The only persisted startup preference.** When on, every launch starts receiving regardless of how the previous run ended; when off, a launch does not receive even if it was receiving before exit |
+| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); applied on OK and read back from Task Scheduler, with the switch reverting to the real state if registration fails. It only launches the app — whether it receives is decided by the row above. Windows only |
 
-Neither switch is affected by launch-at-logon: auto-start only launches the app, while "Start receiving when the app opens" decides whether it receives; starting/stopping receive manually never changes that preference.
+Auto-start and the receive switches are independent: starting or stopping receive manually never changes the startup preference, and auto-start never changes whether the app receives.
 
 ### The three authorization policies (mutually exclusive)
 
@@ -164,7 +165,7 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 | Chroma | 4:2:0 | 4:4:4 = sharper text (software encode) |
 | Status console | off | Shows the classic cmd window for children; the receiver's authorization/status channel is always kept, and its log is also available in the in-app log window |
 | Log window | off | Auto-open the independent log window |
-| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); cleaned up on uninstall |
+| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); applied on OK and read back from Task Scheduler, with the switch reverting to the real state if registration fails; cleaned up on uninstall |
 | Allow other devices to connect | off (at launch) | Live receive switch; on/off starts/stops the 8081/8084 listeners immediately and is not written to config |
 | Start receiving when the app opens | off | The only persisted startup preference; when on, every launch receives, and stopping manually does not change it |
 | Authorization policy | manual approval | Allow any connection / password only / manual approval; a missing or corrupt config falls back to manual approval |

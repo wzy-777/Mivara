@@ -20,7 +20,8 @@ struct AppConfig
     std::string chroma = "420";      /* 420|444 */
     int show_status_console = 0;     /* 1 = classic cmd console for children */
     int show_log_window = 0;         /* 1 = auto-open the log window */
-    int auto_start = 0;              /* 1 = launch at logon (Task Scheduler) */
+    int auto_start = 0;              /* 1 = launch at logon (Task Scheduler;
+                                        verified by read-back after apply) */
     int auto_receive = 0;            /* the ONLY persisted startup preference:
                                         1 = enter receive mode on app open */
     int allow_receive = 1;           /* runtime mirror only — NOT persisted and
