@@ -37,12 +37,12 @@ The GUI is Chinese-only; the screenshots below show the Home screen (light/dark)
 | **Visible cursor** | The pointer is drawn into the video frames; in extend mode this equals "pointer crossing" |
 | **Direct connect** | `sender <IP>` skips discovery — works when SSDP multicast is blocked by network policy |
 | **Discovery** | Zero-config SSDP (UDP 1900 multicast + broadcast fallback); concurrent NIC listeners, a total deadline and cancellation; the first device appears immediately and later devices are added incrementally |
-| **Connection history** | Last 20 connections embedded on the Home screen — one-click direct connect, no search needed |
+| **Connection history** | Last 20 sessions that actually started, embedded on Home — one-click direct connect, no search; failed connections add no entry |
 | **Stitch (software KVM)** | One keyboard/mouse drives two Windows PCs: low-level input hooks + Raw Input, forwarded over TCP 8084 and injected on the peer with `SendInput`; shares the same receive policy as cast/extend (Windows only) |
 | **Connection authorization** | Three mutually exclusive policies: allow any connection (risk warning, never the default) / password only (4–8 characters, letters are case-insensitive, never sent over the wire; an over-long entry is reported, never silently truncated) / manual approval for every connection (the default; 30 s timeout auto-denies, duplicate requests merge, one prompt at a time); a new install or a missing config always falls back to manual approval |
-| **GUI** | SDL2_ttf interface: left nav (Home / Settings), connect-device entry, low-weight receive status bar, connection history, automatic search, device list (cast/extend/stitch), manual IP entry, live status panel, independent log window; Settings is split into General / Receiving & Security |
+| **GUI** | SDL2_ttf interface: left nav (Home / Settings), connect-device entry, low-weight receive status bar, connection history, automatic search, device list (cast/extend/stitch), manual IP entry, collapsible technical details, independent log window; Settings is split into General / Quality & Codec / Receiving & Security |
 | **Close to tray** | On Windows the close button only hides the window and the session keeps running; click the icon to restore, right-click for Show / Quit; launching again wakes the running instance; hiding and quitting never change receive settings |
-| **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt; applied on OK and verified by reading the task back); "Allow other devices to connect" is the live switch (starts/stops immediately, not persisted), while "Start receiving when the app opens" is the only persisted startup preference (off by default); starting or stopping receive manually never changes it |
+| **Auto-start / auto-receive** | Launch at logon (Windows Task Scheduler, no UAC prompt; applied on Save and verified by reading the task back); "Allow other devices to connect" is the live switch (starts/stops immediately, not persisted), while "Start receiving when the app opens" is the only persisted startup preference (off by default); starting or stopping receive manually never changes it |
 | **Update check** | A "Check for updates" button in Settings plus an automatic check at launch (on by default, at most once per 24 h per machine, can be turned off). A new release can be downloaded in-app (size + SHA-256 verified) and installed with one click, or opened on the release page for a manual download. Only the GitHub release source is contacted; no local data is uploaded |
 | **Performance** | Up to 120 FPS streaming, 4 MB socket buffers, TCP_NODELAY |
 | **CPU offload** | RLE frame compression and color conversion offloaded to the receiver's CPU (TCP 8082, RLE mode only) |
@@ -85,23 +85,24 @@ Launching the GUI is recommended:
 bin/app
 ```
 
-The top-right of the header holds the **appearance switcher** — three icons: sun = Light, moon = Dark, monitor = Follow system. The left side holds the nav bar: **Home** (connect device + receive status bar + connection history) and **Settings** (General / Receiving & Security):
+The top-right of the header holds the **appearance switcher** — three icons: sun = Light, moon = Dark, monitor = Follow system. The left side holds the nav bar: **Home** (connect device + receive status bar + connection history) and **Settings** (General / Quality & Codec / Receiving & Security):
 
-- **Appearance**: three icons in the header (sun = Light, moon = Dark, monitor = Follow system); one click recolours the window and writes `theme` to `config.ini`, with no OK needed. For "Follow system", see the platform note in [Settings & History](#settings--history)
-- **Home · Connect device**: opens the discovery screen, whose title reads "Searching", with "Search devices / Search again"; once devices are found (with hostnames), each row offers "Cast" (mirror), "Extend" or "Stitch" (stitch first asks which side the peer is on); streaming can be stopped at any time
-- **Home · Receive status bar**: the low-weight bar at the bottom shows the receiver's real state — "Receiving off / Starting / Waiting for connection / Waiting for approval / Receiving / Failed to start" — and its action follows that state (Start receiving / Stop receiving / Retry / Go to Settings). When receiving is off the bar reads "Receiving off" and the action is "Start receiving"; configuration errors such as a corrupt password record offer "Go to Settings"
-- **Home · Connection history**: the last 20 connections are listed under the connect entry and the status bar — click to connect directly (no search, all three modes); delete single entries or clear all; mouse wheel scrolls
-- **Home · In session**: while casting/receiving you can switch to Settings (the session keeps running); "Back to session" or ESC in Settings returns to the live status, while "Home" goes to the Home screen (shows the session running, with Stop)
-- **Settings · General**: the left column is "Quality & codec" (codec auto/H.264/H.265/AV1/raw/RLE, quality/FPS/bitrate/scale/chroma); the right column is "Connection & startup" (hardware accel / status console / log window / auto update check); the "Software update" card sits below. **Changed transfer parameters apply live when you press OK — the stream is not dropped**
+- **Appearance**: three icons in the header (sun = Light, moon = Dark, monitor = Follow system); one click recolours the window and writes `theme` to `config.ini`, with no Save needed. For "Follow system", see the platform note in [Settings & History](#settings--history)
+- **Home · Connect device**: click "Select target device" to open discovery; searching can be cancelled and results appear incrementally. Each row directly offers "Cast" (mirror the picture), "Extend" (add a desktop) or "Stitch" (share input, no picture) — there is no separate confirm-device-then-choose-mode step. Stitch asks for a direction first
+- **Home · Receive status bar**: the low-weight bar below the connect entry shows the receiver's real state — off / starting / waiting for connection / waiting for approval / receiving / failed to start — and its action follows that state (Start receiving / Stop receiving / Retry / Go to Settings). Configuration errors such as a corrupt password record offer "Go to Settings"; click the bar for the local address and receive details
+- **Home · Connection history**: only sessions that actually started are recorded — video has started streaming, or a stitch session has been established. Discovery, connection probes, denied authorization and launch failures add no entry. For the last 20 entries, click a row to reconnect with its last mode or choose another mode directly; delete one, clear all, or scroll with the mouse wheel
+- **Home · In session**: Home keeps the target, current mode, connection state and Stop action visible. You can switch to Settings without interrupting the session, then use "Back to session" to return to live status. ESC on a cast or receive session screen only returns Home; **it does not stop the session**
+- **Settings · General**: "Startup" contains start receiving on app launch and launch at logon; "Updates & diagnostics" contains the status console, log window and automatic update checks; "Software update" sits below
+- **Settings · Quality & Codec**: the left column has codec (auto/H.264/H.265/AV1/raw/RLE), quality, FPS, bitrate, scale and chroma; the right column has hardware acceleration. **Changed transfer parameters apply live when you save — the stream is not dropped**
 - **Settings · Receiving & Security**: see the next section
-- **Settings · Update**: the bottom "Update" row shows the current version and the check result; a new release offers "Download update" (with progress) → "Install now" (Windows: after verification the app quits and starts the installer; Linux/macOS: opens the release page). You can "Ignore this version"; a new release also shows a banner at the top of Home and a dot on the Settings tab
-- **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same cast/extend choice. If a connection fails or no receiver is ever found, see [Troubleshooting](troubleshooting.md)
-- **Streaming status**: live FPS / bitrate / encoder in the GUI status panel; the "Log" button opens the independent log window (child-process output). The cmd console is hidden by default — re-enable it in Settings
-- **ESC**: discard Settings edits and return to the session; back from the manual-IP page; stop the session on cast/receive screens and go home; quits from home
+- **Settings · Update & Save**: the bottom of General shows the current version and check result; a new release offers "Download update" (with progress) → "Install now" (Windows: after verification the app quits and starts the installer; Linux/macOS: opens the release page). You can "Ignore this version". Apart from immediate controls such as appearance and the receive switch, changes are committed with "Save settings". Cancel or ESC goes back, asking first when edits are unsaved; "Restore defaults" changes the working copy and writes only when saved. A failed save keeps the edits and explains the error
+- **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same three direct mode choices. If a connection fails or no receiver is ever found, see [Troubleshooting](troubleshooting.md)
+- **Cast / Extend status**: the target, current mode and connection phase are prominent; waiting for approval is never presented as connected. Technical details are collapsed by default — expand "Connection details" for FPS / bitrate / encoder and other parameters. Failures retain the target and offer Back / Retry / Log, while Stop remains a separate action
+- **ESC**: cancel local edit/choice dialogs, or deny a connection-approval request; Settings asks about unsaved edits before leaving, otherwise goes back; every other non-Home screen returns Home, and Home does nothing. ESC never stops a session managed by the main window; for ESC / Q in the receiver's own video window, see below
 
 ## Receiving & Security
 
-"Settings → Receiving & Security" controls whether this machine accepts connections and how they are authorized.
+"Settings → Receiving & Security" controls the live receive switch and authorization; "Settings → General" contains the two startup preferences.
 
 ### Three switches
 
@@ -109,7 +110,7 @@ The top-right of the header holds the **appearance switcher** — three icons: s
 |--------|---------|-------------|
 | Allow other devices to connect to this computer | off (at launch) | **The live receive switch.** Turning it on starts the receive service; turning it off stops it (neither 8081 nor 8084 listens) and the Home bar changes accordingly. It affects this run only and is **not written to config**: whether the next launch receives is decided solely by "Start receiving when the app opens" |
 | Start receiving when the app opens | off | **The only persisted startup preference.** When on, every launch starts receiving regardless of how the previous run ended; when off, a launch does not receive even if it was receiving before exit |
-| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); applied on OK and read back from Task Scheduler, with the switch reverting to the real state if registration fails. It only launches the app — whether it receives is decided by the row above. Windows only |
+| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); applied on Save and read back from Task Scheduler, with the switch reverting to the real state if registration fails. It only launches the app — whether it receives is decided by the row above. Windows only |
 
 Auto-start and the receive switches are independent: starting or stopping receive manually never changes the startup preference, and auto-start never changes whether the app receives.
 
@@ -157,7 +158,7 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Appearance | follow system | Light / Dark / Follow system; the header switcher applies instantly and writes `theme` to `config.ini`, so it needs no OK |
+| Appearance | follow system | Light / Dark / Follow system; the header switcher applies instantly and writes `theme` to `config.ini`, so it needs no Save |
 | Codec | H.264 | auto/H.264/H.265/AV1/raw/RLE |
 | Hardware accel | on | Prefer GPU encoding |
 | Quality / Bitrate | 23 / 0 | Bitrate > 0 uses bitrate mode, otherwise CRF |
@@ -165,7 +166,7 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 | Chroma | 4:2:0 | 4:4:4 = sharper text (software encode) |
 | Status console | off | Shows the classic cmd window for children; the receiver's authorization/status channel is always kept, and its log is also available in the in-app log window |
 | Log window | off | Auto-open the independent log window |
-| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); applied on OK and read back from Task Scheduler, with the switch reverting to the real state if registration fails; cleaned up on uninstall |
+| Auto-start | off | Registers a Windows Task Scheduler job (onlogon, no UAC at logon); applied on Save and read back from Task Scheduler, with the switch reverting to the real state if registration fails; cleaned up on uninstall |
 | Allow other devices to connect | off (at launch) | Live receive switch; on/off starts/stops the 8081/8084 listeners immediately and is not written to config |
 | Start receiving when the app opens | off | The only persisted startup preference; when on, every launch receives, and stopping manually does not change it |
 | Authorization policy | manual approval | Allow any connection / password only / manual approval; a missing or corrupt config falls back to manual approval |
@@ -176,8 +177,8 @@ A few options exist only in `config.ini`: `extend_res` (`auto` or `WxH`, default
 
 > "Follow system" reads the OS light/dark preference. Windows reads the `AppsUseLightTheme` registry value and re-checks it every 2 s, so flipping the OS theme is followed immediately; macOS (`AppleInterfaceStyle`) and Linux (GNOME `color-scheme`) are sampled once at startup, so an OS theme change needs a restart of the app there. A failed probe always falls back to light.
 
-**Live reconfigure**: while streaming, change any transfer parameter in Settings and press OK — it takes effect within seconds without dropping the connection (codec/scale switches blip for a frame or two). In classic console mode there is no stdin channel, so the session is restarted with the new parameters instead.
+**Live reconfigure**: while streaming, change any transfer parameter in Settings and press Save — it takes effect within seconds without dropping the connection (codec/scale switches blip for a frame or two). In classic console mode there is no stdin channel, so the session is restarted with the new parameters instead.
 
-Transfer status is shown live in the GUI status panel (FPS / bitrate / encoder); the independent log window shows child-process output. The cmd console is hidden by default and can be re-enabled in Settings.
+Technical details are collapsed on the session screen by default; expand "Connection details" for live FPS / bitrate / encoder, or open the independent log window for child-process output. The cmd console is hidden by default and can be re-enabled in Settings.
 
-The connection-history list (`history.ini`, last 20 entries) sits under the connect entry and the receive status bar on the Home screen — click to connect directly (cast/extend/stitch) without searching; individual entries can be deleted or cleared.
+The connection-history list (`history.ini`, last 20 sessions that actually started) sits under the connect entry and receive status bar on Home — click to reconnect directly with the last mode (cast/extend/stitch), without searching; individual entries can be deleted or cleared.

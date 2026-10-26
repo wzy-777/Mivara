@@ -49,6 +49,7 @@
 #include "discover.h"
 #include "history.h"
 #include "kvm.h"
+#include "logo_icon.h"
 #include "theme.h"
 #include "tray.h"
 #include "update.h"
@@ -105,7 +106,7 @@
 #define FONT_DISPLAY 30                 /* screen titles                       */
 #define FONT_TITLE   22                 /* card titles, nav wordmark           */
 #define FONT_BODY    16                 /* row labels, section headers         */
-#define FONT_SMALL   13                 /* captions, buttons, chips            */
+#define FONT_SMALL   14                 /* captions, buttons, chips            */
 
 /* ── shared layout ─────────────────────────────────────────────────────────
  * buildButtons() (hit rects) and renderScreen() (painted rects) both read
@@ -196,9 +197,9 @@
 
 /* found-devices list: the rows are laid out from the top, so the action row
  * follows the last one instead of floating at a fixed y with a hole above it */
-#define FOUND_ROW_Y0 120
+#define FOUND_ROW_Y0 154
 #define FOUND_ROW_PITCH 60
-#define FOUND_ROW_H 52
+#define FOUND_ROW_H 54
 #define FOUND_ACTIONS_MAX_Y 512
 /* Three per-device actions (投屏 / 扩展 / 拼接), right-aligned in the row. */
 #define DEV_BTN_W 84
@@ -217,14 +218,6 @@ static int foundActionsY(int n)
 static SDL_Rect rcHomeCard(int i)
 {
     return SDL_Rect{HOME_CARD_X(i), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H};
-}
-static SDL_Rect rcHomeStop(int i)
-{
-    return SDL_Rect{HOME_CARD_X(i) + 220, HOME_CARD_Y + 76, 96, 34};
-}
-static SDL_Rect rcHomeChip(int i)
-{
-    return SDL_Rect{HOME_CARD_X(i) + 16, HOME_CARD_Y + 98, 96, 24};
 }
 static SDL_Rect rcHistRow(int i)
 {
@@ -299,19 +292,17 @@ static SDL_Rect rcSideCancel()
 #define SET_LC_W (SET_COL_W - SET_PAD * 2)  /* 296 */
 #define SET_RC_X (SET_COL_R + SET_PAD)  /* 540 */
 #define SET_L_H 424
-#define SET_R_H 296                     /* 连接与启动                            */
+#define SET_R_H 296                     /* right-hand settings card              */
 #define SET_UPD_Y 548                   /* 更新 (full width)                     */
 #define SET_UPD_H 88
-#define SET_ACT_Y 648                   /* 确定 / 恢复默认 / 返回会话             */
+#define SET_ACT_Y 648                   /* 恢复默认 / 取消 / 保存 / 返回会话      */
 #define SET_ACT_H 44
 
-/* Settings tabs: 常规 keeps the existing card layout; 接收与安全 owns the
- * receive switches, 开机自启动 and the connection authorization. The chips sit
- * in the title row so neither tab needs a shifted copy of the layout above. */
+/* Three settings groups share the same two-column card geometry. */
 #define SET_TAB_Y 58
 #define SET_TAB_H 34
 #define SET_TAB_W 118
-#define SET_TAB_X(i) (BODY_R - (2 - (i)) * (SET_TAB_W + 8))
+#define SET_TAB_X(i) (BODY_R - (3 - (i)) * (SET_TAB_W + 8))
 
 /* 接收与安全 tab */
 #define SEC_SWITCH_Y 108
@@ -360,7 +351,7 @@ static SDL_Rect rcSideCancel()
 #define SET_CODEC_LABEL_Y 168
 #define SET_GRID_Y0 196                 /* codec 3x2 grid                        */
 #define SET_ROW_Y(i) (288 + (i) * 44)   /* 画质 / 帧率 / 码率 / 缩放 / 色度      */
-#define SET_TOGGLE_Y0 158               /* first 连接与启动 toggle row           */
+#define SET_TOGGLE_Y0 158               /* first 启动 toggle row                 */
 #define SET_STEP_W 36                   /* − / value / + stepper                 */
 #define SET_VAL_W 110
 #define SET_ROW_R (SET_LC_X + SET_LC_W) /* 476                                   */
@@ -463,6 +454,7 @@ enum BtnId {
     /* receiving */
     BTN_RECV_STOP = 200,
     BTN_RECV_LOG,
+    BTN_RECV_DETAILS,
     /* searching */
     BTN_SEARCH_CANCEL = 300,
     /* found */
@@ -478,6 +470,9 @@ enum BtnId {
     /* streaming */
     BTN_STREAM_STOP = 700,
     BTN_STREAM_LOG,
+    BTN_STREAM_DETAILS,
+    BTN_STREAM_RETRY,
+    BTN_STREAM_BACK,
     /* settings */
     BTN_SET_CODEC_BASE = 7000,          /* +0..5 */
     BTN_SET_HW = 7010,
@@ -493,6 +488,7 @@ enum BtnId {
     BTN_SET_LOGWIN,
     BTN_SET_OK = 7050,
     BTN_SET_RESET,
+    BTN_SET_CANCEL = 7052,
     BTN_SET_AUTOSTART = 7053,
     BTN_SET_AUTORECV,
     /* update row: one id per ACTION, never per slot - a press and its release
@@ -541,7 +537,7 @@ enum BtnId {
 
     /* settings tabs + 接收与安全 controls (below the nav block, above the
      * stitch block; exact-match ids, so no range arithmetic) */
-    BTN_SET_TAB_BASE  = 8030,           /* +0 常规 / +1 接收与安全 */
+    BTN_SET_TAB_BASE  = 8030,           /* +0 常规 / +1 画质 / +2 接收与安全 */
     BTN_SET_ALLOW_RECV = 8040,          /* 允许其他设备连接到此电脑 */
     BTN_SET_POLICY_OPEN,                /* 允许任意连接             */
     BTN_SET_POLICY_PASSWORD,            /* 仅允许密码连接           */
@@ -550,7 +546,9 @@ enum BtnId {
     BTN_SETPW_OK      = 9120,           /* password editor modal */
     BTN_SETPW_CANCEL,
     BTN_SETPW_SHOW,
-    BTN_SETPW_FIELD_A,                  /* 连接密码 field      */
+    BTN_SETPW_FIELD_A,
+    BTN_DISCARD_KEEP = 9130,
+    BTN_DISCARD_CONFIRM,
 };
 
 /* 接收与安全 policy radios — kept outside the enum arithmetic so the three
@@ -615,6 +613,7 @@ enum GlyphId {
     GLYPH_SUN,          /* appearance: 亮色                       */
     GLYPH_MOON,         /* appearance: 暗色                       */
     GLYPH_UPDATE,       /* header: 有可用更新                     */
+    GLYPH_LOGO,         /* original overlapping-frame Mivara mark   */
 };
 
 struct Button {
@@ -625,6 +624,7 @@ struct Button {
     int         glyph   = GLYPH_NONE;
     bool        on      = false;      /* BTN_V_CHOICE: this cell is selected */
     bool        framed  = true;       /* BTN_V_CHOICE: draw the cell's own border */
+    bool        enabled = true;
     TTF_Font   *font    = nullptr;    /* null = the variant's default size   */
 };
 
@@ -761,14 +761,23 @@ static SDL_Renderer *g_log_ren = nullptr;
 static bool          g_log_open = false;
 static std::atomic<int> g_log_scroll{0};  /* lines scrolled up from bottom */
 
+enum class StatusTone { Info, Success, Warning, Error };
+
 static Screen                g_screen = SCR_HOME;
 static Screen                g_session_screen = SCR_HOME; /* home-flow screen when browsing other tabs */
 static std::vector<Button>   g_buttons;
+static size_t                g_modal_button_begin = 0;
 static std::string           g_manual_ip;
+static bool                  g_manual_field_error = false;
 static std::string           g_status_note;
-    static std::string           g_child_label;          /* active sender label */
-    static bool                  g_child_extend = false;
-    static int                   g_child_mode = SEND_MIRROR;
+static StatusTone            g_status_tone = StatusTone::Error;
+static std::string           g_child_label;
+static bool                  g_child_extend = false;
+static int                   g_child_mode = SEND_MIRROR;
+static bool                  g_history_recorded = false;
+static bool                  g_sender_stop_requested = false;
+static bool                  g_details_open = false;
+static bool                  g_recv_details_open = false;
 
 static std::vector<DiscoveredDevice> g_devices;
 static std::mutex                  g_dev_mtx;
@@ -808,7 +817,9 @@ static Uint32           g_recv_started_at = 0;     /* SDL_GetTicks() of STARTING
 static AuthAsk          g_auth_ask;
 static PwAsk            g_pw_ask;
 static SetPwAsk         g_set_pw;
-static int              g_set_tab = 0;      /* 0 常规 / 1 接收与安全 */
+static bool             g_discard_open = false;
+static bool             g_discard_to_home = false;
+static int              g_set_tab = 0;      /* 0 常规 / 1 画质与编码 / 2 接收与安全 */
 static std::string      g_auth_wait_note;  /* sender: 等待授权 / 正在验证 */
 
 /* Windows tray state. `g_hidden` means the main window is hidden but the
@@ -1620,9 +1631,8 @@ static void drawToggle(SDL_Renderer *ren, SDL_Rect rc, bool on)
 }
 
 /* ── icons ────────────────────────────────────────────────────────────────
- * Every glyph is drawn from the same primitives as the rest of the UI — no
- * image assets, no icon font, no SVG. Each is centred on (cx, cy) in a
- * nominal 'size' box so call sites can place them uniformly.
+ * Glyphs are centred on (cx, cy) in a nominal size box and painted through
+ * the same coverage-mask path as the rest of the interface.
  */
 static void glyphMonitor(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
 {
@@ -1632,6 +1642,31 @@ static void glyphMonitor(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color 
     fillRoundRect(ren, SDL_Rect{cx - w / 2, top, w, sh}, 3, c);
     fillRoundRect(ren, SDL_Rect{cx - 1, top + sh, 2, (int)(h * 0.20)}, 1, c);
     fillRoundRect(ren, SDL_Rect{cx - w / 4, cy + h / 2 - 2, w / 2, 2}, 1, c);
+}
+
+static void glyphLogo(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    const int left = cx - size / 2, top = cy - size / 2;
+    auto s = [&](int v) { return (int)std::lround(v * size / 256.0); };
+    auto rc = [&](int x, int y, int w, int h) {
+        return SDL_Rect{left + s(x), top + s(y), s(w), s(h)};
+    };
+    auto erase = [&](SDL_Rect r, int rad) {
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        fillRoundRectRaw(ren, r, rad, SDL_Color{0, 0, 0, 0});
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    };
+    auto frame = [&](int x, int y, int w, int h, int rad) {
+        const SDL_Rect outer = rc(x, y, w, h);
+        const int stroke = s(16);
+        fillRoundRect(ren, outer, s(rad), c);
+        erase(SDL_Rect{outer.x + stroke, outer.y + stroke,
+                       outer.w - 2 * stroke, outer.h - 2 * stroke},
+              std::max(1, s(rad) - stroke));
+    };
+    frame(32, 32, 136, 136, 22);
+    erase(rc(80, 80, 152, 152), s(30));
+    frame(88, 88, 136, 136, 22);
 }
 
 static void glyphArrow(SDL_Renderer *ren, int cx, int cy, int size, bool up, SDL_Color c)
@@ -1842,6 +1877,7 @@ static void paintGlyph(SDL_Renderer *ren, int glyph, int cx, int cy, int size)
     case GLYPH_SUN:        glyphSun(ren, cx, cy, size, WHITE); break;
     case GLYPH_MOON:       glyphMoon(ren, cx, cy, size, WHITE); break;
     case GLYPH_UPDATE:     glyphUpdate(ren, cx, cy, size, WHITE); break;
+    case GLYPH_LOGO:       glyphLogo(ren, cx, cy, size, WHITE); break;
     default: break;
     }
 }
@@ -1941,8 +1977,8 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
 {
     if (b.variant == BTN_V_GHOST) return;      /* hit area only, caller paints */
 
-    const bool hot   = (g_hot == b.id);
-    const bool press = (g_press == b.id);
+    const bool hot   = b.enabled && (g_hot == b.id);
+    const bool press = b.enabled && (g_press == b.id);
     const int  r     = THEME.radius;
     /* Buttons use the bold small face; a caller may override for tight cells. */
     TTF_Font *f = b.font ? b.font : g_fontBS;
@@ -1951,6 +1987,11 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
         drawTextV(ren, b.label, b.rect.x + b.rect.w / 2, b.rect.y + b.rect.h / 2,
                   c, f, ALIGN_CENTER);
     };
+    if (!b.enabled) {
+        drawRoundRect(ren, b.rect, r, THEME.surfaceAlt, THEME.border);
+        centred(THEME.textDim);
+        return;
+    }
     /* Hover is a translucent wash laid over the variant's own fill. The wash
      * must move that fill AWAY from the label colour — darken under a white
      * label, lighten under a dark one — or hovering would erode the label's
@@ -2080,7 +2121,7 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
 
 static void addButton(int x, int y, int w, int h, const std::string &label, int id,
                       int variant = BTN_V_SECONDARY, int glyph = GLYPH_NONE,
-                      TTF_Font *font = nullptr)
+                      TTF_Font *font = nullptr, bool enabled = true)
 {
     Button b;
     b.rect    = SDL_Rect{x, y, w, h};
@@ -2089,6 +2130,7 @@ static void addButton(int x, int y, int w, int h, const std::string &label, int 
     b.variant = variant;
     b.glyph   = glyph;
     b.font    = font;
+    b.enabled = enabled;
     g_buttons.push_back(b);
 }
 
@@ -2129,6 +2171,88 @@ static void addNav(int y, const std::string &label, int id, int glyph, bool on)
     b.glyph   = glyph;
     b.on      = on;
     g_buttons.push_back(b);
+}
+
+static SDL_Color statusToneColor()
+{
+    switch (g_status_tone) {
+    case StatusTone::Success: return THEME.success;
+    case StatusTone::Warning: return THEME.warning;
+    case StatusTone::Info:    return THEME.textDim;
+    case StatusTone::Error:
+    default:                  return THEME.danger;
+    }
+}
+
+static std::string sendPhaseLabel()
+{
+    switch (g_send_phase) {
+    case SP_CONNECTING: return "正在连接";
+    case SP_PASSWORD:   return "需要连接密码";
+    case SP_WAIT_AUTH:  return "等待对方授权";
+    case SP_VERIFY:     return "正在验证密码";
+    case SP_GRANTED:    return "对方已允许连接";
+    case SP_LIVE:       return "正在" + g_child_label;
+    case SP_FAILED:     return "连接失败";
+    case SP_IDLE:
+    default:            return "会话已结束";
+    }
+}
+
+static SDL_Color sendPhaseColor()
+{
+    if (g_send_phase == SP_LIVE) return THEME.success;
+    if (g_send_phase == SP_FAILED) return THEME.danger;
+    if (g_send_phase == SP_PASSWORD || g_send_phase == SP_WAIT_AUTH ||
+        g_send_phase == SP_VERIFY || g_send_phase == SP_GRANTED)
+        return THEME.warning;
+    if (g_send_phase == SP_IDLE) return THEME.textDim;
+    return THEME.primary;
+}
+
+static std::string sendTargetName()
+{
+    return g_last_name.empty() ? g_last_ip : g_last_name;
+}
+
+static std::string sendTargetEndpoint()
+{
+    return g_last_ip + ":" +
+           std::to_string(g_child_mode == SEND_STITCH ? KVM_PORT : g_last_port);
+}
+
+static void recordStartedSession()
+{
+    if (g_history_recorded || g_last_ip.empty()) return;
+    g_history_recorded = true;
+    historyUpsert(g_last_ip, g_last_port,
+                  g_last_name.empty() ? g_last_ip : g_last_name,
+                  sendModeKey(g_child_mode));
+    g_hist = historyLoad();
+    g_hist_scroll = 0;
+}
+
+static bool validIPv4Address(const std::string &ip)
+{
+    if (ip.empty()) return false;
+    int parts = 0;
+    size_t begin = 0;
+    while (begin < ip.size()) {
+        const size_t end = ip.find('.', begin);
+        if (end == begin) return false;
+        int value = 0, digits = 0;
+        for (size_t i = begin; i < end && i < ip.size(); i++) {
+            const char c = ip[i];
+            if (c < '0' || c > '9') return false;
+            value = value * 10 + (c - '0');
+            if (++digits > 3 || value > 255) return false;
+        }
+        if (digits == 0) return false;
+        parts++;
+        if (end == std::string::npos) return parts == 4;
+        begin = end + 1;
+    }
+    return false;
 }
 
 /* ── format helpers ──────────────────────────────────────────────────────── */
@@ -2382,6 +2506,9 @@ static std::string senderErrorText(const std::string &msg)
     if (msg == "decoder_unavailable") return "对方解码器不可用，请更换编码方式";
     if (msg == "handshake_rejected")  return "对方拒绝了握手";
     if (msg == "connect_failed")      return "无法连接对方（接收服务未开启或网络不可达）";
+    if (msg == "no_response")         return "对方未响应，请检查接收服务与网络连接";
+    if (msg == "protocol_error")      return "连接协议异常，请确认两端使用同一版本";
+    if (msg == "encode_failed")       return "画面编码失败，请尝试更换编码方式";
     if (msg == "send_failed")         return "网络连接中断";
     if (msg == "encoder_open_failed" || msg == "encoder_rebuild_failed")
         return "编码器初始化失败，请更换编码方式";
@@ -2653,16 +2780,21 @@ static void parseStatLine(const std::string &line, bool from_receiver)
             g_auth_wait_note.clear();
         }
     } else if (s.event == "error") {
-        setSendPhase(SP_FAILED);
+        if (!(g_sender_stop_requested && s.msg == "send_failed")) {
+            setSendPhase(SP_FAILED);
+            g_status_tone = StatusTone::Error;
+        }
         g_auth_wait_note.clear();
     } else if (s.event == "start") {
         setSendPhase(SP_LIVE);
+        recordStartedSession();
         g_auth_wait_note.clear();
     } else if (s.event == "stitch") {
         /* state=waiting is emitted before the 8084 connect and before the peer
          * authorizes, so it is not a live session yet. Only local/remote are. */
         if (s.state != "waiting") {
             setSendPhase(SP_LIVE);
+            recordStartedSession();
             g_auth_wait_note.clear();
         }
     } else if (s.event == "stop") {
@@ -2929,7 +3061,7 @@ static void submitSetPassword()
     g_cfg_edit.auth_hash = mivaraHexEncode(hash, sizeof(hash));
     g_cfg_edit.auth_iter = (int)iter;
     closeSetPwAsk();
-    g_status_note = "密码已设置，点「确定」保存";
+    g_status_note = "密码已设置，点「保存设置」保存";
 }
 
 /* Drop dialogs whose deadline the child owns (receiver: 30 s auto-deny,
@@ -2972,6 +3104,14 @@ static std::string buildSetpLine(const AppConfig &want, const AppConfig &have)
     return s;
 }
 
+static void applyMivaraWindowIcon(SDL_Window *window)
+{
+    SDL_Surface *icon = mivaraCreateIconSurface();
+    if (!icon) return;
+    SDL_SetWindowIcon(window, icon);
+    SDL_FreeSurface(icon);
+}
+
 /* ── log window ──────────────────────────────────────────────────────────── */
 static void openLogWindow()
 {
@@ -2980,6 +3120,7 @@ static void openLogWindow()
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  uiPx(LOG_WIN_W), uiPx(LOG_WIN_H), 0);
     if (!g_log_win) return;
+    applyMivaraWindowIcon(g_log_win);
     g_log_ren = SDL_CreateRenderer(g_log_win, -1,
                                    SDL_RENDERER_ACCELERATED |
                                        SDL_RENDERER_PRESENTVSYNC);
@@ -3390,10 +3531,12 @@ static void noteReceiverControlFailure(const char *what)
  * must never keep the home screen showing 等待授权/会话进行中. */
 static void stopSender()
 {
+    g_sender_stop_requested = true;
     stopChild(g_sender, g_child_extend);
     g_child_extend = false;
     g_send_phase = SP_IDLE;
     g_auth_wait_note.clear();
+    g_status_tone = StatusTone::Info;
 }
 
 /* A receiver that never reports ready is not "正在开启" forever. Ten seconds
@@ -3542,8 +3685,7 @@ static NavTab navTabForScreen(Screen s)
     return (s == SCR_SETTINGS) ? NAV_SETTINGS : NAV_HOME;
 }
 
-/* Session screens track g_session_screen so "主页" can return to the live
- * session after browsing 设置. The settings tab doesn't. */
+/* Remember the last non-settings page for 取消 / ESC / 返回会话. */
 static void setScreen(Screen s)
 {
     g_screen = s;
@@ -3616,9 +3758,8 @@ static void processSearchUpdates()
     }
 }
 
-/* Take ip/name by value: history callers pass references into g_hist, and
- * this function reloads g_hist below — keeping those references would leave
- * ip/name dangling before the final status/last-used assignments. */
+/* Own the target strings: history callers pass references into g_hist, and
+ * recordStartedSession() reloads that vector when the session actually starts. */
 static void launchStream(std::string ip, int port, int mode, std::string name,
                          const char *stitch_side = nullptr)
 {
@@ -3626,27 +3767,42 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
      * leave the user staring at an error while the real session runs unseen. */
     if (g_sender.active) {
         g_status_note = "已有发送会话";
+        g_status_tone = StatusTone::Warning;
         setScreen(SCR_STREAMING);
         return;
     }
     const bool extend = (mode == SEND_EXTEND);
     const bool stitch = (mode == SEND_STITCH);
+    g_child_extend = extend;
+    g_child_mode = mode;
+    g_child_label = sendModeLabel(mode);
+    g_last_ip = ip;
+    g_last_port = port;
+    g_last_name = name;
+    g_history_recorded = false;
+    g_sender_stop_requested = false;
+    g_details_open = false;
     g_send_phase = SP_CONNECTING;
+    g_status_note.clear();
+    g_status_tone = StatusTone::Info;
     g_auth_wait_note.clear();
+    auto fail = [&](const std::string &message) {
+        g_status_note = message;
+        g_status_tone = StatusTone::Error;
+        g_send_phase = SP_FAILED;
+        setScreen(SCR_STREAMING);
+    };
     std::string path = sibling("sender.exe");
 #ifndef _WIN32
     path = sibling("sender");
 #endif
     if (!binaryExists(path)) {
-        g_status_note = "找不到 sender 程序，请先运行 make";
-        g_send_phase = SP_FAILED;
-        setScreen(SCR_NOT_FOUND);
+        fail("找不到发送程序，请先运行 make");
         return;
     }
     if (stitch && !kvmSupported()) {
-        g_status_note = "拼接模式目前仅支持 Windows";
-        g_send_phase = SP_FAILED;
         logPush("[gui] stitch is unavailable on this platform");
+        fail("拼接模式目前仅支持 Windows");
         return;
     }
     std::string codec = (g_cfg.codec == "auto" || g_cfg.codec.empty())
@@ -3688,12 +3844,9 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     const int probe_port = stitch ? KVM_PORT : port;
     if (!testTcpConnection(ip, probe_port, 1500)) {
         logPush("[gui] TCP probe failed for " + ip + ":" + std::to_string(probe_port));
-        g_status_note = stitch
-            ? "无法连接 " + ip + ":" + std::to_string(probe_port) +
-                  "（对方需先启动接收）"
-            : "无法连接 " + ip + ":" + std::to_string(port);
-        g_send_phase = SP_FAILED;
-        setScreen(stitch ? SCR_FOUND : SCR_HOME);
+        fail(stitch ? "无法连接 " + ip + ":" + std::to_string(probe_port) +
+                          "（对方需先启动接收）"
+                    : "无法连接 " + ip + ":" + std::to_string(port));
         return;
     }
 #ifdef _WIN32
@@ -3715,25 +3868,12 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
         g_cfg.show_status_console ? SPAWN_CONSOLE : SPAWN_PIPES;
     if (!spawnChild(g_sender, path, args, spawn_flags)) {
         logPush("[gui] spawn sender failed");
-        g_status_note = "启动 sender 失败";
-        g_send_phase = SP_FAILED;
-        setScreen(SCR_NOT_FOUND);
+        fail("无法启动发送程序，请查看日志");
         return;
     }
-    historyUpsert(ip, port, name.empty() ? ip : name, sendModeKey(mode));
-    g_hist = historyLoad();           /* keep the home-screen list in sync */
-    g_hist_scroll = 0;
-    g_child_extend = extend;
-    g_child_mode = mode;
-    g_child_label = sendModeLabel(mode);
-    /* 拼接 runs over the KVM port, not the video port — the status line must
-     * show the endpoint the sender actually connected to. */
-    g_status_note = "目标: " + ip + ":" +
-                    std::to_string(stitch ? KVM_PORT : port);
+    g_status_note = "目标: " + sendTargetEndpoint();
+    g_status_tone = StatusTone::Info;
     g_live_params = g_cfg;
-    g_last_ip = ip;
-    g_last_port = port;
-    g_last_name = name;
     setScreen(SCR_STREAMING);
 }
 
@@ -3890,10 +4030,66 @@ static void stopReceiver()
     if (g_screen == SCR_RECEIVING) setScreen(SCR_HOME);
 }
 
+static bool settingsDirty()
+{
+    return g_cfg_edit.codec != g_cfg.codec ||
+           g_cfg_edit.hw_accel != g_cfg.hw_accel ||
+           g_cfg_edit.bitrate_kbps != g_cfg.bitrate_kbps ||
+           g_cfg_edit.quality != g_cfg.quality ||
+           g_cfg_edit.fps_limit != g_cfg.fps_limit ||
+           g_cfg_edit.scale_percent != g_cfg.scale_percent ||
+           g_cfg_edit.chroma != g_cfg.chroma ||
+           g_cfg_edit.show_status_console != g_cfg.show_status_console ||
+           g_cfg_edit.show_log_window != g_cfg.show_log_window ||
+           g_cfg_edit.auto_start != g_cfg.auto_start ||
+           g_cfg_edit.auto_receive != g_cfg.auto_receive ||
+           g_cfg_edit.auto_check_update != g_cfg.auto_check_update ||
+           g_cfg_edit.theme != g_cfg.theme ||
+           g_cfg_edit.extend_res != g_cfg.extend_res ||
+           g_cfg_edit.vdd_mode_write != g_cfg.vdd_mode_write ||
+           g_cfg_edit.stitch_side != g_cfg.stitch_side ||
+           g_cfg_edit.auth_mode != g_cfg.auth_mode ||
+           g_cfg_edit.auth_salt != g_cfg.auth_salt ||
+           g_cfg_edit.auth_hash != g_cfg.auth_hash ||
+           g_cfg_edit.auth_iter != g_cfg.auth_iter;
+}
+
+static void restoreSettingsPreview()
+{
+    ThemeMode mode = ThemeMode::System;
+    themeModeFromKey(g_cfg.theme.c_str(), mode);
+    themeSetMode(mode);
+    if (g_cfg.show_log_window && !g_log_open) openLogWindow();
+    if (!g_cfg.show_log_window && g_log_open) closeLogWindow();
+}
+
+static void cancelSettings(bool to_home)
+{
+    g_cfg_edit = g_cfg;
+    restoreSettingsPreview();
+    g_discard_open = false;
+    g_status_note.clear();
+    g_status_tone = StatusTone::Info;
+    if (to_home) setScreen(SCR_HOME);
+    else         g_screen = resolveHomeScreen();
+}
+
+static void requestLeaveSettings(bool to_home)
+{
+    if (settingsDirty()) {
+        g_discard_to_home = to_home;
+        g_discard_open = true;
+        return;
+    }
+    cancelSettings(to_home);
+}
+
 static void openSettings()
 {
     g_cfg_edit = g_cfg;
-    g_status_note.clear();       /* a stale home-screen note would read as new */
+    g_discard_open = false;
+    g_status_note.clear();
+    g_status_tone = StatusTone::Info;
     g_screen = SCR_SETTINGS;
 }
 
@@ -3926,7 +4122,7 @@ static const char *recvStateLabel(int st)
     case RSV_AUTH:      return "等待授权";
     case RSV_STREAMING: return "正在接收";
     case RSV_FAILED:    return "开启失败";
-    default:            return "接收已关闭";
+    default:            return "已关闭";
     }
 }
 
@@ -4046,8 +4242,8 @@ static bool confirmExit()
 #endif
 }
 
-/** Exit for real (tray 退出 / ESC on the home screen / 退出 buttons). The
- *  SDL_QUIT handler in main() performs the confirmation exactly once. */
+/** Exit for real (tray 退出 / 退出 buttons). The SDL_QUIT handler in main()
+ *  performs the confirmation exactly once. */
 static void requestQuit(bool no_confirm = false)
 {
     g_exit_no_confirm = no_confirm;
@@ -4096,7 +4292,7 @@ static std::string trayTooltip()
     const RecvView rv = recvView();
     std::string s = "Mivara · ";
     if (g_sender.active) {
-        s += (g_child_mode == SEND_STITCH) ? "拼接控制中" : "投屏中";
+        s += sendPhaseLabel();
     } else {
         /* Derived from the receive state machine only. g_cfg.allow_receive is
          * deliberately not consulted: it is no longer a truth source. */
@@ -4113,12 +4309,15 @@ static std::string trayTooltip()
 }
 
 /* ── screen building ─────────────────────────────────────────────────────── */
-/* One modal stack shared by buildButtons(), renderScreen() and onButton().
- * Priority (low → high): 普通页面 < 密码/设置密码 < 拼接方向 < 连接授权. The old
- * code built the stitch buttons first (so first-match-wins hit them) while
- * painting and dispatching by a different order, which made a visible 授权
- * dialog unclickable. All three consumers now ask topModal(). */
-enum Modal { MODAL_NONE = 0, MODAL_SETPW, MODAL_PW, MODAL_STITCH, MODAL_AUTH };
+/* One modal stack shared by buildButtons(), renderScreen() and onButton(). */
+enum Modal {
+    MODAL_NONE = 0,
+    MODAL_DISCARD,
+    MODAL_SETPW,
+    MODAL_PW,
+    MODAL_STITCH,
+    MODAL_AUTH
+};
 
 static Modal topModal()
 {
@@ -4126,15 +4325,12 @@ static Modal topModal()
     if (g_stitch_ask.open) return MODAL_STITCH;
     if (g_pw_ask.open)     return MODAL_PW;
     if (g_set_pw.open)     return MODAL_SETPW;
+    if (g_discard_open)    return MODAL_DISCARD;
     return MODAL_NONE;
 }
 
-static void buildButtons()
+static void appendModalButtons()
 {
-    g_buttons.clear();
-
-    /* Only the top modal owns the input; lower dialogs stay open but inert
-     * (so a pending password/chooser survives a 30 s authorization prompt). */
     switch (topModal()) {
     case MODAL_AUTH: {
         const int y = AUTH_DLG_Y + AUTH_DLG_H - 58;
@@ -4142,19 +4338,19 @@ static void buildButtons()
                   BTN_V_SECONDARY);
         addButton(AUTH_DLG_X + 322, y, 114, 38, "允许一次", BTN_AUTH_ALLOW,
                   BTN_V_PRIMARY);
-        return;
+        break;
     }
     case MODAL_PW: {
         const SDL_Rect show{PW_SHOW_X, PW_SHOW_Y, 116, 26};
         addButton(show.x, show.y, show.w, show.h,
                   g_pw_ask.show ? "隐藏密码" : "显示密码", BTN_PW_SHOW,
-                  BTN_V_LINK);
+                  BTN_V_SECONDARY);
         const int y = PW_DLG_Y + PW_DLG_H - 58;
         addButton(PW_DLG_X + 200, y, 110, 38, "取消", BTN_PW_CANCEL,
                   BTN_V_SECONDARY);
         addButton(PW_DLG_X + 322, y, 114, 38, "连 接", BTN_PW_CONNECT,
                   BTN_V_PRIMARY);
-        return;
+        break;
     }
     case MODAL_SETPW: {
         addButton(SETPW_FIELD_X, SETPW_A_Y, SETPW_FIELD_W, SETPW_FIELD_H, "",
@@ -4164,9 +4360,9 @@ static void buildButtons()
         const int y = SETPW_DLG_Y + SETPW_DLG_H - 58;
         addButton(SETPW_DLG_X + 200, y, 110, 38, "取消", BTN_SETPW_CANCEL,
                   BTN_V_SECONDARY);
-        addButton(SETPW_DLG_X + 322, y, 114, 38, "保 存", BTN_SETPW_OK,
+        addButton(SETPW_DLG_X + 322, y, 114, 38, "应 用", BTN_SETPW_OK,
                   BTN_V_PRIMARY);
-        return;
+        break;
     }
     case MODAL_STITCH: {
         const int cur = stitchSideFromConfig();
@@ -4178,11 +4374,25 @@ static void buildButtons()
         const SDL_Rect c = rcSideCancel();
         addButton(c.x, c.y, c.w, c.h, "取 消", BTN_STITCH_SIDE_CANCEL,
                   BTN_V_SECONDARY);
-        return;
+        break;
+    }
+    case MODAL_DISCARD: {
+        const int y = AUTH_DLG_Y + AUTH_DLG_H - 58;
+        addButton(AUTH_DLG_X + 200, y, 110, 38, "继续编辑", BTN_DISCARD_KEEP,
+                  BTN_V_SECONDARY);
+        addButton(AUTH_DLG_X + 322, y, 114, 38, "放弃修改", BTN_DISCARD_CONFIRM,
+                  BTN_V_DANGER);
+        break;
     }
     default:
         break;
     }
+}
+
+static void buildButtons()
+{
+    g_buttons.clear();
+    g_modal_button_begin = 0;
 
     /* ── header: appearance switcher (on every screen) ───────────────────── */
     {
@@ -4235,7 +4445,8 @@ static void buildButtons()
                       HOME_SESSION_BACK_W, HOME_SESSION_BTN_H, "返回会话",
                       BTN_RETURN_SESSION, BTN_V_SECONDARY);
             addButton(HOME_SESSION_STOP_X, HOME_SESSION_BTN_Y,
-                      HOME_SESSION_STOP_W, HOME_SESSION_BTN_H, "停止",
+                      HOME_SESSION_STOP_W, HOME_SESSION_BTN_H,
+                      std::string("停止") + g_child_label,
                       BTN_HOME_SENDER_STOP, BTN_V_DANGER);
         } else {
             addButton(HOME_CARD_X(0), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H, "",
@@ -4271,11 +4482,11 @@ static void buildButtons()
             SDL_Rect b3 = rcHistBtn(i, 2);
             SDL_Rect b4 = rcHistBtn(i, 3);
             addButton(b1.x, b1.y, b1.w, b1.h, "投屏", BTN_HIST_BASE + idx * 10 + 1,
-                      BTN_V_CHIP_OK);
+                      BTN_V_SECONDARY);
             addButton(b2.x, b2.y, b2.w, b2.h, "扩展", BTN_HIST_BASE + idx * 10 + 2,
-                      BTN_V_CHIP_ACC);
+                      BTN_V_SECONDARY);
             addButton(b3.x, b3.y, b3.w, b3.h, "拼接", BTN_HIST_BASE + idx * 10 + 3,
-                      BTN_V_CHIP_STITCH);
+                      BTN_V_SECONDARY);
             addButton(b4.x, b4.y, b4.w, b4.h, "删除", BTN_HIST_BASE + idx * 10 + 4,
                       BTN_V_LINK);
         }
@@ -4285,10 +4496,13 @@ static void buildButtons()
         break;
     }
 
-    case SCR_RECEIVING:
+    case SCR_RECEIVING: {
+        addButton(BODY_X + 16, 326, BODY_W - 32, 36, "",
+                  BTN_RECV_DETAILS, BTN_V_GHOST);
         addButton(cx - 178, 518, 170, 48, "停止接收", BTN_RECV_STOP, BTN_V_DANGER);
         addButton(cx + 8,   518, 170, 48, "日志",     BTN_RECV_LOG,  BTN_V_SECONDARY);
         break;
+    }
 
     case SCR_SEARCHING:
         addButton(cx - 90, 480, 180, 48, "取 消", BTN_SEARCH_CANCEL, BTN_V_SECONDARY);
@@ -4303,16 +4517,16 @@ static void buildButtons()
         for (size_t i = 0; i < n && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
             addButton(DEV_BTN_X(0), y + 8, DEV_BTN_W, 36, "投屏",
-                      BTN_DEV_BASE + (int)i * 10 + 1, BTN_V_CHIP_OK);
+                      BTN_DEV_BASE + (int)i * 10 + 1, BTN_V_SECONDARY);
             addButton(DEV_BTN_X(1), y + 8, DEV_BTN_W, 36, "扩展",
-                      BTN_DEV_BASE + (int)i * 10 + 2, BTN_V_CHIP_ACC);
+                      BTN_DEV_BASE + (int)i * 10 + 2, BTN_V_SECONDARY);
             addButton(DEV_BTN_X(2), y + 8, DEV_BTN_W, 36, "拼接",
-                      BTN_DEV_BASE + (int)i * 10 + 3, BTN_V_CHIP_STITCH);
+                      BTN_DEV_BASE + (int)i * 10 + 3, BTN_V_SECONDARY);
         }
         {
             const int y = foundActionsY((int)n);
-            addButton(cx - 168, y, 160, 44, "重新搜索",   BTN_FOUND_RESEARCH, BTN_V_SECONDARY);
-            addButton(cx + 8,   y, 160, 44, "手动输入 ip", BTN_FOUND_MANUAL,  BTN_V_SECONDARY);
+            addButton(cx - 168, y, 160, 44, "重新搜索", BTN_FOUND_RESEARCH, BTN_V_SECONDARY);
+            addButton(cx + 8, y, 160, 44, "手动输入 IPv4", BTN_FOUND_MANUAL, BTN_V_SECONDARY);
         }
         break;
     }
@@ -4328,110 +4542,122 @@ static void buildButtons()
         addButton(cx + 8,   440, 160, 48, "返 回", BTN_MANUAL_BACK,    BTN_V_SECONDARY);
         break;
 
-    case SCR_STREAMING:
-        /* Live direction switch, only for a stitch session: changing sides on
-         * a mirror/extend stream would do nothing. */
-        if (g_sender.active && g_child_mode == SEND_STITCH) {
+    case SCR_STREAMING: {
+        if (g_sender.active && g_child_mode == SEND_STITCH &&
+            g_send_phase == SP_LIVE) {
             const int cur = stitchSideCurrent();
             for (int i = 0; i < 4; i++)
                 addChoice(ST_DIR_CHIP_X(i), ST_DIR_CHIP_Y, ST_DIR_CHIP_W,
                           ST_DIR_CHIP_H, kStitchSideLabel[i],
                           BTN_STITCH_SWITCH_BASE + i, i == cur, g_fontS);
         }
-        addButton(cx - 178, 510, 170, 48, "停 止", BTN_STREAM_STOP, BTN_V_DANGER);
-        addButton(cx + 8,   510, 170, 48, "日志",  BTN_STREAM_LOG,  BTN_V_SECONDARY);
+        if (g_send_phase == SP_LIVE)
+            addButton(ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W, 48, "",
+                      BTN_STREAM_DETAILS, BTN_V_GHOST);
+        if (g_send_phase == SP_FAILED) {
+            addButton(cx - 178, 510, 170, 48, "返回", BTN_STREAM_BACK, BTN_V_SECONDARY);
+            addButton(cx + 8, 510, 170, 48,
+                      std::string("重试") + g_child_label,
+                      BTN_STREAM_RETRY, BTN_V_PRIMARY);
+            addButton(cx + 184, 510, 160, 48, "日志", BTN_STREAM_LOG, BTN_V_SECONDARY);
+        } else {
+            addButton(cx - 178, 510, 170, 48,
+                      std::string("停止") + g_child_label,
+                      BTN_STREAM_STOP, BTN_V_DANGER, GLYPH_NONE, nullptr,
+                      g_sender.active);
+            addButton(cx + 8, 510, 170, 48, "日志", BTN_STREAM_LOG, BTN_V_SECONDARY);
+        }
         break;
+    }
 
     case SCR_SETTINGS: {
-        /* tab chips (drawn by drawButton) sit in the title row */
-        {
-            static const char *kTab[2] = {"常规", "接收与安全"};
-            for (int i = 0; i < 2; i++)
-                addChoice(SET_TAB_X(i), SET_TAB_Y, SET_TAB_W, SET_TAB_H,
-                          kTab[i], BTN_SET_TAB_BASE + i, g_set_tab == i);
-        }
-
-        if (g_set_tab == 0) {
-        /* codec: a 3x2 choice grid, not a segmented control — six cells at
-         * 93px do not fit on one row next to their label */
-        const char *codecLabels[] = {"自动", "H.264", "H.265", "AV1", "原始", "RLE"};
-        const char *codecIds[]    = {"auto", "h264", "h265", "av1", "raw", "rle"};
-        for (int i = 0; i < 6; i++) {
-            const int col = i % 3, row = i / 3;
-            addChoice(SET_LC_X + col * 101, SET_GRID_Y0 + row * 36, 93, 32,
-                      codecLabels[i], BTN_SET_CODEC_BASE + i,
-                      g_cfg_edit.codec == codecIds[i]);
-        }
-        /* steppers */
-        addButton(SET_MINUS_X, SET_ROW_Y(0), SET_STEP_W, 32, "−",
-                  BTN_SET_QUALITY_DEC, BTN_V_SECONDARY);
-        addButton(SET_ROW_R - SET_STEP_W, SET_ROW_Y(0), SET_STEP_W, 32, "+",
-                  BTN_SET_QUALITY_INC, BTN_V_SECONDARY);
-        addButton(SET_MINUS_X, SET_ROW_Y(1), SET_STEP_W, 32, "−",
-                  BTN_SET_FPS_DEC, BTN_V_SECONDARY);
-        addButton(SET_ROW_R - SET_STEP_W, SET_ROW_Y(1), SET_STEP_W, 32, "+",
-                  BTN_SET_FPS_INC, BTN_V_SECONDARY);
-        addButton(SET_MINUS_X, SET_ROW_Y(2), SET_STEP_W, 32, "−",
-                  BTN_SET_BITRATE_DEC, BTN_V_SECONDARY);
-        addButton(SET_ROW_R - SET_STEP_W, SET_ROW_Y(2), SET_STEP_W, 32, "+",
-                  BTN_SET_BITRATE_INC, BTN_V_SECONDARY);
-        /* scale + chroma choice rows */
-        const int scaleVals[] = {100, 75, 50};
-        const char *scaleLabels[] = {"100%", "75%", "50%"};
+        static const char *kTab[3] = {"常规", "画质与编码", "接收与安全"};
         for (int i = 0; i < 3; i++)
-            addChoice(SET_ROW_R - 240 + i * 80, SET_ROW_Y(3), 80, 32,
-                      scaleLabels[i], BTN_SET_SCALE_BASE + i,
-                      g_cfg_edit.scale_percent == scaleVals[i]);
-        const char *chromaIds[] = {"420", "444"};
-        const char *chromaLabels[] = {"4:2:0", "4:4:4"};
-        for (int i = 0; i < 2; i++)
-            addChoice(SET_ROW_R - 160 + i * 80, SET_ROW_Y(4), 80, 32,
-                      chromaLabels[i], BTN_SET_CHROMA_BASE + i,
-                      g_cfg_edit.chroma == chromaIds[i]);
+            addChoice(SET_TAB_X(i), SET_TAB_Y, SET_TAB_W, SET_TAB_H,
+                      kTab[i], BTN_SET_TAB_BASE + i, g_set_tab == i);
 
-        /* 连接与启动 toggles (自动接收 lives on the 接收与安全 tab, never here) */
-        const int tog[4] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
-                            BTN_SET_AUTOCHECK};
-        for (int i = 0; i < 4; i++)
-            addButton(SET_RC_X, SET_TOGGLE_Y0 + i * 40, SET_COL_W - SET_PAD * 2, 32,
-                      "", tog[i], BTN_V_GHOST);
-
-        /* update card: three fixed slots so the hit targets never move */
-        {
-            const bool canDl = updateDownloadSupported();
-            UpdateInfo ui = updateGetInfo();
-            const int y = SET_UPD_Y + 44;
-            if (ui.state == UpdateState::Available)
-                addButton(442, y, 126, 32,
-                          updateIsIgnored(ui) ? "取消忽略" : "忽略此版本",
-                          BTN_SET_UPD_IGNORE, BTN_V_SECONDARY);
-            if (ui.state == UpdateState::Failed ||
-                (ui.state == UpdateState::Available && canDl))
-                addButton(576, y, 126, 32, "打开下载页", BTN_SET_UPD_PAGE,
-                          BTN_V_SECONDARY);
-            const char *lbl = "检查更新";
-            int id = BTN_SET_UPD_CHECK;
-            if (ui.state == UpdateState::Available) {
-                if (canDl) { lbl = "下载更新"; id = BTN_SET_UPD_DL; }
-                else       { lbl = "打开下载页"; id = BTN_SET_UPD_PAGE; }
-            } else if (ui.state == UpdateState::Downloading) {
-                lbl = "取消下载"; id = BTN_SET_UPD_CANCEL;
-            } else if (ui.state == UpdateState::Downloaded) {
-                lbl = "立即安装"; id = BTN_SET_UPD_INSTALL;
-            } else if (ui.state == UpdateState::Failed) {
-                lbl = "重试";
-                id = (ui.is_download && !ui.remote_tag.empty()) ? BTN_SET_UPD_DL
-                                                               : BTN_SET_UPD_CHECK;
+        if (g_set_tab == 1) {
+            const char *codecLabels[] = {"自动", "H.264", "H.265", "AV1", "原始", "RLE"};
+            const char *codecIds[]    = {"auto", "h264", "h265", "av1", "raw", "rle"};
+            for (int i = 0; i < 6; i++) {
+                const int col = i % 3, row = i / 3;
+                addChoice(SET_LC_X + col * 101, SET_GRID_Y0 + row * 36, 93, 32,
+                          codecLabels[i], BTN_SET_CODEC_BASE + i,
+                          g_cfg_edit.codec == codecIds[i]);
             }
-            addButton(710, y, 126, 32, lbl, id, BTN_V_PRIMARY);
-        }
-        } else {
-            /* 接收与安全: the three switches, three policy radios, password row */
-            const int tog[3] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV,
-                                BTN_SET_AUTOSTART};
+            addButton(SET_MINUS_X, SET_ROW_Y(0), SET_STEP_W, 32, "−",
+                      BTN_SET_QUALITY_DEC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
+                      g_cfg_edit.quality > 0);
+            addButton(SET_PLUS_X, SET_ROW_Y(0), SET_STEP_W, 32, "+",
+                      BTN_SET_QUALITY_INC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
+                      g_cfg_edit.quality < 51);
+            addButton(SET_MINUS_X, SET_ROW_Y(1), SET_STEP_W, 32, "−",
+                      BTN_SET_FPS_DEC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
+                      g_cfg_edit.fps_limit > 1);
+            addButton(SET_PLUS_X, SET_ROW_Y(1), SET_STEP_W, 32, "+",
+                      BTN_SET_FPS_INC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
+                      g_cfg_edit.fps_limit < 240);
+            addButton(SET_MINUS_X, SET_ROW_Y(2), SET_STEP_W, 32, "−",
+                      BTN_SET_BITRATE_DEC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
+                      g_cfg_edit.bitrate_kbps > 0);
+            addButton(SET_PLUS_X, SET_ROW_Y(2), SET_STEP_W, 32, "+",
+                      BTN_SET_BITRATE_INC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
+                      g_cfg_edit.bitrate_kbps < 100000);
+            const int scaleVals[] = {100, 75, 50};
+            const char *scaleLabels[] = {"100%", "75%", "50%"};
             for (int i = 0; i < 3; i++)
-                addButton(SEC_ROW_X, SEC_TOGGLE_Y(i), SEC_ROW_W, 32, "", tog[i],
-                          BTN_V_GHOST);
+                addChoice(SET_ROW_R - 240 + i * 80, SET_ROW_Y(3), 80, 32,
+                          scaleLabels[i], BTN_SET_SCALE_BASE + i,
+                          g_cfg_edit.scale_percent == scaleVals[i]);
+            const char *chromaIds[] = {"420", "444"};
+            const char *chromaLabels[] = {"4:2:0", "4:4:4"};
+            for (int i = 0; i < 2; i++)
+                addChoice(SET_ROW_R - 160 + i * 80, SET_ROW_Y(4), 80, 32,
+                          chromaLabels[i], BTN_SET_CHROMA_BASE + i,
+                          g_cfg_edit.chroma == chromaIds[i]);
+            addButton(SET_RC_X, SET_TOGGLE_Y0, SET_COL_W - SET_PAD * 2, 32, "",
+                      BTN_SET_HW, BTN_V_GHOST);
+        } else if (g_set_tab == 0) {
+            const int startup[2] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART};
+            for (int i = 0; i < 2; i++)
+                addButton(SET_LC_X, SET_TOGGLE_Y0 + i * 40, SET_LC_W, 32, "",
+                          startup[i], BTN_V_GHOST);
+            const int diagnostics[3] = {BTN_SET_CONSOLE, BTN_SET_LOGWIN,
+                                        BTN_SET_AUTOCHECK};
+            for (int i = 0; i < 3; i++)
+                addButton(SET_RC_X, SET_TOGGLE_Y0 + i * 40, SET_COL_W - SET_PAD * 2,
+                          32, "", diagnostics[i], BTN_V_GHOST);
+            {
+                const bool canDl = updateDownloadSupported();
+                UpdateInfo ui = updateGetInfo();
+                const int y = SET_UPD_Y + 44;
+                if (ui.state == UpdateState::Available)
+                    addButton(442, y, 126, 32,
+                              updateIsIgnored(ui) ? "取消忽略" : "忽略此版本",
+                              BTN_SET_UPD_IGNORE, BTN_V_SECONDARY);
+                if (ui.state == UpdateState::Failed ||
+                    (ui.state == UpdateState::Available && canDl))
+                    addButton(576, y, 126, 32, "打开下载页", BTN_SET_UPD_PAGE,
+                              BTN_V_SECONDARY);
+                const char *lbl = "检查更新";
+                int id = BTN_SET_UPD_CHECK;
+                if (ui.state == UpdateState::Available) {
+                    if (canDl) { lbl = "下载更新"; id = BTN_SET_UPD_DL; }
+                    else       { lbl = "打开下载页"; id = BTN_SET_UPD_PAGE; }
+                } else if (ui.state == UpdateState::Downloading) {
+                    lbl = "取消下载"; id = BTN_SET_UPD_CANCEL;
+                } else if (ui.state == UpdateState::Downloaded) {
+                    lbl = "立即安装"; id = BTN_SET_UPD_INSTALL;
+                } else if (ui.state == UpdateState::Failed) {
+                    lbl = "重试";
+                    id = (ui.is_download && !ui.remote_tag.empty()) ? BTN_SET_UPD_DL
+                                                                   : BTN_SET_UPD_CHECK;
+                }
+                addButton(710, y, 126, 32, lbl, id, BTN_V_PRIMARY);
+            }
+        } else {
+            addButton(SEC_ROW_X, SEC_TOGGLE_Y(0), SEC_ROW_W, 32, "",
+                      BTN_SET_ALLOW_RECV, BTN_V_GHOST);
             for (int i = 0; i < 3; i++)
                 addButton(SEC_ROW_X, SEC_POLICY_Y(i), SEC_ROW_W, 38, "",
                           kAuthModeBtn[i], BTN_V_GHOST);
@@ -4440,16 +4666,21 @@ static void buildButtons()
                       BTN_SET_PW_EDIT, BTN_V_SECONDARY);
         }
 
-        addButton(cx - 168, SET_ACT_Y, 160, SET_ACT_H, "确 定", BTN_SET_OK,
-                  BTN_V_PRIMARY);
-        addButton(cx + 8,   SET_ACT_Y, 160, SET_ACT_H, "恢复默认", BTN_SET_RESET,
+        addButton(BODY_X, SET_ACT_Y, 140, SET_ACT_H, "恢复默认", BTN_SET_RESET,
                   BTN_V_SECONDARY);
+        addButton(cx - 170, SET_ACT_Y, 150, SET_ACT_H, "取消", BTN_SET_CANCEL,
+                  BTN_V_SECONDARY);
+        addButton(cx - 10, SET_ACT_Y, 150, SET_ACT_H, "保存设置", BTN_SET_OK,
+                  BTN_V_PRIMARY);
         if (g_sender.active || g_receiver.active)
-            addButton(cx + 184, SET_ACT_Y, 160, SET_ACT_H, "返回会话",
+            addButton(cx + 156, SET_ACT_Y, 172, SET_ACT_H, "返回会话",
                       BTN_RETURN_SESSION, BTN_V_SECONDARY);
         break;
     }
     }
+
+    g_modal_button_begin = g_buttons.size();
+    appendModalButtons();
 }
 
 /* ── stat panel text ─────────────────────────────────────────────────────── */
@@ -4482,8 +4713,7 @@ static std::string codecDetail(const std::string &impl)
 
 static std::string statLine1(const LiveStats &s)
 {
-    std::string head = (g_child_label.empty() ? "会话" : g_child_label) + "中";
-    std::string out = head + " · " + codecDisplay(s.codec);
+    std::string out = codecDisplay(s.codec);
     const std::string detail = codecDetail(s.codec);
     if (!detail.empty()) out += " (" + detail + ")";
     if (!s.fps.empty()) out += "   " + s.fps + " fps";
@@ -4518,12 +4748,19 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
     drawCard(ren, card, CARD_R);
     const int x = card.x + 20;
     const int maxW = card.w - 40;
-    drawText(ren, "实时状态", x, card.y + 20, THEME.textDim, g_fontBS);
-
-    /* A stitch session carries the live four-way switch. The hit rects come
-     * from buildButtons; only the caption is painted here, the chips draw
-     * themselves in the common button pass. */
     const bool stitch_session = g_sender.active && g_child_mode == SEND_STITCH;
+    drawText(ren, g_send_phase == SP_LIVE ? "连接详情" : "连接状态",
+             x, card.y + 16, THEME.textDim, g_fontBS);
+    if (g_send_phase == SP_LIVE && !stitch_session)
+        drawTextV(ren, g_details_open ? "收起 ▲" : "展开 ▼", card.x + card.w - 20,
+                  card.y + 26, THEME.textDim, g_fontS, ALIGN_RIGHT);
+
+    if (g_send_phase != SP_LIVE) {
+        drawText(ren, sendPhaseLabel(), x, card.y + 48, sendPhaseColor(), g_font);
+        return;
+    }
+    if (!stitch_session && !g_details_open) return;
+
     if (stitch_session)
         drawText(ren, "方向", x, ST_DIR_CHIP_Y + 5, THEME.textDim, g_fontS);
 
@@ -4542,9 +4779,6 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
         return;
     }
     if (s.event == "stitch") {
-        /* 拼接 has no fps/bitrate to report; what matters is where control
-         * currently is and which edge leads there. The sender emits one of
-         * these on every crossing and on every side switch. */
         int side = kvmSideFromKey(s.side.c_str());
         if (side < 0) side = stitchSideFromConfig();
         std::string hint;
@@ -4557,7 +4791,7 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
             hint = std::string("光标移到屏幕") + kStitchEnterEdge[side] +
                    "即可控制对方";
         }
-        drawText(ren, "拼接中", x, card.y + 50, THEME.text, g_fontB);
+        drawText(ren, "控制状态", x, card.y + 50, THEME.text, g_fontB);
         drawText(ren, fitText(hint, g_fontS, maxW), x, card.y + 86,
                  THEME.textDim, g_fontS);
         return;
@@ -4579,10 +4813,13 @@ static void drawStitchSideDialog(SDL_Renderer *ren)
     fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
     const SDL_Rect card{SIDE_DLG_X, SIDE_DLG_Y, SIDE_DLG_W, SIDE_DLG_H};
     drawCard(ren, card, CARD_R);
-    drawText(ren, "拼接到哪一侧？", SIDE_DLG_X + 24, SIDE_DLG_Y + 22,
-             THEME.text, g_fontB);
-    drawText(ren, "选择对方电脑相对本机的位置", SIDE_DLG_X + 24, SIDE_DLG_Y + 58,
-             THEME.textDim, g_fontS);
+    const std::string target = g_stitch_ask.name.empty()
+                                   ? g_stitch_ask.ip : g_stitch_ask.name;
+    drawText(ren, fitText(target + " 在本机的哪一侧？", g_fontB, SIDE_DLG_W - 48),
+             SIDE_DLG_X + 24, SIDE_DLG_Y + 22, THEME.text, g_fontB);
+    drawText(ren, fitText(g_stitch_ask.ip + " · 共享键鼠，不传输画面",
+                          g_fontS, SIDE_DLG_W - 48),
+             SIDE_DLG_X + 24, SIDE_DLG_Y + 58, THEME.textDim, g_fontS);
     drawText(ren, "从该侧移出鼠标即可控制对方", SIDE_DLG_X + 24, SIDE_DLG_Y + 78,
              THEME.textDim, g_fontS);
     const SDL_Rect me = rcSideCenter();
@@ -4590,13 +4827,24 @@ static void drawStitchSideDialog(SDL_Renderer *ren)
     drawTextIn(ren, "本机", me, THEME.textDim, g_fontS, ALIGN_CENTER);
 }
 
-/* ── authorization modals ─────────────────────────────────────────────────
- * Both dialogs are overlays: the receiver's approval request and the sender's
- * password prompt. They are drawn above the current screen but below the
- * buttons, which buildButtons() limits to the dialog's own cells. */
+/* ── authorization and settings modals ──────────────────────────────────────
+ * Only topModal() is painted here, matching buildButtons() and onButton(). */
 static void drawAuthDialogs(SDL_Renderer *ren)
 {
-    if (g_auth_ask.open) {
+    if (topModal() == MODAL_DISCARD) {
+        fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
+        const SDL_Rect card{AUTH_DLG_X, AUTH_DLG_Y, AUTH_DLG_W, AUTH_DLG_H};
+        drawCard(ren, card, CARD_R);
+        const int x = AUTH_DLG_X + 24;
+        drawText(ren, "放弃未保存修改？", x, AUTH_DLG_Y + 22,
+                 THEME.text, g_fontB);
+        drawText(ren, "当前设置尚未保存，离开后这些修改将丢失。", x,
+                 AUTH_DLG_Y + 72, THEME.textDim, g_fontS);
+        drawText(ren, "选择继续编辑，或明确放弃本次修改。", x,
+                 AUTH_DLG_Y + 102, THEME.textDim, g_fontS);
+        return;
+    }
+    if (topModal() == MODAL_AUTH) {
         fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
         const SDL_Rect card{AUTH_DLG_X, AUTH_DLG_Y, AUTH_DLG_W, AUTH_DLG_H};
         drawCard(ren, card, CARD_R);
@@ -4612,7 +4860,7 @@ static void drawAuthDialogs(SDL_Renderer *ren)
         drawText(ren,
                  g_auth_ask.req == "stitch"
                      ? "请求：拼接控制（键盘与鼠标）"
-                     : "请求：投屏 / 扩展连接（视频）",
+                     : "请求：视频连接（投屏或扩展）",
                  x, AUTH_DLG_Y + 116, THEME.textDim, g_fontS);
         const long leftMs = (long)g_auth_ask.deadline - (long)SDL_GetTicks();
         const int secs = leftMs > 0 ? (int)(leftMs / 1000) + 1 : 0;
@@ -4622,7 +4870,7 @@ static void drawAuthDialogs(SDL_Renderer *ren)
                  x, AUTH_DLG_Y + 142, THEME.textDim, g_fontS);
         return;
     }
-    if (g_pw_ask.open) {
+    if (topModal() == MODAL_PW) {
         fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
         const SDL_Rect card{PW_DLG_X, PW_DLG_Y, PW_DLG_W, PW_DLG_H};
         drawCard(ren, card, CARD_R);
@@ -4640,10 +4888,11 @@ static void drawAuthDialogs(SDL_Renderer *ren)
         drawTextIn(ren, shown.empty() ? "密码" : shown, field,
                    shown.empty() ? THEME.textDim : THEME.text, g_font,
                    ALIGN_LEFT, 14);
-        /* caret */
-        if (!shown.empty())
-            drawHairline(ren, field.x + 14 + 0, field.y + field.h - 8, 1, 1,
-                         THEME.border);
+        int textW = 0, textH = 0;
+        TTF_SizeUTF8(g_font, shown.c_str(), &textW, &textH);
+        const int caretX = field.x + 14 + (shown.empty() ? 0 : uiCoord(textW));
+        fillRoundRect(ren, SDL_Rect{caretX, field.y + 10, 1, field.h - 20}, 0,
+                      THEME.border);
 
         drawText(ren, "支持 Ctrl+V 粘贴", x, PW_SHOW_Y + 2, THEME.textDim,
                  g_fontS);
@@ -4652,7 +4901,7 @@ static void drawAuthDialogs(SDL_Renderer *ren)
                      g_fontS);
         return;
     }
-    if (g_set_pw.open) {
+    if (topModal() == MODAL_SETPW) {
         fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
         const SDL_Rect card{SETPW_DLG_X, SETPW_DLG_Y, SETPW_DLG_W, SETPW_DLG_H};
         drawCard(ren, card, CARD_R);
@@ -4692,7 +4941,7 @@ static void drawHeader()
 {
     fillRoundRect(g_ren, SDL_Rect{0, 0, WIN_W, HEADER_H}, 0, THEME.surface);
     drawHairline(g_ren, 0, HEADER_H - 1, WIN_W, 1, THEME.border);
-    drawGlyph(g_ren, GLYPH_MONITOR, HDR_GLYPH_CX, HEADER_H / 2, 22, THEME.primary);
+    drawGlyph(g_ren, GLYPH_LOGO, HDR_GLYPH_CX, HEADER_H / 2, 24, THEME.primary);
     drawTextV(g_ren, "Mivara 幻屏", HDR_WORD_X, HEADER_H / 2, THEME.text,
               g_fontB, ALIGN_LEFT);
     /* update button — ghost hit area, painted here because its fill encodes the
@@ -4763,10 +5012,11 @@ static void renderScreen(int mousex, int mousey)
                            g_fontBS, ALIGN_CENTER);
             }
         }
-        drawText(g_ren, "零配置局域网投屏 · 无线扩展屏", BODY_X, HOME_TITLE_Y,
-                 THEME.textDim, g_font);
+        drawText(g_ren, "发送到其他电脑", BODY_X, HOME_TITLE_Y,
+                 THEME.text, g_fontB);
         if (!g_status_note.empty())
-            drawTextV(g_ren, g_status_note, BODY_R, HOME_TITLE_Y + 10, THEME.danger,
+            drawTextV(g_ren, fitText(g_status_note, g_fontS, BODY_W - 220),
+                      BODY_R, HOME_TITLE_Y + 10, statusToneColor(),
                       g_fontS, ALIGN_RIGHT);
         drawText(g_ren, "快捷操作", BODY_X, HOME_CAPTION_Y, THEME.textDim, g_fontBS);
 
@@ -4779,23 +5029,17 @@ static void renderScreen(int mousex, int mousey)
             drawCard(g_ren, card, CARD_R);
 
             SDL_Rect tile{card.x + 18, card.y + 26, 46, 46};
+            const bool live = (g_send_phase == SP_LIVE);
             fillRoundRect(g_ren, tile, 14,
-                          g_sender.active ? THEME.successTint
-                                          : THEME.primaryTint);
+                          live ? THEME.successTint : THEME.primaryTint);
             drawGlyph(g_ren, g_sender.active ? GLYPH_MONITOR : GLYPH_ARROW_UP,
                       tile.x + 23, tile.y + 23, 22,
-                      g_sender.active ? THEME.onSuccessTint
-                                      : THEME.onPrimaryTint);
+                      live ? THEME.onSuccessTint : THEME.onPrimaryTint);
 
             if (g_sender.active) {
-                drawTextV(g_ren, "正在" + g_child_label, card.x + 82,
-                          card.y + 42, THEME.success, g_fontB, ALIGN_LEFT);
-                std::string sub = g_last_name.empty() ? g_last_ip : g_last_name;
-                if (!g_last_ip.empty())
-                    sub += " · " + g_last_ip + ":" +
-                           std::to_string(g_child_mode == SEND_STITCH
-                                              ? KVM_PORT
-                                              : g_last_port);
+                drawTextV(g_ren, sendPhaseLabel(), card.x + 82,
+                          card.y + 42, sendPhaseColor(), g_fontB, ALIGN_LEFT);
+                const std::string sub = sendTargetName() + " · " + sendTargetEndpoint();
                 drawText(g_ren,
                          fitText(sub, g_fontS,
                                  HOME_SESSION_BACK_X - 12 - (card.x + 82)),
@@ -4803,9 +5047,9 @@ static void renderScreen(int mousex, int mousey)
             } else {
                 if (g_hot == BTN_HOME_CONNECT || g_press == BTN_HOME_CONNECT)
                     fillRoundRect(g_ren, card, CARD_R, THEME.hover);
-                drawTextV(g_ren, "连接设备", card.x + 82, card.y + 42,
+                drawTextV(g_ren, "选择目标设备", card.x + 82, card.y + 42,
                           THEME.text, g_fontB, ALIGN_LEFT);
-                drawText(g_ren, "搜索局域网内的接收端，开始投屏、扩展或拼接",
+                drawText(g_ren, "搜索后直接选择投屏、扩展或拼接",
                          card.x + 82, card.y + 66, THEME.textDim, g_fontS);
                 drawTextV(g_ren, "›", card.x + card.w - 22, card.y + card.h / 2,
                           THEME.textDim, g_fontL, ALIGN_RIGHT);
@@ -4823,7 +5067,7 @@ static void renderScreen(int mousex, int mousey)
             fillCircle(g_ren, bar.x + 20, bar.y + 24, 5);
 
             const int textW = RECV_BAR_ACT_X - 12 - (bar.x + 36);
-            drawText(g_ren, fitText(std::string("接收 · ") +
+            drawText(g_ren, fitText(std::string("本机接收 · ") +
                                         recvStateLabel(rv.state),
                                     g_fontBS, textW),
                      bar.x + 36, bar.y + 14, THEME.text, g_fontBS);
@@ -4837,10 +5081,12 @@ static void renderScreen(int mousex, int mousey)
             const SDL_Rect card{BODY_X, HIST_CARD_Y, BODY_W,
                                 g_hist.empty() ? HIST_CARD_H_EMPTY : HIST_CARD_H};
             drawCard(g_ren, card, CARD_R);
-            drawText(g_ren, "连接历史", card.x + 16, card.y + 16, THEME.text,
+            drawText(g_ren, "最近连接", card.x + 16, card.y + 16, THEME.text,
                      g_fontBS);
+            drawText(g_ren, "仅记录已开始的会话", card.x + 100, card.y + 18,
+                     THEME.textDim, g_fontS);
             if (g_hist.empty()) {
-                drawTextIn(g_ren, "暂无连接记录 · 成功连接一次后会自动出现在这里",
+                drawTextIn(g_ren, "暂无连接记录 · 真正开始一次会话后会自动出现在这里",
                            card, THEME.textDim, g_font, ALIGN_CENTER);
             } else {
                 for (int i = 0; i < HIST_VISIBLE; i++) {
@@ -4855,14 +5101,14 @@ static void renderScreen(int mousex, int mousey)
                         drawHairline(g_ren, row.x, row.y + row.h, row.w, 1,
                                      THEME.border);
 
-                    std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 10);
+                    std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 14);
                     drawText(g_ren, fitText(nm, g_fontS, HIST_TEXT_W),
                              row.x + 12, row.y + 5,
                              THEME.text, g_fontS);
                     std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
                                       sendModeLabel(sendModeFromKey(e.mode)) + " · " +
-                                      relTime(e.last_used_unix) + " · ×" +
-                                      std::to_string(e.use_count);
+                                      relTime(e.last_used_unix) + " · " +
+                                      std::to_string(e.use_count) + " 次";
                     drawText(g_ren, fitText(sub, g_fontS, HIST_TEXT_W), row.x + 12,
                              row.y + 23,
                              THEME.textDim, g_fontS);
@@ -4893,42 +5139,47 @@ static void renderScreen(int mousex, int mousey)
         const int lx = card.x + 20;
         drawText(g_ren, "本机 IP", lx, card.y + 24, THEME.textDim, g_fontS);
         drawText(g_ren, ip, lx, card.y + 48, THEME.text, g_fontB);
-        /* Live service state. 8082/8083/8084 are not fatal on their own, but
-         * a silent failure would leave the user believing 拼屏/旁路可用. */
-        auto svcText = [](const char *label, const RecvServiceState &st) {
-            std::string t = std::string(label) + " " + std::to_string(st.port);
-            if (st.state == 0)      t += " 正常";
-            else if (st.state == 2) t += " 不适用";
-            else if (st.state == 1) {
-                t += " 未启动";
-                const std::string why = recvServiceErrorText(st.err);
-                if (!why.empty()) t += "（" + why + "）";
-            } else                  t += " 未确认";
-            return t;
-        };
-        const bool videoUp = (rv.state == RSV_WAITING || rv.state == RSV_AUTH ||
-                              rv.state == RSV_STREAMING);
-        const std::string svcLine =
-            std::string("视频 8081 ") + (videoUp ? "已就绪" : "未就绪") + " · " +
-            svcText("计算", rv.services.gpu) + " · " +
-            svcText("端口", rv.services.ports) + " · " +
-            svcText("拼接", rv.services.kvm) + " · 发现 UDP 1900";
-        drawText(g_ren, fitText(svcLine, g_fontS, card.w - 40), lx,
-                 card.y + 90, THEME.textDim, g_fontS);
-        {
+        const SDL_Rect detail{lx, 326, card.w - 40, 36};
+        if (g_hot == BTN_RECV_DETAILS || g_press == BTN_RECV_DETAILS)
+            fillRoundRect(g_ren, detail, THEME.radius - 3, THEME.hover);
+        drawText(g_ren, "服务详情", lx, 336, THEME.text, g_fontBS);
+        drawTextV(g_ren, g_recv_details_open ? "收起 ▲" : "展开 ▼",
+                  lx + detail.w, 344, THEME.textDim, g_fontS, ALIGN_RIGHT);
+        if (g_recv_details_open) {
+            auto svcText = [](const char *label, const RecvServiceState &st) {
+                std::string t = std::string(label) + " " + std::to_string(st.port);
+                if (st.state == 0)      t += " 正常";
+                else if (st.state == 2) t += " 不适用";
+                else if (st.state == 1) {
+                    t += " 未启动";
+                    const std::string why = recvServiceErrorText(st.err);
+                    if (!why.empty()) t += "（" + why + "）";
+                } else                  t += " 未确认";
+                return t;
+            };
+            const bool videoUp = (rv.state == RSV_WAITING || rv.state == RSV_AUTH ||
+                                  rv.state == RSV_STREAMING);
+            const std::string svcLine =
+                std::string("视频 8081 ") + (videoUp ? "已就绪" : "未就绪") + " · " +
+                svcText("计算", rv.services.gpu) + " · " +
+                svcText("端口", rv.services.ports) + " · " +
+                svcText("拼接", rv.services.kvm) + " · 发现 UDP 1900";
+            drawText(g_ren, fitText(svcLine, g_fontS, card.w - 40), lx,
+                     376, THEME.textDim, g_fontS);
             const std::string issue = recvServicesIssue(rv.services);
             if (!issue.empty())
                 drawText(g_ren, fitText(issue, g_fontS, card.w - 40), lx,
-                         card.y + 110, THEME.warning, g_fontS);
+                         398, THEME.warning, g_fontS);
         }
-        drawHairline(g_ren, lx, card.y + 132, card.w - 40, 1, THEME.border);
+        const int dividerY = g_recv_details_open ? 420 : 386;
+        drawHairline(g_ren, lx, dividerY, card.w - 40, 1, THEME.border);
         drawText(g_ren, "授权方式：" +
                             std::string(rv.policy == "open" ? "允许任意连接"
                                         : rv.policy == "password" ? "仅允许密码连接"
                                                                   : "每次手动授权"),
-                 lx, card.y + 150, THEME.text, g_font);
-        drawText(g_ren, "收流期间的密码验证只用于准入，画质数据并未加密",
-                 lx, card.y + 186, THEME.textDim, g_fontS);
+                 lx, dividerY + 24, THEME.text, g_font);
+        drawText(g_ren, "密码验证只用于连接准入，画面数据并未加密",
+                 lx, dividerY + 58, THEME.textDim, g_fontS);
         break;
     }
 
@@ -4941,7 +5192,7 @@ static void renderScreen(int mousex, int mousey)
         const int dots = ((int)(SDL_GetTicks() / 400)) % 4;
         drawText(g_ren, "搜索中" + std::string(dots, '.'), cx, 370, THEME.text,
                  g_fontL, true);
-        drawText(g_ren, "正在通过 SSDP 查找局域网内的接收端", cx, 420,
+        drawText(g_ren, "正在搜索同一局域网中的设备", cx, 420,
                  THEME.textDim, g_font, true);
         break;
     }
@@ -4952,32 +5203,32 @@ static void renderScreen(int mousex, int mousey)
             std::lock_guard<std::mutex> lk(g_dev_mtx);
             devs = g_devices;
         }
-        drawText(g_ren, "发现 " + std::to_string(devs.size()) + " 台设备", BODY_X,
-                 TITLE_Y, THEME.text, g_fontB);
-        drawTextV(g_ren, "选择投屏、扩展或拼接", BODY_R, TITLE_Y + 12, THEME.textDim,
-                  g_fontS, ALIGN_RIGHT);
+        drawText(g_ren, "选择目标设备", BODY_X, TITLE_Y, THEME.text, g_fontB);
+        drawTextV(g_ren, std::to_string(devs.size()) + " 个可用地址 · 点击模式即连接",
+                  BODY_R, TITLE_Y + 12, THEME.textDim, g_fontS, ALIGN_RIGHT);
+        drawText(g_ren, "投屏 · 镜像画面", BODY_X, 116, THEME.textDim, g_fontS);
+        drawText(g_ren, "扩展 · 新增桌面", BODY_X + 218, 116, THEME.textDim, g_fontS);
+        drawText(g_ren, "拼接 · 共享键鼠，不传画面", BODY_X + 436, 116,
+                 THEME.textDim, g_fontS);
         for (size_t i = 0; i < devs.size() && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
             const SDL_Rect row{BODY_X, y, BODY_W, FOUND_ROW_H};
-            /* border, not a shadow: consecutive rows are only 8px apart and
-             * the 12px shadow of one landed on top of the next */
             drawRoundRect(g_ren, row, THEME.radiusCard - 4, THEME.surface,
                           THEME.border);
-            std::string label = devs[i].name.empty()
-                                    ? devs[i].toString()
-                                    : truncateUtf8(devs[i].name, 12) + "  ·  " +
-                                          devs[i].toString();
-            drawTextIn(g_ren, fitText(label, g_font, DEV_BTN_X(0) - BODY_X - 40),
-                       row, THEME.text, g_font, ALIGN_LEFT, 20);
+            const std::string name = devs[i].name.empty()
+                                         ? "未命名设备" : truncateUtf8(devs[i].name, 14);
+            const int textW = DEV_BTN_X(0) - (row.x + 20) - 20;
+            drawText(g_ren, fitText(name, g_font, textW), row.x + 20, row.y + 7,
+                     THEME.text, g_font);
+            drawText(g_ren, fitText(devs[i].toString(), g_fontS, textW),
+                     row.x + 20, row.y + 31, THEME.textDim, g_fontS);
         }
         if (devs.size() > 6)
-            drawText(g_ren, "仅显示前 6 台", BODY_X, FOUND_ACTIONS_MAX_Y - 22,
+            drawText(g_ren, "仅显示前 6 个地址", BODY_X, FOUND_ACTIONS_MAX_Y - 22,
                      THEME.textDim, g_fontS);
-        /* Launch failures (including "stitch needs Windows") are shown here
-         * because this screen has no other status line. */
         if (!g_status_note.empty())
-            drawText(g_ren, g_status_note, cx,
-                     foundActionsY((int)devs.size()) - 26, THEME.danger,
+            drawText(g_ren, fitText(g_status_note, g_fontS, BODY_W - 40), cx,
+                     foundActionsY((int)devs.size()) - 26, statusToneColor(),
                      g_fontS, true);
         break;
     }
@@ -4993,101 +5244,148 @@ static void renderScreen(int mousex, int mousey)
     }
 
     case SCR_MANUAL_IP: {
-        drawText(g_ren, "手动输入接收端 IP", cx, 230, THEME.text, g_fontL, true);
-        drawText(g_ren, "在接收端的主页可以看到它的本机 IP", cx, 278, THEME.textDim,
-                 g_font, true);
+        drawText(g_ren, "手动输入接收端 IPv4", cx, 230, THEME.text, g_fontL, true);
+        drawText(g_ren, "对方开启接收后，在接收详情中查看本机 IPv4", cx, 278,
+                 THEME.textDim, g_font, true);
         const SDL_Rect box{cx - 200, 312, 400, 60};
-        /* surface, not inputBg: on the light palette inputBg IS the page colour,
-         * so the field had no fill of its own — only a border. */
         drawRoundRect(g_ren, box, THEME.radius, THEME.surface,
-                      g_status_note.empty() ? THEME.border : THEME.danger);
+                      g_manual_field_error ? THEME.danger : THEME.border);
         const bool empty = g_manual_ip.empty();
         drawTextIn(g_ren, empty ? "例如 192.168.1.105" : g_manual_ip, box,
                    empty ? THEME.textDim : THEME.text, g_font, ALIGN_CENTER);
         if (!g_status_note.empty())
-            drawText(g_ren, g_status_note, cx, 396, THEME.danger, g_font, true);
+            drawText(g_ren, fitText(g_status_note, g_font, BODY_W - 60), cx, 396,
+                     statusToneColor(), g_font, true);
+        if (!g_manual_field_error && !g_status_note.empty())
+            drawText(g_ren, "请确认对方已开启接收、处于同一局域网，并检查防火墙",
+                     cx, 420, THEME.textDim, g_fontS, true);
         break;
     }
 
     case SCR_STREAMING: {
-        /* The phase, not the last STAT payload, decides the copy: while the
-         * password is being checked or the peer is deciding, this screen must
-         * not claim 正在投屏/会话进行中. */
-        std::string title;
-        std::string note;           /* g_auth_wait_note, drawn prominently */
-        SDL_Color col = THEME.primary;
-        switch (g_send_phase) {
-        case SP_PASSWORD:
-            title = "需要连接密码";
-            note = g_auth_wait_note.empty() ? "请输入对方设置的连接密码"
-                                            : g_auth_wait_note;
-            col = THEME.warning;
-            break;
-        case SP_VERIFY:
-            title = "正在验证连接密码…";
-            note = g_auth_wait_note.empty() ? "正在验证连接密码…"
-                                            : g_auth_wait_note;
-            col = THEME.warning;
-            break;
-        case SP_WAIT_AUTH:
-            title = "等待对方授权…";
-            note = g_auth_wait_note.empty()
-                       ? "已发送连接请求，等待对方确认（最多 30 秒）…"
-                       : g_auth_wait_note;
-            col = THEME.warning;
-            break;
-        case SP_GRANTED:
-            title = "对方已允许连接";
-            note = g_auth_wait_note.empty() ? "正在建立会话…" : g_auth_wait_note;
-            col = THEME.success;
-            break;
-        case SP_LIVE:
-            title = "正在" + g_child_label;
-            note = "会话进行中 · 关闭窗口不会中断，请点下方按钮结束";
-            col = THEME.success;
-            break;
-        case SP_FAILED:
-            title = "连接失败";
-            col = THEME.danger;
-            break;
-        case SP_CONNECTING:
-        case SP_IDLE:
-        default:
-            title = "正在连接对方…";
-            col = THEME.primary;
-            break;
-        }
-        drawText(g_ren, title, cx, 200, col, g_fontL, true);
+        const std::string target = sendTargetName();
+        drawText(g_ren, fitText(target.empty() ? "未选择设备" : target,
+                                g_fontL, BODY_W - 40),
+                 cx, 142, THEME.text, g_fontL, true);
+        const std::string phase = (g_send_phase == SP_LIVE)
+                                      ? "已连接" : sendPhaseLabel();
+        drawText(g_ren, phase, cx, 190, sendPhaseColor(), g_fontB, true);
+        drawText(g_ren, fitText(g_child_label + " · " + sendTargetEndpoint(),
+                                g_fontS, BODY_W - 40),
+                 cx, 222, THEME.textDim, g_fontS, true);
+
         if (g_send_phase == SP_FAILED) {
             const std::string why = g_status_note.empty()
-                                        ? "连接未建立，请返回重试"
+                                        ? "连接未建立，请重试或返回"
                                         : g_status_note;
-            drawText(g_ren, why, cx, 258, THEME.danger, g_font, true);
+            drawText(g_ren, fitText(why, g_font, BODY_W - 40), cx, 266,
+                     THEME.danger, g_font, true);
+            drawText(g_ren, "未建立会话 · 可重试，或返回后重新选择目标",
+                     cx, 298, THEME.textDim, g_fontS, true);
         } else {
-            if (!g_status_note.empty())
-                drawText(g_ren, g_status_note, cx, 258, THEME.text, g_font,
-                         true);
+            std::string note = g_auth_wait_note;
+            if (note.empty() && g_send_phase == SP_LIVE)
+                note = "关闭窗口不会中断 · 停止请使用下方按钮";
+            if (note.empty() && g_send_phase == SP_CONNECTING)
+                note = "正在建立连接，请稍候…";
             if (!note.empty())
-                drawText(g_ren, note, cx, 290,
-                         g_send_phase == SP_LIVE ? THEME.textDim : col,
-                         g_send_phase == SP_LIVE ? g_fontS : g_font, true);
+                drawText(g_ren, fitText(note, g_fontS, BODY_W - 40), cx, 266,
+                         g_send_phase == SP_LIVE ? THEME.textDim : sendPhaseColor(),
+                         g_fontS, true);
+            if (!g_status_note.empty() && g_status_note.find("目标: ") != 0)
+                drawText(g_ren, fitText(g_status_note, g_fontS, BODY_W - 40),
+                         cx, 292, statusToneColor(), g_fontS, true);
         }
-        drawStatPanel(g_ren, SDL_Rect{ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W,
-                                      ST_PANEL_H});
+        const bool stitch = g_sender.active && g_child_mode == SEND_STITCH;
+        const int panelH = (stitch || g_details_open) ? ST_PANEL_H : 68;
+        drawStatPanel(g_ren, SDL_Rect{ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W, panelH});
         break;
     }
 
     case SCR_SETTINGS: {
-        drawText(g_ren, "设 置", BODY_X, TITLE_Y, THEME.text, g_fontB);
-        /* tab chips are painted by drawButton (BTN_V_CHOICE) */
-        if (!g_status_note.empty()) {
-            const int nx = BODY_X + 82;
-            drawText(g_ren, fitText(g_status_note, g_fontS,
-                                    SET_TAB_X(0) - 16 - nx),
-                     nx, TITLE_Y + 8, THEME.danger, g_fontS);
+        drawText(g_ren, "设置", BODY_X, TITLE_Y, THEME.text, g_fontB);
+        int noteX = BODY_X + 64;
+        if (settingsDirty()) {
+            drawText(g_ren, "未保存", noteX, TITLE_Y + 8, THEME.warning, g_fontS);
+            noteX += 64;
         }
+        if (!g_status_note.empty())
+            drawText(g_ren, fitText(g_status_note, g_fontS,
+                                    SET_TAB_X(0) - 16 - noteX),
+                     noteX, TITLE_Y + 8, statusToneColor(), g_fontS);
 
         if (g_set_tab == 0) {
+            {
+                const SDL_Rect card{SET_COL_L, SET_CARD_Y, SET_COL_W, SET_L_H};
+                drawCard(g_ren, card, CARD_R);
+                drawText(g_ren, "启动", SET_LC_X, card.y + 20,
+                         THEME.textDim, g_fontBS);
+                static const char *labels[2] = {"启动软件时自动开启接收", "开机自启动"};
+                const bool on[2] = {g_cfg_edit.auto_receive != 0,
+                                    g_cfg_edit.auto_start != 0};
+                const int ids[2] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART};
+                for (int i = 0; i < 2; i++) {
+                    const int y = SET_TOGGLE_Y0 + i * 40;
+                    const SDL_Rect row{SET_LC_X, y, SET_LC_W, 32};
+                    if (g_hot == ids[i] || g_press == ids[i])
+                        fillRoundRect(g_ren, row, THEME.radius - 3, THEME.hover);
+                    drawTextV(g_ren, labels[i], row.x, y + 16, THEME.text,
+                              g_font, ALIGN_LEFT);
+                    drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
+                }
+                drawText(g_ren, "自动接收只影响下次启动。",
+                         SET_LC_X, SET_TOGGLE_Y0 + 96, THEME.textDim, g_fontS);
+                drawText(g_ren, "开机自启动只负责启动程序。",
+                         SET_LC_X, SET_TOGGLE_Y0 + 120, THEME.textDim, g_fontS);
+                drawText(g_ren, "本次接收开关位于「接收与安全」。",
+                         SET_LC_X, SET_TOGGLE_Y0 + 144, THEME.textDim, g_fontS);
+            }
+            {
+                const SDL_Rect card{SET_COL_R, SET_CARD_Y, SET_COL_W, SET_R_H};
+                drawCard(g_ren, card, CARD_R);
+                drawText(g_ren, "更新与诊断", SET_RC_X, card.y + 20,
+                         THEME.textDim, g_fontBS);
+                static const char *labels[3] = {"状态控制台", "日志窗口", "自动检查更新"};
+                const bool on[3] = {g_cfg_edit.show_status_console != 0,
+                                    g_cfg_edit.show_log_window != 0,
+                                    g_cfg_edit.auto_check_update != 0};
+                const int ids[3] = {BTN_SET_CONSOLE, BTN_SET_LOGWIN,
+                                    BTN_SET_AUTOCHECK};
+                for (int i = 0; i < 3; i++) {
+                    const int y = SET_TOGGLE_Y0 + i * 40;
+                    const SDL_Rect row{SET_RC_X, y, SET_COL_W - SET_PAD * 2, 32};
+                    if (g_hot == ids[i] || g_press == ids[i])
+                        fillRoundRect(g_ren, row, THEME.radius - 3, THEME.hover);
+                    drawTextV(g_ren, labels[i], row.x, y + 16, THEME.text,
+                              g_font, ALIGN_LEFT);
+                    drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
+                }
+                drawText(g_ren, fitText("控制台开启后，发送端统计在控制台显示。",
+                                        g_fontS, SET_COL_W - SET_PAD * 2),
+                         SET_RC_X, SET_TOGGLE_Y0 + 130, THEME.textDim, g_fontS);
+            }
+            {
+                const SDL_Rect card{BODY_X, SET_UPD_Y, BODY_W, SET_UPD_H};
+                drawCard(g_ren, card, CARD_R);
+                drawText(g_ren, "软件更新", card.x + 20, card.y + 14,
+                         THEME.textDim, g_fontBS);
+                UpdateInfo ui = updateGetInfo();
+                SDL_Color col = THEME.textDim;
+                std::string txt = updateStatusText(ui, col);
+                drawText(g_ren, fitText(txt, g_fontS, updateTextMaxW(ui)),
+                         card.x + 20, card.y + 40, col, g_fontS);
+                if (ui.state == UpdateState::Downloading) {
+                    int p = updateProgress();
+                    p = p < 0 ? 0 : (p > 100 ? 100 : p);
+                    const SDL_Rect bar{card.x + 20, card.y + 66, 240, 5};
+                    fillRoundRect(g_ren, bar, 2, THEME.surfaceAlt);
+                    if (p > 0) {
+                        const SDL_Rect fill{bar.x, bar.y, bar.w * p / 100, bar.h};
+                        fillRoundRect(g_ren, fill, 2, THEME.primary);
+                    }
+                }
+            }
+        } else if (g_set_tab == 1) {
         /* ── left column: 画质与编码 ────────────────────────────────────── */
         {
             const SDL_Rect card{SET_COL_L, SET_CARD_Y, SET_COL_W, SET_L_H};
@@ -5114,52 +5412,26 @@ static void renderScreen(int mousex, int mousey)
             }
         }
 
-        /* ── right column: 连接与启动 ───────────────────────────────────── */
+        /* ── right column: 传输 ─────────────────────────────────────────── */
         {
             const SDL_Rect card{SET_COL_R, SET_CARD_Y, SET_COL_W, SET_R_H};
             drawCard(g_ren, card, CARD_R);
-            drawText(g_ren, "连接与启动", SET_RC_X, card.y + 20, THEME.textDim,
-                     g_fontBS);
-            static const char *kToggle[4] = {"硬件加速", "状态控制台", "日志窗口",
-                                             "自动检查更新"};
-            const bool on[4] = {g_cfg_edit.hw_accel != 0,
-                                g_cfg_edit.show_status_console != 0,
-                                g_cfg_edit.show_log_window != 0,
-                                g_cfg_edit.auto_check_update != 0};
-            const int id[4] = {BTN_SET_HW, BTN_SET_CONSOLE, BTN_SET_LOGWIN,
-                               BTN_SET_AUTOCHECK};
-            for (int i = 0; i < 4; i++) {
-                const int y = SET_TOGGLE_Y0 + i * 40;
-                const SDL_Rect row{SET_RC_X, y, SET_COL_W - SET_PAD * 2, 32};
-                if (g_hot == id[i] || g_press == id[i])
-                    fillRoundRect(g_ren, row, THEME.radius - 3, THEME.hover);
-                drawTextV(g_ren, kToggle[i], row.x, y + 16, THEME.text, g_font,
-                          ALIGN_LEFT);
-                drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
-            }
-        }
-
-        /* ── 更新 (full width) ──────────────────────────────────────────── */
-        {
-            const SDL_Rect card{BODY_X, SET_UPD_Y, BODY_W, SET_UPD_H};
-            drawCard(g_ren, card, CARD_R);
-            drawText(g_ren, "软件更新", card.x + 20, card.y + 14, THEME.textDim,
-                     g_fontBS);
-            UpdateInfo ui = updateGetInfo();
-            SDL_Color col = THEME.textDim;
-            std::string txt = updateStatusText(ui, col);
-            drawText(g_ren, fitText(txt, g_fontS, updateTextMaxW(ui)),
-                     card.x + 20, card.y + 40, col, g_fontS);
-            if (ui.state == UpdateState::Downloading) {
-                int p = updateProgress();
-                p = p < 0 ? 0 : (p > 100 ? 100 : p);
-                const SDL_Rect bar{card.x + 20, card.y + 66, 240, 5};
-                fillRoundRect(g_ren, bar, 2, THEME.surfaceAlt);
-                if (p > 0) {
-                    const SDL_Rect fill{bar.x, bar.y, bar.w * p / 100, bar.h};
-                    fillRoundRect(g_ren, fill, 2, THEME.primary);
-                }
-            }
+            drawText(g_ren, "传输", SET_RC_X, card.y + 20, THEME.textDim, g_fontBS);
+            const int y = SET_TOGGLE_Y0;
+            const SDL_Rect row{SET_RC_X, y, SET_COL_W - SET_PAD * 2, 32};
+            if (g_hot == BTN_SET_HW || g_press == BTN_SET_HW)
+                fillRoundRect(g_ren, row, THEME.radius - 3, THEME.hover);
+            drawTextV(g_ren, "硬件加速", row.x, y + 16, THEME.text, g_font, ALIGN_LEFT);
+            drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24},
+                       g_cfg_edit.hw_accel != 0);
+            drawText(g_ren, fitText("优先使用可用的 GPU 编码器。",
+                                    g_fontS, SET_COL_W - SET_PAD * 2),
+                     SET_RC_X, y + 52, THEME.textDim, g_fontS);
+            drawText(g_ren, fitText("不可用时自动回退到软件编码。",
+                                    g_fontS, SET_COL_W - SET_PAD * 2),
+                     SET_RC_X, y + 76, THEME.textDim, g_fontS);
+            drawText(g_ren, "保存后应用；活动会话按现有通道更新。",
+                     SET_RC_X, y + 112, THEME.textDim, g_fontS);
         }
 
         } else {
@@ -5167,36 +5439,26 @@ static void renderScreen(int mousex, int mousey)
             {
                 const SDL_Rect card{BODY_X, SEC_SWITCH_Y, BODY_W, SEC_SWITCH_H};
                 drawCard(g_ren, card, CARD_R);
-                drawText(g_ren, "接收与启动", SEC_ROW_X, card.y + 18,
+                drawText(g_ren, "本次接收", SEC_ROW_X, card.y + 18,
                          THEME.textDim, g_fontBS);
-                static const char *kSwitch[3] = {"允许其他设备连接到此电脑",
-                                                 "启动软件时自动开启接收",
-                                                 "开机自启动"};
-                /* The first switch reflects the live service, not a stored
-                 * preference; the second is the next-launch preference; the
-                 * third registers the logon task (Windows only). */
-                const bool on[3] = {receiveRunning(),
-                                    g_cfg_edit.auto_receive != 0,
-                                    g_cfg_edit.auto_start != 0};
-                const int id[3] = {BTN_SET_ALLOW_RECV, BTN_SET_AUTORECV,
-                                   BTN_SET_AUTOSTART};
-                for (int i = 0; i < 3; i++) {
-                    const int y = SEC_TOGGLE_Y(i);
-                    if (g_hot == id[i] || g_press == id[i])
-                        fillRoundRect(g_ren, SDL_Rect{SEC_ROW_X, y, SEC_ROW_W, 32},
-                                      THEME.radius - 3, THEME.hover);
-                    drawTextV(g_ren, kSwitch[i], SEC_ROW_X + 4, y + 16, THEME.text,
-                              g_font, ALIGN_LEFT);
-                    drawToggle(g_ren,
-                               SDL_Rect{SEC_ROW_X + SEC_ROW_W - 48, y + 4, 44, 24},
-                               on[i]);
-                }
-                drawText(g_ren, "「开机自启动」只决定 Mivara 是否随 Windows 登录启动；",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 168, THEME.textDim, g_fontS);
-                drawText(g_ren, "「自动开启接收」只决定下次启动是否直接进入接收状态；",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 186, THEME.textDim, g_fontS);
-                drawText(g_ren, "上方接收开关只改变本次运行，不会修改这些偏好。",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 204, THEME.textDim, g_fontS);
+                const int y = SEC_TOGGLE_Y(0);
+                if (g_hot == BTN_SET_ALLOW_RECV || g_press == BTN_SET_ALLOW_RECV)
+                    fillRoundRect(g_ren, SDL_Rect{SEC_ROW_X, y, SEC_ROW_W, 32},
+                                  THEME.radius - 3, THEME.hover);
+                drawTextV(g_ren, "允许其他设备连接到此电脑", SEC_ROW_X + 4, y + 16,
+                          THEME.text, g_font, ALIGN_LEFT);
+                drawToggle(g_ren,
+                           SDL_Rect{SEC_ROW_X + SEC_ROW_W - 48, y + 4, 44, 24},
+                           receiveRunning());
+                drawText(g_ren, std::string("当前状态：") + recvStateLabel(g_recv_state),
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 98,
+                         recvStateColor(g_recv_state), g_fontS);
+                drawText(g_ren, "此开关立即启停接收，只改变本次运行，不写入配置。",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 140, THEME.textDim, g_fontS);
+                drawText(g_ren, "下次启动是否接收，以及是否随 Windows 登录启动，",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 164, THEME.textDim, g_fontS);
+                drawText(g_ren, "已移至「常规」页分别管理。",
+                         SEC_ROW_X + 4, SEC_SWITCH_Y + 188, THEME.textDim, g_fontS);
             }
 
             {
@@ -5241,7 +5503,8 @@ static void renderScreen(int mousex, int mousey)
                 const bool havePw = !g_cfg_edit.auth_hash.empty();
                 drawText(g_ren, havePw ? "已设置（4–8 个字符）" : "尚未设置",
                          SEC_ROW_X + 92, SEC_PW_ROW_Y,
-                         havePw ? THEME.textDim : THEME.danger, g_fontS);
+                         havePw ? THEME.textDim
+                                : (pwMode ? THEME.warning : THEME.textDim), g_fontS);
                 drawText(g_ren, "密码只用于连接准入，画面传输并未加密",
                          SEC_ROW_X + 4, SEC_PW_ROW_Y + 30, THEME.textDim, g_fontS);
                 if (cur == 0)
@@ -5252,28 +5515,13 @@ static void renderScreen(int mousex, int mousey)
             }
         }
 
-        /* ── 确定 / 恢复默认 / 返回会话 ─────────────────────────────────── */
+        /* ── 保存设置 / 恢复默认 / 返回会话 ─────────────────────────────── */
         break;
     }
     }
 
-    /* Modal last: it dims whatever screen is underneath, and the modal's own
-     * cells live in g_buttons, so they paint on top of the scrim. Exactly one
-     * dialog is painted — the same one topModal() gave buildButtons/onButton. */
-    switch (topModal()) {
-    case MODAL_AUTH:
-    case MODAL_PW:
-    case MODAL_SETPW:
-        drawAuthDialogs(g_ren);
-        break;
-    case MODAL_STITCH:
-        drawStitchSideDialog(g_ren);
-        break;
-    default:
-        break;
-    }
-
-    for (auto &b : g_buttons) drawButton(g_ren, b);
+    for (size_t i = 0; i < g_modal_button_begin && i < g_buttons.size(); i++)
+        drawButton(g_ren, g_buttons[i]);
 
     /* dot on the 设置 nav item while an update is pending */
     {
@@ -5286,6 +5534,23 @@ static void renderScreen(int mousex, int mousey)
             fillCircle(g_ren, NAV_ITEM_X + NAV_ITEM_W - 8, NAV_SET_Y + 22, 5);
         }
     }
+
+    switch (topModal()) {
+    case MODAL_AUTH:
+    case MODAL_PW:
+    case MODAL_SETPW:
+    case MODAL_DISCARD:
+        drawAuthDialogs(g_ren);
+        break;
+    case MODAL_STITCH:
+        drawStitchSideDialog(g_ren);
+        break;
+    default:
+        break;
+    }
+    for (size_t i = g_modal_button_begin; i < g_buttons.size(); i++)
+        drawButton(g_ren, g_buttons[i]);
+
     SDL_RenderPresent(g_ren);
 }
 
@@ -5335,6 +5600,14 @@ static void onButton(int id)
             chooseStitchSide(id - BTN_STITCH_SIDE_BASE);
         else if (id == BTN_STITCH_SIDE_CANCEL)
             g_stitch_ask.open = false;
+        return;
+    case MODAL_DISCARD:
+        if (id == BTN_DISCARD_KEEP) {
+            g_discard_open = false;
+        } else if (id == BTN_DISCARD_CONFIRM) {
+            g_discard_open = false;
+            cancelSettings(g_discard_to_home);
+        }
         return;
     default:
         break;
@@ -5390,8 +5663,8 @@ static void onButton(int id)
         const ThemeMode picked = kThemeIds[i].mode;
         themeSetMode(picked);
         /* Persist immediately: the header switcher is available on every
-         * screen, so requiring 确定 would make it look broken on the others.
-         * This mirrors 日志窗口 / 忽略此版本, the other instant side effects. */
+         * screen, so requiring 保存设置 would make it look broken elsewhere.
+         * 忽略此版本 is also immediate; 日志窗口 is a preview until saved. */
         g_cfg.theme = themeModeKey(picked);
         g_cfg_edit.theme = g_cfg.theme;
         configSave(g_cfg);
@@ -5400,10 +5673,12 @@ static void onButton(int id)
 
     switch (id) {
     case BTN_NAV_HOME:
-        setScreen(SCR_HOME);
+        if (g_screen == SCR_SETTINGS) requestLeaveSettings(true);
+        else                          setScreen(SCR_HOME);
         break;
     case BTN_RETURN_SESSION:
-        g_screen = resolveHomeScreen();
+        if (g_screen == SCR_SETTINGS) requestLeaveSettings(false);
+        else                          g_screen = resolveHomeScreen();
         break;
     case BTN_NAV_SETTINGS:
         /* Only re-snapshot when arriving from another screen. openSettings()
@@ -5432,16 +5707,19 @@ static void onButton(int id)
         break;
     case BTN_HOME_SENDER_STOP:
         stopSender();
-        g_child_mode = SEND_MIRROR;
-        g_status_note = "会话已结束";
+        g_status_note = std::string("已停止") + g_child_label;
+        g_status_tone = StatusTone::Info;
         setScreen(SCR_HOME);
         break;
 
     case BTN_RECV_STOP:
-        stopReceiver();              /* also returns to 主页 and clears state */
+        stopReceiver();
         break;
     case BTN_RECV_LOG:
         toggleLogWindow();
+        break;
+    case BTN_RECV_DETAILS:
+        g_recv_details_open = !g_recv_details_open;
         break;
 
     case BTN_SEARCH_CANCEL:
@@ -5458,6 +5736,7 @@ static void onButton(int id)
     case BTN_FOUND_MANUAL:
     case BTN_NF_MANUAL:
         g_manual_ip.clear();
+        g_manual_field_error = false;
         g_status_note.clear();
         SDL_StartTextInput();
         setScreen(SCR_MANUAL_IP);
@@ -5473,12 +5752,24 @@ static void onButton(int id)
 
     case BTN_MANUAL_CONNECT: {
         std::string ip = g_manual_ip;
-        if (ip.empty()) { g_status_note = "请输入 IP 地址"; break; }
-        if (!testTcpConnection(ip, 8081, 1500)) {
-            g_status_note = "无法连接 " + ip + ":8081";
+        if (ip.empty()) {
+            g_manual_field_error = true;
+            g_status_note = "请输入 IPv4 地址";
+            g_status_tone = StatusTone::Error;
             break;
         }
-        /* reuse the found-list screen with this single device */
+        if (!validIPv4Address(ip)) {
+            g_manual_field_error = true;
+            g_status_note = "请输入有效的 IPv4 地址，例如 192.168.1.105";
+            g_status_tone = StatusTone::Error;
+            break;
+        }
+        g_manual_field_error = false;
+        if (!testTcpConnection(ip, 8081, 1500)) {
+            g_status_note = "无法连接 " + ip + ":8081";
+            g_status_tone = StatusTone::Error;
+            break;
+        }
         {
             std::lock_guard<std::mutex> lk(g_dev_mtx);
             g_devices.clear();
@@ -5486,21 +5777,34 @@ static void onButton(int id)
         }
         SDL_StopTextInput();
         g_status_note.clear();
+        g_status_tone = StatusTone::Info;
         setScreen(SCR_FOUND);
         break;
     }
     case BTN_MANUAL_BACK:
         SDL_StopTextInput();
+        g_manual_field_error = false;
         g_status_note.clear();
         setScreen(SCR_HOME);
         break;
 
     case BTN_STREAM_STOP:
         stopSender();
+        g_status_note = std::string("已停止") + g_child_label;
+        g_status_tone = StatusTone::Info;
         setScreen(SCR_HOME);
         break;
     case BTN_STREAM_LOG:
         toggleLogWindow();
+        break;
+    case BTN_STREAM_DETAILS:
+        g_details_open = !g_details_open;
+        break;
+    case BTN_STREAM_RETRY:
+        startSendMode(g_last_ip, g_last_port, g_child_mode, g_last_name);
+        break;
+    case BTN_STREAM_BACK:
+        setScreen(SCR_HOME);
         break;
 
     /* settings */
@@ -5548,11 +5852,12 @@ static void onButton(int id)
         break;
     case BTN_SET_TAB_BASE:
     case BTN_SET_TAB_BASE + 1:
+    case BTN_SET_TAB_BASE + 2:
         g_set_tab = id - BTN_SET_TAB_BASE;
         break;
     case BTN_SET_ALLOW_RECV: {
         /* The switch is the live run state: start/stop now, and stay on this
-         * settings page. 确定 later only reloads the policy of a running
+         * settings page. 保存设置 later only reloads the policy of a running
          * receiver; it never starts or stops one. */
         const Screen keep = g_screen;
         const Screen keep_session = g_session_screen;
@@ -5568,7 +5873,7 @@ static void onButton(int id)
         const int idx = id - BTN_SET_POLICY_OPEN;
         g_cfg_edit.auth_mode = kAuthModeKey[idx];
         /* 密码 mode without a record is not a usable policy: open the editor
-         * now rather than letting 确定 fail later. */
+         * now rather than letting 保存设置 fail later. */
         if (idx == 1 && g_cfg_edit.auth_hash.empty()) openSetPwAsk();
         break;
     }
@@ -5577,7 +5882,7 @@ static void onButton(int id)
         break;
     case BTN_HOME_RECV_SETTINGS:
         openSettings();
-        g_set_tab = 1;
+        g_set_tab = 2;
         break;
     case BTN_SET_AUTOCHECK:
         g_cfg_edit.auto_check_update = !g_cfg_edit.auto_check_update;
@@ -5649,7 +5954,7 @@ static void onButton(int id)
                 mivaraAuthRecordUsable(hash, salt,
                                        (uint32_t)g_cfg_edit.auth_iter, &why);
             if (!ok) {
-                g_set_tab = 1;
+                g_set_tab = 2;
                 g_status_note = "请先设置连接密码，再启用「仅允许密码连接」";
                 break;
             }
@@ -5658,14 +5963,20 @@ static void onButton(int id)
         const int had = g_cfg.auto_start ? 1 : 0;
         /* Update metadata is runtime state, not a user setting: preserve it
          * across the working-copy commit (else the 24h throttle and the
-         * ignored-version filter would be silently reset on every 确定). */
-        const long long   keep_last = g_cfg.last_update_check;
-        const std::string keep_ign  = g_cfg.ignored_version;
-        g_cfg = g_cfg_edit;
-        g_cfg.last_update_check = keep_last;
-        g_cfg.ignored_version   = keep_ign;
-        configSave(g_cfg);
-        /* 授权方式：确定只做策略热更新。接收的启动/停止由「允许其他设备连接」
+         * ignored-version filter would be silently reset on every save). */
+        AppConfig next = g_cfg_edit;
+        next.last_update_check = g_cfg.last_update_check;
+        next.ignored_version = g_cfg.ignored_version;
+        next.tray_hint_shown = g_cfg.tray_hint_shown;
+        if (!configSave(next)) {
+            g_status_note = "无法写入配置文件，修改尚未保存；请检查目录权限后重试";
+            g_status_tone = StatusTone::Error;
+            break;
+        }
+        g_cfg = next;
+        g_status_note.clear();
+        g_status_tone = StatusTone::Success;
+        /* 授权方式：保存设置只做策略热更新。接收的启动/停止由「允许其他设备连接」
          * 开关立即完成，这里绝不隐式启动或停止服务；已建立的会话不受影响。 */
         {
             std::lock_guard<std::mutex> lk(g_recv_mtx);
@@ -5688,7 +5999,10 @@ static void onButton(int id)
             if (now != (want != 0)) {
                 g_cfg.auto_start = now ? 1 : 0;
                 g_cfg_edit.auto_start = g_cfg.auto_start;
-                configSave(g_cfg);
+                if (!configSave(g_cfg)) {
+                    g_status_note += "；实际状态无法写入配置";
+                    reloadFailed = true;
+                }
 #ifdef _WIN32
                 g_status_note = want ? "开机自启动注册失败（计划任务）"
                                      : "开机自启动取消失败（计划任务）";
@@ -5717,6 +6031,7 @@ static void onButton(int id)
                         g_status_note = "参数已更新";
                     } else {
                         g_status_note = "参数未生效：发送进程无响应";
+                        reloadFailed = true;
                     }
                 } else {
                     /* Console-mode child has no stdin channel – restart the
@@ -5731,16 +6046,23 @@ static void onButton(int id)
                 }
             }
         }
+        if (reloadFailed) {
+            g_status_tone = StatusTone::Error;
+            g_screen = SCR_SETTINGS;
+            break;
+        }
         g_screen = resolveHomeScreen();
         break;
     }
+    case BTN_SET_CANCEL:
+        cancelSettings(false);
+        break;
     case BTN_SET_RESET:
-        g_cfg_edit = AppConfig{};          /* theme defaults to "system" */
-        /* The appearance applies instantly everywhere else (header switcher),
-         * so applying it here too keeps 恢复默认 from looking half-done. */
+        g_cfg_edit = AppConfig{};
         themeSetMode(ThemeMode::System);
-        g_cfg.theme = "system";
-        configSave(g_cfg);
+        if (g_log_open) closeLogWindow();
+        g_status_note = "已恢复默认值，保存后生效";
+        g_status_tone = StatusTone::Info;
         break;
 
     case BTN_HIST_CLEAR:
@@ -5820,7 +6142,7 @@ int main(int argc, char *argv[])
          * sub-pixel offset. */
         g_uiScale = (float)std::lround((double)g_uiScale * 4.0) / 4.0f;
         /* The layout is fixed, so scaling must never push the window past the
-         * screen: at 125% on a 768-tall panel the bottom row (确定 / 退出)
+         * screen: at 125% on a 768-tall panel the bottom row (保存设置 / 取消)
          * would land off-screen with no way to reach it. Round DOWN to the
          * previous quarter step, and never below 1:1 — an unscaled 880x700
          * window is the most this layout can promise. */
@@ -5887,6 +6209,7 @@ int main(int argc, char *argv[])
         SDL_Quit();
         return 1;
     }
+    applyMivaraWindowIcon(g_win);
     /* Required by fillRoundRect: the tint chips, hairlines and the stacked
      * drop shadow all rely on SDL honouring the alpha channel. */
     SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
@@ -5978,7 +6301,10 @@ int main(int argc, char *argv[])
                 } else if (ev.button.windowID == SDL_GetWindowID(g_win)) {
                     g_press = BTN_NONE;
                     SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
-                    for (auto &b : g_buttons) {
+                    const bool modal = (topModal() != MODAL_NONE);
+                    for (size_t i = 0; i < g_buttons.size(); i++) {
+                        const Button &b = g_buttons[i];
+                        if (!b.enabled || (modal && i < g_modal_button_begin)) continue;
                         if (SDL_PointInRect(&p, &b.rect)) { g_press = b.id; break; }
                     }
                 }
@@ -5988,7 +6314,10 @@ int main(int argc, char *argv[])
                 if (ev.button.windowID == SDL_GetWindowID(g_win)) {
                     SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
                     int hit = BTN_NONE;
-                    for (auto &b : g_buttons) {
+                    const bool modal = (topModal() != MODAL_NONE);
+                    for (size_t i = 0; i < g_buttons.size(); i++) {
+                        const Button &b = g_buttons[i];
+                        if (!b.enabled || (modal && i < g_modal_button_begin)) continue;
                         if (SDL_PointInRect(&p, &b.rect)) { hit = b.id; break; }
                     }
                     if (g_press != BTN_NONE && hit == g_press) onButton(g_press);
@@ -6005,6 +6334,8 @@ int main(int argc, char *argv[])
                                         g_pw_ask.error);
                 } else if (topModal() == MODAL_NONE &&
                            g_screen == SCR_MANUAL_IP) {
+                    g_manual_field_error = false;
+                    g_status_note.clear();
                     for (const char *c = ev.text.text; *c; c++) {
                         if ((isdigit((unsigned char)*c) || *c == '.') &&
                             g_manual_ip.size() < 15)
@@ -6062,28 +6393,33 @@ int main(int argc, char *argv[])
                 }
                 if (modal == MODAL_STITCH) {
                     if (ev.key.keysym.sym == SDLK_ESCAPE)
-                        g_stitch_ask.open = false;   /* dismiss the chooser */
+                        g_stitch_ask.open = false;
+                    continue;
+                }
+                if (modal == MODAL_DISCARD) {
+                    if (ev.key.keysym.sym == SDLK_ESCAPE)
+                        g_discard_open = false;
                     continue;
                 }
                 if (ev.key.keysym.sym == SDLK_ESCAPE) {
                     if (g_screen == SCR_MANUAL_IP) {
                         SDL_StopTextInput();
+                        g_manual_field_error = false;
+                        g_status_note.clear();
+                        g_status_tone = StatusTone::Info;
                         setScreen(SCR_HOME);
                     } else if (g_screen == SCR_SETTINGS) {
-                        g_screen = resolveHomeScreen();
-                    } else if (g_screen == SCR_STREAMING) {
-                        stopSender();
-                        setScreen(SCR_HOME);
-                    } else if (g_screen == SCR_RECEIVING) {
-                        stopReceiver();      /* single stop path; also goes home */
+                        requestLeaveSettings(false);
                     } else if (g_screen != SCR_HOME) {
+                        /* Session screens return to Home without stopping the
+                         * child; stopping stays an explicit button action. */
                         setScreen(SCR_HOME);
-                    } else {
-                        requestQuit();      /* ESC on 主页: ask, then exit */
                     }
                 }
                 else if (g_screen == SCR_MANUAL_IP &&
                          ev.key.keysym.sym == SDLK_BACKSPACE) {
+                    g_manual_field_error = false;
+                    g_status_note.clear();
                     if (!g_manual_ip.empty()) g_manual_ip.pop_back();
                 }
                 else if (g_screen == SCR_MANUAL_IP &&
@@ -6148,14 +6484,8 @@ int main(int argc, char *argv[])
 
         /* child exit tracking */
         if (g_sender.active && childExited(g_sender, "sender")) {
-            /* childExited() joined the reader, so every final STAT line is
-             * queued; apply them now or the last error is missed. */
             drainChildStats();
             g_child_extend = false;
-            g_child_mode = SEND_MIRROR;
-            /* Keep the sender's last failure visible: the streaming panel is
-             * gone by the time the user reaches Home, and "会话已结束" alone
-             * would hide a wrong password or a busy peer. */
             std::string err;
             {
                 std::lock_guard<std::mutex> lk(g_stats_mtx);
@@ -6163,20 +6493,21 @@ int main(int argc, char *argv[])
                     !g_stats.msg.empty())
                     err = g_stats.msg;
             }
-            /* The connection phase must not outlive the child either: a dead
-             * sender can never be "正在投屏" or "等待授权". */
+            if (g_sender_stop_requested) err.clear();
             g_send_phase = err.empty() ? SP_IDLE : SP_FAILED;
             g_auth_wait_note.clear();
-            if (g_screen == SCR_STREAMING) {
-                g_status_note = err.empty()
-                                    ? "会话已结束"
+            if (!err.empty()) {
+                g_status_note = (g_screen == SCR_STREAMING)
+                                    ? senderErrorText(err)
                                     : "连接失败：" + senderErrorText(err);
-                setScreen(SCR_HOME);
-            } else if (!err.empty()) {
-                g_status_note = "连接失败：" + senderErrorText(err);
+                g_status_tone = StatusTone::Error;
+            } else {
+                g_status_note = "会话已结束";
+                g_status_tone = StatusTone::Info;
+                if (g_screen == SCR_STREAMING) setScreen(SCR_HOME);
             }
             if (g_hidden)
-                trayNotify("会话已结束", err.empty() ? "投屏会话已结束，单击托盘图标查看"
+                trayNotify("会话已结束", err.empty() ? "会话已结束，单击托盘图标查看"
                                                      : senderErrorText(err));
         }
         if (g_receiver.active && childExited(g_receiver, "receiver")) {
@@ -6239,7 +6570,10 @@ int main(int argc, char *argv[])
             my = uiCoord(my);
         }
         g_hot = BTN_NONE;
-        for (auto &b : g_buttons) {
+        const bool modal = (topModal() != MODAL_NONE);
+        for (size_t i = 0; i < g_buttons.size(); i++) {
+            const Button &b = g_buttons[i];
+            if (!b.enabled || (modal && i < g_modal_button_begin)) continue;
             if (mx >= b.rect.x && mx < b.rect.x + b.rect.w &&
                 my >= b.rect.y && my < b.rect.y + b.rect.h) {
                 g_hot = b.id;

@@ -21,6 +21,7 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
 OutputBaseFilename=Mivara-Setup-{#AppVersion}
+SetupIconFile=..\res\mivara.ico
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible

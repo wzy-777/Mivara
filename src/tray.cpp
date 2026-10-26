@@ -223,7 +223,8 @@ void threadMain()
     NOTIFYICONDATAW nid = makeIcon(hwnd);
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kMsgCallback;
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    nid.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    if (!nid.hIcon) nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     {
         std::lock_guard<std::mutex> lk(g_tip_mtx);
         copyTip(nid.szTip, g_tip);

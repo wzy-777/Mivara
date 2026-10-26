@@ -1,2 +1,5 @@
+/* Original B application icon (RT_ICON = type 3, id 1). */
+1 ICON "mivara.ico"
+
 /* Embed the requireAdministrator manifest (RT_MANIFEST = type 24, id 1). */
 1 24 "admin.manifest"

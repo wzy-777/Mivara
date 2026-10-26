@@ -6,7 +6,7 @@
 
 把局域网里的任意一台电脑变成你的第二块屏幕。发送端采集画面并推流，接收端全屏显示；扩展模式下，系统里会多出一块真实的虚拟显示器，窗口和鼠标可以直接拖过去。
 
-[![Version](https://img.shields.io/badge/version-0.11.1-blue)](https://github.com/wzy-777/Mivara)
+[![Version](https://img.shields.io/badge/version-0.11.2-blue)](https://github.com/wzy-777/Mivara)
 [![下载最新安装包](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#环境要求)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#环境要求)
@@ -35,7 +35,7 @@
 
 1. 下载 [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)（也可以到 [Releases](https://github.com/wzy-777/Mivara/releases) 选择版本）。
 2. 双击安装。安装包未做代码签名，可能出现 SmartScreen 提示，见[下文](#windows-smartscreen-提示说明)。
-3. 接收端打开 Mivara，在主页底部的接收状态栏点「开启接收」；发送端点「连接设备」，选择设备后点「投屏」「扩展」或「拼接」（拼接需要两端都是 Windows，详见[使用指南](docs/zh/usage.md#拼接软件-kvm)）。新安装默认「每次手动授权」，接收端会弹窗让你选择「允许一次」或「拒绝」；可在「设置 → 接收与安全」改为「仅允许密码连接」或「允许任意连接」。
+3. 接收端打开 Mivara，在主页的接收状态栏点「开启接收」；发送端点「连接设备」，选择设备后点「投屏」「扩展」或「拼接」（拼接需要两端都是 Windows，详见[使用指南](docs/zh/usage.md#拼接软件-kvm)）。新安装默认「每次手动授权」，接收端会弹窗让你选择「允许一次」或「拒绝」；可在「设置 → 接收与安全」改为「仅允许密码连接」或「允许任意连接」。
 
 > 扩展模式需要安装一次虚拟显示器驱动，详见[虚拟显示器驱动](docs/zh/virtual-display.md)。
 

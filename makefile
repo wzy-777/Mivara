@@ -207,9 +207,9 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp | $(BUILDDIR)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# requireAdministrator manifest resource (Windows only; RES_ADMIN empty elsewhere)
+# requireAdministrator manifest + application icon (Windows only; empty elsewhere)
 ifneq ($(RES_ADMIN),)
-$(RES_ADMIN): res/admin.rc res/admin.manifest | $(BUILDDIR)
+$(RES_ADMIN): res/admin.rc res/admin.manifest res/mivara.ico | $(BUILDDIR)
 	windres res/admin.rc -O coff -o $@
 endif
 
@@ -237,7 +237,7 @@ $(OBJ_AUTH): $(SRCDIR)/auth.h
 $(OBJ_TRAY): $(SRCDIR)/tray.h
 $(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
 $(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h $(SRCDIR)/logo_icon.h
 
 # ============================================================================
 # TARGET LINKING
@@ -331,14 +331,17 @@ check:
                kvm.cpp kvm.h \
                config.cpp config.h history.cpp history.h \
 	               update.cpp update.h version.h theme.cpp theme.h \
-               auth.cpp auth.h tray.cpp tray.h; do \
+               auth.cpp auth.h tray.cpp tray.h logo_icon.h; do \
         if [ -f $(SRCDIR)/$$f ]; then \
             echo "    OK  $$f"; \
         else \
             echo "    MISSING  $$f"; \
         fi; \
     done
-	@for f in res/admin.rc res/admin.manifest; do \
+	@for f in res/admin.rc res/admin.manifest \
+	           res/mivara-mark.svg res/mivara-app.svg \
+	           res/mivara-16.png res/mivara-32.png \
+	           res/mivara-48.png res/mivara-256.png res/mivara.ico; do \
         if [ -f $$f ]; then \
             echo "    OK  $$f"; \
         else \

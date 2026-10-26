@@ -6,7 +6,7 @@
 
 Turn any computer on your LAN into a second screen. The sender captures and streams its display; the receiver shows it fullscreen. In extend mode the system gains a real virtual display, so windows and the mouse can move straight onto it.
 
-[![Version](https://img.shields.io/badge/version-0.11.1-blue)](https://github.com/wzy-777/Mivara)
+[![Version](https://img.shields.io/badge/version-0.11.2-blue)](https://github.com/wzy-777/Mivara)
 [![Download Latest Installer](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#requirements)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#requirements)
@@ -35,7 +35,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 1. Download [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe) (or pick a version from [Releases](https://github.com/wzy-777/Mivara/releases)).
 2. Run the installer. It is not code-signed, so SmartScreen may prompt — see [below](#windows-smartscreen-notice).
-3. On the receiver, open Mivara and click "Start receiving" in the receive status bar at the bottom of Home; on the sender click "Connect device", pick a device, then choose "Cast", "Extend" or "Stitch" (stitch needs Windows on both ends — see the [User Guide](docs/en/usage.md#stitch-software-kvm)). New installs default to manual approval, so the receiver asks you to "Allow once" or "Deny"; change this under Settings → Receiving & Security to "Password only" or "Allow any connection".
+3. On the receiver, open Mivara and click "Start receiving" in the Home receive status bar; on the sender click "Connect device", pick a device, then choose "Cast", "Extend" or "Stitch" (stitch needs Windows on both ends — see the [User Guide](docs/en/usage.md#stitch-software-kvm)). New installs default to manual approval, so the receiver asks you to "Allow once" or "Deny"; change this under Settings → Receiving & Security to "Password only" or "Allow any connection".
 
 > Extend mode requires the virtual display driver to be installed once — see [Virtual Display Driver](docs/en/virtual-display.md).
 
