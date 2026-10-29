@@ -36,6 +36,10 @@ step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32mok\033[0m  %s\n' "$*"; }
 warn() { printf '    \033[33m!\033[0m   %s\n' "$*" >&2; }
 die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+timeout_cmd() {
+  local d="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$d" "$@"; else "$@"; fi
+}
 
 usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
@@ -76,27 +80,81 @@ detect_gh() {
   if command -v gh >/dev/null 2>&1; then command -v gh; return; fi
   for p in "/c/Program Files/GitHub CLI/gh.exe" "/c/Program Files/GitHub CLI/gh" \
            "/c/Program Files (x86)/GitHub CLI/gh.exe" \
-           "/usr/local/bin/gh" "/opt/homebrew/bin/gh"; do
+           "/usr/bin/gh" "/usr/local/bin/gh" "/opt/homebrew/bin/gh"; do
     if [ -x "$p" ]; then printf '%s' "$p"; return; fi
   done
+  if [ -n "${LOCALAPPDATA:-}" ]; then
+    local appdata
+    appdata="$(cygpath -u "$LOCALAPPDATA" 2>/dev/null || printf '%s' "$LOCALAPPDATA")"
+    for p in "$appdata"/Microsoft/WinGet/Links/gh.exe \
+             "$appdata"/Microsoft/WinGet/Packages/GitHub.cli_*/bin/gh.exe \
+             "$appdata"/Programs/GitHub\ CLI/gh.exe; do
+      if [ -x "$p" ]; then printf '%s' "$p"; return; fi
+    done
+  fi
 }
 GH_BIN="$(detect_gh)"
 [ -n "$GH_BIN" ] || die "找不到 gh CLI（设置 GH=/path/to/gh）"
 gh() { "$GH_BIN" "$@"; }
 
-# Read-only calls retry: this network drops connections regularly.
+# Reuse Git Credential Manager's github.com token when gh itself has no login.
+if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+  if ! timeout_cmd 30 "$GH_BIN" auth status >/dev/null 2>&1; then
+    # Touch the remote first so GCM refreshes an expired stored token.
+    timeout_cmd 60 git ls-remote --heads "https://github.com/$WINGET_REPO.git" >/dev/null 2>&1 || true
+    GCM_TOKEN="$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null \
+                   | sed -n 's/^password=//p' || true)"
+    [ -n "$GCM_TOKEN" ] && export GH_TOKEN="$GCM_TOKEN"
+  fi
+fi
+
+# Read-only calls retry with backoff: this network drops connections regularly.
 read_gh() {
-  local n=0
-  until gh "$@"; do
+  local n=0 delay=2
+  until timeout_cmd 60 "$GH_BIN" "$@"; do
     n=$((n + 1))
-    [ "$n" -ge 3 ] && return 1
-    sleep 2
+    [ "$n" -ge 4 ] && return 1
+    sleep "$delay"
+    delay=$((delay * 2))
   done
 }
 read_api() { read_gh api "$@"; }
 
+# Write calls retry only on transient GitHub failures (429 from gitmon, 5xx,
+# dropped connections), never on validation errors. Output is captured, so the
+# caller can still use --jq; stderr stays out of the JSON.
+write_gh() {
+  local n=0 errf out err
+  errf="$(mktemp)"
+  while :; do
+    if out="$(gh "$@" 2>"$errf")"; then
+      rm -f "$errf"
+      printf '%s' "$out"
+      return 0
+    fi
+    err="$(cat "$errf")"
+    n=$((n + 1))
+    case "$err" in
+      *"HTTP 429"*|*"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*|*"HTTP 504"*|*"fail-fast:network"*|*"TLS handshake timeout"*|*"connection reset"*|*"Recv failure"*)
+        if [ "$n" -ge 4 ]; then
+          rm -f "$errf"
+          printf '%s\n' "$err" >&2
+          return 1
+        fi
+        warn "GitHub API 暂时失败，$((n * 10)) 秒后重试"
+        sleep $((n * 10))
+        ;;
+      *)
+        rm -f "$errf"
+        printf '%s\n' "$err" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
 step "预检"
-gh auth status >/dev/null 2>&1 || die "gh 未登录（gh auth login）"
+read_gh auth status >/dev/null 2>&1 || die "gh 未登录或 API 不可达（gh auth login，或设置 GH_TOKEN）"
 GH_USER="$(read_api user --jq .login)" || die "无法获取 gh 账号"
 ok "gh 账号 $GH_USER"
 
@@ -204,6 +262,8 @@ HEAD_DIRS=()
 if [ -n "$OPEN_PR" ]; then
   if out="$(read_api "repos/$FORK/contents/$PKG_PATH?ref=$BRANCH" --jq '.[] | select(.type == "dir") | .name' 2>/dev/null)"; then
     while IFS= read -r v; do [ -n "$v" ] && HEAD_DIRS+=("$v"); done <<< "$out"
+  else
+    warn "无法读取 PR 分支内容（API 连续失败），按「需要更新」处理"
   fi
 fi
 
@@ -225,6 +285,8 @@ if [ -n "$OPEN_PR" ]; then
     declare -A REMOTE_SUM=()
     if out="$(read_api "repos/$FORK/contents/$PKG_PATH/$VER?ref=$BRANCH" --jq '.[] | [.name, .sha] | @tsv' 2>/dev/null)"; then
       while IFS=$'\t' read -r n s; do [ -n "$n" ] && REMOTE_SUM["$n"]="$s"; done <<< "$out"
+    else
+      warn "无法读取分支上的 $VER 清单（API 连续失败），按「需要更新」处理"
     fi
     [ "${#REMOTE_SUM[@]}" -eq 3 ] || UP_TO_DATE=0
     for f in "${files[@]}"; do
@@ -290,7 +352,7 @@ if [ "$CHANGES" = 1 ]; then
   # Additions: one blob per manifest (GitHub dedups identical content).
   for f in "${files[@]}"; do
     b64="$(base64 < "$f" | tr -d '\n')"
-    blob="$(gh api -X POST "repos/$FORK/git/blobs" \
+    blob="$(write_gh api -X POST "repos/$FORK/git/blobs" \
               -f content="$b64" -f encoding=base64 --jq .sha)"
     [ -n "$blob" ] || die "创建 blob 失败: $f"
     entries+=("{\"path\": \"$PKG_PATH/$VER/$(basename "$f")\", \"mode\": \"100644\", \"type\": \"blob\", \"sha\": \"$blob\"}")
@@ -307,7 +369,7 @@ if [ "$CHANGES" = 1 ]; then
     printf '\n  ]\n}\n'
   } > "$TMP/tree.json"
 
-  TREE_SHA="$(gh api -X POST "repos/$FORK/git/trees" \
+  TREE_SHA="$(write_gh api -X POST "repos/$FORK/git/trees" \
                 --input "$TMP/tree.json" --jq .sha)"
   [ -n "$TREE_SHA" ] || die "创建 tree 失败"
 
@@ -321,21 +383,21 @@ if [ "$CHANGES" = 1 ]; then
       "$COMMIT_MSG" "$TREE_SHA" "$BASE_SHA"
   } > "$TMP/commit.json"
 
-  NEW_SHA="$(gh api -X POST "repos/$FORK/git/commits" \
+  NEW_SHA="$(write_gh api -X POST "repos/$FORK/git/commits" \
                --input "$TMP/commit.json" --jq .sha)"
   [ -n "$NEW_SHA" ] || die "创建 commit 失败"
   ok "commit ${NEW_SHA:0:7} — $COMMIT_MSG"
 
   if [ -n "$OPEN_PR" ]; then
-    gh api -X PATCH "repos/$FORK/git/refs/heads/$BRANCH" \
+    write_gh api -X PATCH "repos/$FORK/git/refs/heads/$BRANCH" \
       -f sha="$NEW_SHA" >/dev/null || die "更新分支 $BRANCH 失败"
     ok "已推送 $BRANCH（PR #$OPEN_PR 会自动带上这个提交）"
   elif read_api "repos/$FORK/git/ref/heads/$BRANCH" --jq .object.sha >/dev/null 2>&1; then
-    gh api -X PATCH "repos/$FORK/git/refs/heads/$BRANCH" \
+    write_gh api -X PATCH "repos/$FORK/git/refs/heads/$BRANCH" \
       -f sha="$NEW_SHA" >/dev/null || die "更新分支 $BRANCH 失败"
     ok "已更新分支 $BRANCH"
   else
-    gh api -X POST "repos/$FORK/git/refs" \
+    write_gh api -X POST "repos/$FORK/git/refs" \
       -f ref="refs/heads/$BRANCH" -f sha="$NEW_SHA" >/dev/null \
       || die "创建分支 $BRANCH 失败"
     ok "已创建分支 $BRANCH"
@@ -362,8 +424,12 @@ else
   step "更新 PR"
   CUR_TITLE="$(read_api "repos/$WINGET_REPO/pulls/$OPEN_PR" --jq .title)"
   if [ "$CUR_TITLE" != "$TITLE" ]; then
-    gh pr edit "$OPEN_PR" --repo "$WINGET_REPO" --title "$TITLE" >/dev/null \
-      || die "更新 PR 标题失败"
+    # `gh pr edit` uses GraphQL and asks for read:org on the repository owner,
+    # which a GCM token scoped to gist/repo/workflow does not have. The REST
+    # PATCH needs only repo scope.
+    write_gh api -X PATCH "repos/$WINGET_REPO/pulls/$OPEN_PR" \
+      -f title="$TITLE" >/dev/null \
+      || die "更新 PR 标题失败（REST PATCH）"
     ok "标题 → $TITLE"
   fi
   if [ "$CHANGES" = 1 ]; then
@@ -372,7 +438,7 @@ else
     else
       COMMENT="Updated to $VER (commit ${NEW_SHA:0:7}). Installer SHA-256 ($HASH) matches the v$VER GitHub release asset digest."
     fi
-    gh pr comment "$OPEN_PR" --repo "$WINGET_REPO" --body "$COMMENT" >/dev/null \
+    write_gh pr comment "$OPEN_PR" --repo "$WINGET_REPO" --body "$COMMENT" >/dev/null \
       || die "发表更新说明失败"
     ok "已在 PR 里说明本次更新"
   fi
