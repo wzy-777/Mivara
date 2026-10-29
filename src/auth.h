@@ -37,6 +37,18 @@
 /** SHA-256 of one buffer. */
 void mivaraSha256(const void *data, size_t len, uint8_t out[32]);
 
+/** Incremental SHA-256 for streaming a file through the drop channel.
+ *  The context is plain data; the caller owns it. Do not copy it mid-stream. */
+struct MivaraSha256Ctx {
+    uint32_t h[8];
+    uint64_t total;          /* bytes hashed so far */
+    uint8_t  buf[64];
+    size_t   buflen;
+};
+void mivaraSha256Init(MivaraSha256Ctx *c);
+void mivaraSha256Update(MivaraSha256Ctx *c, const void *data, size_t len);
+void mivaraSha256Final(MivaraSha256Ctx *c, uint8_t out[32]);
+
 /** HMAC-SHA256 (RFC 2104). */
 void mivaraHmacSha256(const uint8_t *key, size_t key_len,
                       const void *data, size_t len, uint8_t out[32]);

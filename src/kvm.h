@@ -102,7 +102,14 @@ enum KvmEventType : uint32_t {
     KVM_EV_KEY         = 4,   /* a = down, b = vk, c = scan | ext << 16    */
     KVM_EV_RELEASE_ALL = 5,   /* release every key/button held on the target */
     KVM_EV_PING        = 6,   /* negotiated heartbeat; empty payload         */
-    KVM_EV_PONG        = 7    /* reply to PING; never sent to older peers    */
+    KVM_EV_PONG        = 7,   /* reply to PING; never sent to older peers    */
+    /* Target → controller, only when the controller set
+     * KVM_FEATURE_FILE_DROP in KvmHello.reserved[1] and the target accepted:
+     * one marker (a='MVKX', b=version, c=token word count = 8) followed by
+     * eight frames whose b holds one 32-bit token word. The controller reads
+     * this fixed sequence before it starts drainLoop(), so no variable-length
+     * frame ever enters the 16-byte event stream. */
+    KVM_EV_DROP_INFO   = 8
 };
 
 /* Where the peer sits relative to the controller. KVM_SIDE_RIGHT is the
@@ -174,6 +181,12 @@ struct KvmTargetAuth {
      *  hung up (present it as intptr_t; it is a SOCKET on Windows). */
     KvmApprovalResult (*approve)(const char *ip, const char *device,
                                  intptr_t client, void *ctx);
+    /** 1 = offer the 8085 file-drop capability to an authorized controller.
+     *  The token is still generated per session and the 8085 listener must be
+     *  up; this only says the user allowed receiving files. */
+    /* Written by the receiver's stdin/policy thread (RX|reload) and read by
+     * the 8084 session thread. */
+    std::atomic<int> accept_files{0};
     void *ctx = nullptr;
 };
 
@@ -197,6 +210,9 @@ struct KvmClientAuth {
      *  "waiting" | "need_password" | "authenticating" | "granted" |
      *  "cancelled". Must not include the password. */
     void (*report)(const char *state, const char *extra, void *ctx);
+    /** 1 = capture dragged files at the shared edge and offer the 8085 file
+     *  drop to the target. The sender sets this from --file-drop. */
+    int file_drop = 0;
     void *ctx = nullptr;
 };
 

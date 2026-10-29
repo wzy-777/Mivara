@@ -57,6 +57,7 @@
 #include "auth.h"
 #include "config.h"
 #include "discover.h"
+#include "drop.h"
 #include "gpu_accelerate.h"
 #include "kvm.h"
 #include "ports.h"
@@ -391,8 +392,17 @@ struct RxPolicy
     uint8_t  hash[32] = {};
     uint32_t iter = 0;
     bool     record_ok = false;   /* password mode: record present + valid */
+    bool     accept_files = false;/* stitch: offer the 8085 file-drop channel */
     std::string why;              /* diagnostic when !record_ok */
 };
+
+/* Written by applyPolicy and read by the 8084 session thread. */
+static bool kvmPolicyHook(MivaraAuthMode *mode, uint8_t salt[16],
+                          uint8_t hash[32], uint32_t *iterations,
+                          bool *record_ok, void *ctx);
+static KvmApprovalResult kvmApproveHook(const char *ip, const char *device,
+                                        intptr_t client, void *ctx);
+static KvmTargetAuth g_kvm_auth = {kvmPolicyHook, kvmApproveHook, 0, nullptr};
 
 static std::mutex g_policy_mtx;
 static RxPolicy g_policy;
@@ -554,6 +564,13 @@ static void emitRxStat(const char *event, const std::string &extra)
     std::cout << "\n" << std::flush;
 }
 
+/* The 8085 worker writes its own machine-readable lines. */
+static void dropStatSink(const char *line)
+{
+    std::lock_guard<std::mutex> lk(g_stat_mtx);
+    std::cout << "STAT|" << line << "\n" << std::flush;
+}
+
 /* ── authorization policy ────────────────────────────────────────────────── */
 
 /* Load config.ini and derive the policy. A missing/unknown mode is manual
@@ -571,6 +588,7 @@ static RxPolicy loadPolicyFromConfig()
         mode = MIVARA_AUTH_MANUAL;          /* unknown key → manual */
     p.mode = mode;
     p.iter = (uint32_t)cfg.auth_iter;
+    p.accept_files = cfg.file_drop_accept != 0;
 
     if (mode == MIVARA_AUTH_PASSWORD) {
         uint8_t salt[16] = {}, hash[32] = {};
@@ -608,6 +626,8 @@ static void applyPolicy(const RxPolicy &p, bool announce_error = true)
         std::lock_guard<std::mutex> lk(g_policy_mtx);
         g_policy = p;
     }
+    g_kvm_auth.accept_files.store(p.accept_files ? 1 : 0,
+                                  std::memory_order_relaxed);
     emitRxStat("policy", std::string("mode=") + policyKey(p) +
                              (p.mode == MIVARA_AUTH_PASSWORD
                                   ? (p.record_ok ? "|record=ok" : "|record=bad")
@@ -1042,10 +1062,6 @@ static KvmApprovalResult kvmApproveHook(const char *ip, const char *device,
     default:                 return KVM_APPROVAL_FAILED;
     }
 }
-
-static const KvmTargetAuth g_kvm_auth = {kvmPolicyHook, kvmApproveHook,
-                                         nullptr};
-
 
 /* SSDP friendly name: this machine's hostname (fallback "Mivara"). */
 static std::string localHostName()
@@ -2414,9 +2430,14 @@ int main(int argc, char* argv[])
     sigaction(SIGTERM, &sa, nullptr);
 #endif
 
-    for (int i = 1; i < argc; i++)
+    int cli_accept_files = -1;
+    for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--gui") == 0)
             g_gui_mode = true;
+        else if (std::strcmp(argv[i], "--accept-files") == 0 &&
+                 i + 1 < argc)
+            cli_accept_files = (std::atoi(argv[++i]) != 0) ? 1 : 0;
+    }
 
     queryMyDisplaySize();
 
@@ -2438,6 +2459,10 @@ int main(int argc, char* argv[])
     /* Connection policy from config.ini (never argv: see auth.h). The
      * auth_config error is deferred until after ready (issue 8). */
     applyPolicy(loadPolicyFromConfig(), false);
+    if (cli_accept_files >= 0)
+        g_kvm_auth.accept_files.store(cli_accept_files,
+                                      std::memory_order_relaxed);
+    dropSetStatSink(dropStatSink);
 
     if (!initSockets())
     {
@@ -2457,6 +2482,10 @@ int main(int argc, char* argv[])
     /* 拼接 (stitch) input channel. It is independent of the video listener:
      * the receiver can be idle (no window) and still hand control to a peer.
      * The thread polls g_running, so it joins on every shutdown path below. */
+    /* 8085 file-drop channel. It only serves a token installed by an active
+     * 8084 session, so it can idle here for the whole process lifetime. Start
+     * it first so a session that connects immediately sees it listening. */
+    std::thread drop_thread(dropServiceRun, std::ref(g_running));
     std::thread kvm_thread(kvmServiceRun, std::ref(g_running), &g_kvm_auth);
 
     /* TCP stream server */
@@ -2472,6 +2501,7 @@ int main(int argc, char* argv[])
         port_thread.join();
         stats_thread.join();
         kvm_thread.join();
+        drop_thread.join();
         cleanupSockets();
         return 1;
     }
@@ -2499,6 +2529,7 @@ int main(int argc, char* argv[])
         port_thread.join();
         stats_thread.join();
         kvm_thread.join();
+        drop_thread.join();
         cleanupSockets();
         return 1;
     }
@@ -2510,13 +2541,15 @@ int main(int argc, char* argv[])
         gpu_startup_status gpu_st = {};
         ports_startup_status ports_st = {};
         KvmStartupStatus kvm_st = {};
+        DropStartupStatus drop_st = {};
         const int64_t svc_deadline = steadyMs() + 1500;
         for (;;) {
             gpu_st = gpu_service_status();
             ports_st = ports_service_status();
             kvm_st = kvmServiceStatus();
+            drop_st = dropServiceStatus();
             const bool settled = gpu_st.state != 0 && ports_st.state != 0 &&
-                                 kvm_st.state != 0;
+                                 kvm_st.state != 0 && drop_st.state != 0;
             if (settled || steadyMs() >= svc_deadline)
                 break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2527,6 +2560,8 @@ int main(int argc, char* argv[])
                           ports_st.stage, ports_st.error_code);
         emitServiceStatus("kvm", KVM_PORT, kvm_st.state,
                           kvm_st.stage, kvm_st.error_code);
+        emitServiceStatus("drop", DROP_PORT, drop_st.state,
+                          drop_st.stage, drop_st.error_code);
     }
 
     std::cout << "Waiting for sender on TCP " << TCP_STREAM_PORT << " ...\n";
@@ -2619,6 +2654,7 @@ int main(int argc, char* argv[])
     port_thread.join();
     stats_thread.join();
     kvm_thread.join();
+    drop_thread.join();
     cleanupSockets();
 
     // Final stats write

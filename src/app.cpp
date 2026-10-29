@@ -501,6 +501,9 @@ enum BtnId {
     BTN_SET_UPD_PAGE,                   /* 打开下载页 */
     BTN_SET_UPD_IGNORE,                 /* 忽略此版本 / 取消忽略 */
     BTN_UPD_NOTICE,                     /* home-screen update banner */
+    /* 拼接文件投放 (both default off; copy-only) */
+    BTN_SET_FILEDROP_ACCEPT = 7070,     /* 允许对端发送文件 */
+    BTN_SET_FILEDROP_SEND,              /* 拖拽到边缘发送文件 */
     /* history rows (drawn on the home screen under 接收/发送) */
     BTN_HIST_BASE = 5000,               /* row i: +i*10 +0 row / +1 投屏 / +2 扩展
                                          * / +3 拼接 / +4 删除 */
@@ -730,8 +733,14 @@ struct RecvServiceState {
     std::string err;              /* stable token (bind_failed, …) */
 };
 struct RecvServices {
-    RecvServiceState gpu, ports, kvm;
-    RecvServices() { gpu.port = 8082; ports.port = 8083; kvm.port = 8084; }
+    RecvServiceState gpu, ports, kvm, drop;
+    RecvServices()
+    {
+        gpu.port = 8082;
+        ports.port = 8083;
+        kvm.port = 8084;
+        drop.port = 8085;
+    }
 };
 
 /* A queued STAT line plus the receiver generation that produced it. Lines from
@@ -2536,9 +2545,10 @@ static std::string recvServiceErrorText(const std::string &err)
 static std::string recvServicesIssue(const RecvServices &svc)
 {
     struct Item { const char *label; const RecvServiceState *st; };
-    const Item items[3] = {{"计算", &svc.gpu},
+    const Item items[4] = {{"计算", &svc.gpu},
                            {"端口", &svc.ports},
-                           {"拼接", &svc.kvm}};
+                           {"拼接", &svc.kvm},
+                           {"文件投放", &svc.drop}};
     std::string out;
     for (const Item &it : items) {
         if (it.st->state != 1) continue;     /* only fail() is a problem */
@@ -2554,6 +2564,11 @@ static std::string recvServicesIssue(const RecvServices &svc)
 /* Home-screen status bar state, driven by the receiver's STAT lines. */
 static void applyReceiverStat(const LiveStats &s)
 {
+    if (s.event == "drop") {
+        logPush("[drop] state=" + s.state +
+                (s.msg.empty() ? "" : " · " + s.msg));
+        return;
+    }
     if (s.event == "policy") {
         bool recovered = false;
         bool bad = false;
@@ -2670,6 +2685,7 @@ static void applyReceiverStat(const LiveStats &s)
         if (s.svc == "gpu")        dst = &g_recv_services.gpu;
         else if (s.svc == "ports") dst = &g_recv_services.ports;
         else if (s.svc == "kvm")   dst = &g_recv_services.kvm;
+        else if (s.svc == "drop")  dst = &g_recv_services.drop;
         if (!dst) return;
         dst->state = val;
         if (s.port > 0) dst->port = s.port;
@@ -2749,6 +2765,13 @@ static void parseStatLine(const std::string &line, bool from_receiver)
         /* The receiver owns the home status bar; its stats never drive the
          * sender's stat panel. */
         applyReceiverStat(s);
+        return;
+    }
+    /* File-drop progress is informational and must not replace the live
+     * session snapshot (a drop line carries no frames/codec fields). */
+    if (s.event == "drop") {
+        logPush("[drop] state=" + s.state +
+                (s.msg.empty() ? "" : " · " + s.msg));
         return;
     }
     {
@@ -3820,6 +3843,8 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
                                                  : g_cfg.stitch_side.c_str());
         args.push_back("--stitch-side");
         args.push_back(kStitchSideKey[s < 0 ? (int)KVM_SIDE_RIGHT : s]);
+        args.push_back("--file-drop");
+        args.push_back(g_cfg.file_drop_send ? "1" : "0");
     } else {
         args.insert(args.end(), {
             "--codec", codec,
@@ -3987,8 +4012,10 @@ static void launchReceiver()
     const unsigned flags =
         (unsigned)SPAWN_PIPES |
         (g_cfg.show_status_console ? (unsigned)SPAWN_CONSOLE : 0u);
-    if (!spawnChild(g_receiver, path, {"--gui"}, flags, /*is_receiver=*/true,
-                    epoch)) {
+    if (!spawnChild(g_receiver, path,
+                    {"--gui", "--accept-files",
+                     g_cfg.file_drop_accept ? "1" : "0"},
+                    flags, /*is_receiver=*/true, epoch)) {
         g_status_note = "启动 receiver 失败";
         {
             std::lock_guard<std::mutex> lk(g_recv_mtx);
@@ -4048,6 +4075,8 @@ static bool settingsDirty()
            g_cfg_edit.extend_res != g_cfg.extend_res ||
            g_cfg_edit.vdd_mode_write != g_cfg.vdd_mode_write ||
            g_cfg_edit.stitch_side != g_cfg.stitch_side ||
+           g_cfg_edit.file_drop_send != g_cfg.file_drop_send ||
+           g_cfg_edit.file_drop_accept != g_cfg.file_drop_accept ||
            g_cfg_edit.auth_mode != g_cfg.auth_mode ||
            g_cfg_edit.auth_salt != g_cfg.auth_salt ||
            g_cfg_edit.auth_hash != g_cfg.auth_hash ||
@@ -4618,8 +4647,10 @@ static void buildButtons()
             addButton(SET_RC_X, SET_TOGGLE_Y0, SET_COL_W - SET_PAD * 2, 32, "",
                       BTN_SET_HW, BTN_V_GHOST);
         } else if (g_set_tab == 0) {
-            const int startup[2] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART};
-            for (int i = 0; i < 2; i++)
+            const int startup[4] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART,
+                                    BTN_SET_FILEDROP_ACCEPT,
+                                    BTN_SET_FILEDROP_SEND};
+            for (int i = 0; i < 4; i++)
                 addButton(SET_LC_X, SET_TOGGLE_Y0 + i * 40, SET_LC_W, 32, "",
                           startup[i], BTN_V_GHOST);
             const int diagnostics[3] = {BTN_SET_CONSOLE, BTN_SET_LOGWIN,
@@ -5163,7 +5194,8 @@ static void renderScreen(int mousex, int mousey)
                 std::string("视频 8081 ") + (videoUp ? "已就绪" : "未就绪") + " · " +
                 svcText("计算", rv.services.gpu) + " · " +
                 svcText("端口", rv.services.ports) + " · " +
-                svcText("拼接", rv.services.kvm) + " · 发现 UDP 1900";
+                svcText("拼接", rv.services.kvm) + " · " +
+                svcText("文件投放", rv.services.drop) + " · 发现 UDP 1900";
             drawText(g_ren, fitText(svcLine, g_fontS, card.w - 40), lx,
                      376, THEME.textDim, g_fontS);
             const std::string issue = recvServicesIssue(rv.services);
@@ -5320,11 +5352,17 @@ static void renderScreen(int mousex, int mousey)
                 drawCard(g_ren, card, CARD_R);
                 drawText(g_ren, "启动", SET_LC_X, card.y + 20,
                          THEME.textDim, g_fontBS);
-                static const char *labels[2] = {"启动软件时自动开启接收", "开机自启动"};
-                const bool on[2] = {g_cfg_edit.auto_receive != 0,
-                                    g_cfg_edit.auto_start != 0};
-                const int ids[2] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART};
-                for (int i = 0; i < 2; i++) {
+                static const char *labels[4] = {
+                    "启动软件时自动开启接收", "开机自启动",
+                    "允许对端发送文件", "拖拽到边缘发送文件"};
+                const bool on[4] = {g_cfg_edit.auto_receive != 0,
+                                    g_cfg_edit.auto_start != 0,
+                                    g_cfg_edit.file_drop_accept != 0,
+                                    g_cfg_edit.file_drop_send != 0};
+                const int ids[4] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART,
+                                    BTN_SET_FILEDROP_ACCEPT,
+                                    BTN_SET_FILEDROP_SEND};
+                for (int i = 0; i < 4; i++) {
                     const int y = SET_TOGGLE_Y0 + i * 40;
                     const SDL_Rect row{SET_LC_X, y, SET_LC_W, 32};
                     if (g_hot == ids[i] || g_press == ids[i])
@@ -5334,11 +5372,15 @@ static void renderScreen(int mousex, int mousey)
                     drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
                 }
                 drawText(g_ren, "自动接收只影响下次启动。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 96, THEME.textDim, g_fontS);
+                         SET_LC_X, SET_TOGGLE_Y0 + 168, THEME.textDim, g_fontS);
                 drawText(g_ren, "开机自启动只负责启动程序。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 120, THEME.textDim, g_fontS);
+                         SET_LC_X, SET_TOGGLE_Y0 + 192, THEME.textDim, g_fontS);
                 drawText(g_ren, "本次接收开关位于「接收与安全」。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 144, THEME.textDim, g_fontS);
+                         SET_LC_X, SET_TOGGLE_Y0 + 216, THEME.textDim, g_fontS);
+                drawText(g_ren, "文件投放只复制，不移动或删除源文件；",
+                         SET_LC_X, SET_TOGGLE_Y0 + 248, THEME.warning, g_fontS);
+                drawText(g_ren, "两端都需开启，且仅 Windows 拼接会话可用。",
+                         SET_LC_X, SET_TOGGLE_Y0 + 272, THEME.warning, g_fontS);
             }
             {
                 const SDL_Rect card{SET_COL_R, SET_CARD_Y, SET_COL_W, SET_R_H};
@@ -5849,6 +5891,14 @@ static void onButton(int id)
         /* 自动接收 is a next-launch preference only — never toggle the service
          * from here (PRD: 手动开关只改变当前状态). */
         g_status_note = "「自动接收」只影响下次启动，本次不会开启或关闭接收";
+        break;
+    case BTN_SET_FILEDROP_ACCEPT:
+        g_cfg_edit.file_drop_accept = !g_cfg_edit.file_drop_accept;
+        g_status_note = "文件投放只复制，不会移动或删除源文件";
+        break;
+    case BTN_SET_FILEDROP_SEND:
+        g_cfg_edit.file_drop_send = !g_cfg_edit.file_drop_send;
+        g_status_note = "拖拽文件到屏幕边缘即可复制到对端；默认关闭";
         break;
     case BTN_SET_TAB_BASE:
     case BTN_SET_TAB_BASE + 1:

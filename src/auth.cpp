@@ -48,12 +48,7 @@ const uint32_t K256[64] = {
 
 inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 
-struct Sha256Ctx {
-    uint32_t h[8];
-    uint64_t total;          /* bytes hashed so far */
-    uint8_t  buf[64];
-    size_t   buflen;
-};
+using Sha256Ctx = MivaraSha256Ctx;
 
 void sha256Init(Sha256Ctx &c)
 {
@@ -191,6 +186,21 @@ void mivaraSha256(const void *data, size_t len, uint8_t out[32])
     sha256Init(c);
     sha256Update(c, data, len);
     sha256Final(c, out);
+}
+
+void mivaraSha256Init(MivaraSha256Ctx *c)
+{
+    if (c) sha256Init(*c);
+}
+
+void mivaraSha256Update(MivaraSha256Ctx *c, const void *data, size_t len)
+{
+    if (c) sha256Update(*c, data, len);
+}
+
+void mivaraSha256Final(MivaraSha256Ctx *c, uint8_t out[32])
+{
+    if (c) sha256Final(*c, out);
 }
 
 void mivaraHmacSha256(const uint8_t *key, size_t key_len,

@@ -40,6 +40,10 @@ struct AppConfig
     std::string stitch_side = "right";  /* 拼接: left|right|top|bottom –
                                            which edge the peer sits on (the
                                            GUI preselects it in the dialog) */
+    int file_drop_send = 0;             /* stitch: 1 = edge drag copies files
+                                           to the peer (opt-in, default off) */
+    int file_drop_accept = 0;           /* stitch: 1 = accept incoming files
+                                           (opt-in, default off) */
     /* ── 接收与安全 ────────────────────────────────────────────────────────
      * Connection policy. The default for a new install (and for an upgraded
      * config with no policy key) is manual approval — never open. */

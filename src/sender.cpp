@@ -52,6 +52,7 @@
 #include <algorithm>
 #include "auth.h"
 #include "discover.h"
+#include "drop.h"
 #include "gpu_accelerate.h"
 #include "kvm.h"
 #include "ports.h"
@@ -1150,6 +1151,15 @@ static void emitAuthStat(const char *state, const std::string &extra = std::stri
     std::cout << "\n" << std::flush;
 }
 
+/* File-drop worker threads emit STAT lines; serialise them so the GUI's
+ * line parser never sees two records spliced together. */
+static void dropStatSink(const char *line)
+{
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);
+    std::cout << "STAT|" << line << "\n" << std::flush;
+}
+
 /* 拼接 (8084) authorization hooks: the same password prompt and progress
  * lines as the 8081 handshake, so the GUI shows one password modal and one
  * wait state no matter which channel is being authorized. */
@@ -1568,6 +1578,7 @@ int main(int argc, char* argv[])
     std::string cli_extend_res = "auto";
     int cli_add_modes = -1;                     /* -1 = not specified */
     int cli_stitch_side = KVM_SIDE_RIGHT;       /* where the peer sits */
+    int cli_file_drop = 0;                      /* 1 = edge drag sends files */
     int cli_port = 8081;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -1582,6 +1593,8 @@ int main(int argc, char* argv[])
                 cleanupSockets();
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--file-drop") == 0 && i + 1 < argc) {
+            cli_file_drop = (std::atoi(argv[++i]) != 0) ? 1 : 0;
         } else if (std::strcmp(argv[i], "--extend-res") == 0 && i + 1 < argc) {
             cli_extend_res = argv[++i];
         } else if (std::strcmp(argv[i], "--vdd-add-modes") == 0 && i + 1 < argc) {
@@ -1694,9 +1707,11 @@ int main(int argc, char* argv[])
         /* The GUI switches sides with STITCH|side=… lines on stdin. Stitch
          * returns before the streaming path starts its own reader. */
         startStdinReader();
+        dropSetStatSink(dropStatSink);
         KvmClientAuth kvm_auth = {};
         kvm_auth.password = kvmPasswordHook;
         kvm_auth.report = kvmReportHook;
+        kvm_auth.file_drop = cli_file_drop;
         const int rc = kvmRunController(sel.ip_address.c_str(), KVM_PORT,
                                         cli_stitch_side, g_running, &kvm_auth);
         cleanupSockets();

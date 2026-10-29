@@ -53,6 +53,7 @@ Mivara/
 | 8082 | TCP | CPU compute offload service (session token required) |
 | 8083 | TCP | Remote port inspection service (session token required) |
 | 8084 | TCP | Stitch (software KVM) keyboard/mouse input channel (same receive policy as 8081) |
+| 8085 | TCP | Stitch file drop (optional, off by default; guarded by a one-shot token from the active stitch session; copy-only) |
 
 All of these ports must be allowed on the receiver; see [Network & Firewall](network.md) for firewall rules and network requirements. 8082/8083 are no longer unauthenticated: they only accept the 32-byte token issued by the current authorized 8081 session, and the token is cleared when the session ends.
 
@@ -269,6 +270,10 @@ The proof binds this connection with the stitch purpose (`purpose=2`): `HMAC-SHA
 - Injection is serial on the session thread. `SendInput` cannot cross UIPI into **higher**-integrity windows and cannot target the secure desktop (so Ctrl+Alt+Del cannot be synthesised). A standalone `receiver` is unelevated, so elevated windows receive no stitch input; a receiver launched by the GUI inherits the GUI's administrator token and can type into them.
 
 > Security note: 8084 uses the same authorization policy as 8081 (any / password / manual), but the channel is **unencrypted** — authorization decides who may connect and does not protect the input events. Keep it LAN-only.
+
+### 7 — Stitch File Drop (8085, optional)
+
+File drop is a companion channel of a stitch session — **not a display mode and not a new session**: it does not claim the 8081/8084 active-session slot, adds no second approval prompt and is off by default on both ends. When the controller enables `--file-drop 1` and the Medium-integrity `stitchcap.exe` helper is ready, it sets `KVM_FEATURE_FILE_DROP` in `KvmHello.reserved[1]`; the target echoes it only when `file_drop_accept=1`, the 8085 listener is up and authorization succeeded, then sends one marker plus eight fixed `KvmEvent` frames carrying a 32-byte one-shot token after `KvmReply`. The controller reads this fixed sequence before starting `drainLoop()`, so the 16-byte event stream never desynchronises. 8085 is a separate TCP service: `DropHello` carries the token, transfer id, release point and item/byte limits; manifest, chunks, per-file SHA-256 and a result frame follow. The target stages under `%LOCALAPPDATA%\Mivara\Drop\<transfer>`, verifies every file, then copies the top-level items into the Explorer/Desktop folder under the release point; copy-only, never overwrite, move or delete the source. Source-side edge capture is done by `stitchcap.exe`: an asInvoker process launched with the shell token (Medium integrity) that owns a 3-pixel topmost strip on the shared edge, reads `CF_HDROP` in `DragEnter`, reports the paths over a named pipe and returns `DROPEFFECT_NONE`, so nothing is copied locally. Medium is mandatory: a High window cannot receive a Medium Explorer's OLE drop (UIPI).
 
 ## Protocol Reference
 

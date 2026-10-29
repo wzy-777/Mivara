@@ -38,6 +38,7 @@
  * unsupported and kvmServiceRun() returns immediately.
  */
 #include "kvm.h"
+#include "drop.h"
 #include "proto.h"
 
 #include <algorithm>
@@ -282,10 +283,27 @@ bool g_btn_local[8] = {};
 
 #define KVM_WM_DISCONNECT (WM_APP + 1)
 #define KVM_WM_PANIC      (WM_APP + 2)
+#define KVM_WM_DROP       (WM_APP + 3)
 #define KVM_TIMER_ID      1
+
+/* File-drop capability negotiated after KvmReply. The token is per session and
+ * only leaves the wire when both sides opted in. */
+bool    g_drop_ready = false;
+bool    g_file_drag = false;
+uint8_t g_drop_token[DROP_TOKEN_BYTES] = {};
+uint16_t g_drop_port = (uint16_t)DROP_PORT;
+std::string g_peer_ip;
+std::vector<std::string> g_drag_files;
+std::atomic<bool> g_drop_cancel{false};
+std::atomic<bool> g_drop_active{false};
+std::atomic<bool> g_discard_drag{false};
+std::thread g_drop_thread;
+
+static std::mutex g_stat_out_mtx;
 
 static void emitStat(const std::string &line)
 {
+    std::lock_guard<std::mutex> lk(g_stat_out_mtx);
     std::cout << "STAT|" << line << "\n" << std::flush;
 }
 
@@ -364,19 +382,73 @@ static void queueWheel(int delta, bool horizontal)
 }
 
 /* Re-arm every key/button the user is physically holding, so the target
- * starts from the same modifier state as the controller. */
+ * starts from the same modifier state as the controller.
+ *
+ * The held tables are written only by the low-level hooks, and a key-up can
+ * be missed: WH_KEYBOARD_LL does not run while a secure desktop is up
+ * (Win+L, Ctrl+Alt+Del, UAC), another low-level hook may swallow the event
+ * first, and Windows silently drops a hook that overruns
+ * LowLevelHooksTimeout. An entry whose up was lost stays "down" for the rest
+ * of the session, so every crossing re-arms it on the target. For a letter
+ * key that types a stray character; for VK_LWIN it is worse — the target
+ * gets a real Win down, and the KVM_EV_RELEASE_ALL that leaveRemote sends
+ * completes it into a Win down/up pair, so the target's Start menu opens
+ * even though the user never touched the Win key.
+ *
+ * g_key_local records whether the press actually reached the local desktop.
+ * If it did, the OS must still report the key as down; if it does not, the
+ * cached entry is stale, not something the user is holding. A press made
+ * while control was Remote never reached the desktop, so its entry is
+ * trusted as-is: GetAsyncKeyState knows nothing about input a hook
+ * swallowed. */
 static void syncHeldInput()
 {
-    for (int vk = 0; vk < 256; vk++)
-        if (g_key_down[vk])
-            queueKey(1, (uint32_t)vk, g_key_scan[vk], g_key_ext[vk]);
-    for (int b = 1; b < 8; b++)
-        if (g_btn_down[b]) queueButton((uint32_t)b, true);
+    for (int vk = 0; vk < 256; vk++) {
+        if (!g_key_down[vk]) continue;
+        if (g_key_local[vk] && !(GetAsyncKeyState(vk) & 0x8000)) {
+            g_key_down[vk] = false;
+            g_key_local[vk] = false;
+            continue;
+        }
+        queueKey(1, (uint32_t)vk, g_key_scan[vk], g_key_ext[vk]);
+    }
+    /* Buttons 4/5 are the X buttons; 6/7 are never tracked. */
+    static const int btn_vk[6] = {0, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
+                                  VK_XBUTTON1, VK_XBUTTON2};
+    for (int b = 1; b < 8; b++) {
+        if (!g_btn_down[b]) continue;
+        if (b < 6 && g_btn_local[b] &&
+            !(GetAsyncKeyState(btn_vk[b]) & 0x8000)) {
+            g_btn_down[b] = false;
+            g_btn_local[b] = false;
+            continue;
+        }
+        queueButton((uint32_t)b, true);
+    }
 }
 
 static void enterRemote()
 {
     if (g_state == ControlState::Remote) return;
+
+    /* A file drag is the one gesture where re-arming the held left button is
+     * wrong: the target never received its DOWN, and the local Explorer drag
+     * must keep running until the physical release. The helper captures the
+     * selection at DragEnter, before the edge is crossed. */
+    g_file_drag = false;
+    g_drag_files.clear();
+    if (g_btn_down[1] && g_drop_ready && dropHelperReady()) {
+        /* Non-blocking: this runs on the hook/message-loop thread, and a
+         * LowLevelHooksTimeout would silently remove the mouse hook. The
+         * helper's 1-pixel strip sees DragEnter before the edge overshoot. */
+        std::vector<std::string> files;
+        if (dropHelperTakeFiles(files) && !files.empty()) {
+            g_file_drag = true;
+            g_drag_files.swap(files);
+            emitStat("event=drop|state=ready|items=" +
+                     std::to_string(g_drag_files.size()));
+        }
+    }
 
     POINT p = {};
     GetCursorPos(&p);
@@ -403,7 +475,7 @@ static void enterRemote()
     g_state = ControlState::Remote;
     setCursorVisible(false);
     g_queue.pushMove((uint32_t)g_remote_x, (uint32_t)g_remote_y);
-    syncHeldInput();
+    if (!g_file_drag) syncHeldInput();
     emitStitchState("remote");
 }
 
@@ -411,6 +483,8 @@ static void leaveRemote(bool warpCursor)
 {
     if (g_state != ControlState::Remote) return;
     g_state = ControlState::Local;
+    g_file_drag = false;
+    g_drag_files.clear();
 
     KvmEvent e = {};
     e.type = KVM_EV_RELEASE_ALL;
@@ -474,6 +548,7 @@ static void applySide(int side)
         side == g_side) return;
     if (g_state == ControlState::Remote) leaveRemote(true);
     g_side = side;
+    dropHelperSetSide(side);
     g_edge_overshoot = 0;
     emitStitchState("local");
     std::cout << "[kvm] stitch side -> " << kvmSideKey(g_side) << "\n"
@@ -517,7 +592,12 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
         noteButton((uint32_t)btn, down);
         /* Remember whether the press actually reached the local desktop; see
          * g_btn_local. A press made in Remote stays false (it was swallowed). */
-        if (g_state != ControlState::Remote) g_btn_local[btn] = down;
+        if (g_state != ControlState::Remote) {
+            g_btn_local[btn] = down;
+            /* Defer the actual discard to the message loop: nothing blocking
+             * may run inside a low-level hook. */
+            if (btn == 1 && down) g_discard_drag = true;
+        }
     }
 
     if (g_state != ControlState::Remote)
@@ -542,6 +622,16 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
         break;
     }
     if (!btn) return 1;
+
+    if (g_file_drag && btn == 1 && !down) {
+        /* End the local Explorer drag normally: the helper's 1-pixel strip
+         * rejects the local drop, and the remote transfer starts from the
+         * message loop with the release point. The target never received the
+         * matching DOWN, so no button-up is sent to it. */
+        g_btn_local[1] = false;
+        if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
 
     queueButton((uint32_t)btn, down);
     if (!down && g_btn_local[btn]) {
@@ -600,6 +690,11 @@ LRESULT CALLBACK keyProc(int code, WPARAM wp, LPARAM lp)
 
 static void onRawMouse(const RAWMOUSE &m)
 {
+    /* A new physical button-down invalidates any selection captured for the
+     * previous gesture. Done here (message loop), never in the hook. */
+    if (g_discard_drag.exchange(false))
+        dropHelperDiscard();
+
     /* Windows clamps the cursor to the virtual desktop, so the low-level hook
      * keeps reporting a stationary point when the user pushes further right.
      * The device delta in WM_INPUT is the only reliable signal. */
@@ -644,6 +739,50 @@ static void onRawMouse(const RAWMOUSE &m)
     if (g_edge_overshoot >= 3) enterRemote();
 }
 
+/* Starts the 8085 copy for the selection captured at the edge. Runs on its
+ * own thread: a large folder must not stall the hook message loop, and the
+ * 8084 session keeps forwarding input while the copy proceeds. */
+static void startFileDrop(int screen_x, int screen_y)
+{
+    if (!g_drop_ready || g_drag_files.empty()) return;
+    if (g_drop_active.exchange(true)) {
+        emitStat("event=drop|state=busy|msg=another transfer is running");
+        g_drag_files.clear();
+        return;
+    }
+    g_drop_cancel = false;
+
+    std::vector<std::string> files;
+    files.swap(g_drag_files);
+    std::vector<uint8_t> token(g_drop_token, g_drop_token + DROP_TOKEN_BYTES);
+    const std::string peer = g_peer_ip;
+    const uint16_t port = g_drop_port;
+    emitStat("event=drop|state=sending|items=" +
+             std::to_string(files.size()));
+
+    if (g_drop_thread.joinable()) g_drop_thread.join();
+    g_drop_thread = std::thread([files = std::move(files), token = std::move(token), peer,
+                 port, screen_x, screen_y]() {
+        DropOptions opt;
+        opt.peer_ip = peer.c_str();
+        opt.port = port;
+        opt.x = screen_x;
+        opt.y = screen_y;
+        opt.transfer_id = (uint32_t)(GetTickCount64() ^
+                                     (uint64_t)GetCurrentProcessId());
+        const DropResult r = dropSendFiles(opt, files, token.data(),
+                                           g_drop_cancel);
+        std::string line = "event=drop|state=";
+        line += (r.status == DROP_OK) ? "done" : "error";
+        line += "|items=" + std::to_string(r.committed);
+        line += "|failed=" + std::to_string(r.failed);
+        line += "|fallback=" + std::string(r.fallback ? "1" : "0");
+        if (!r.message.empty()) line += "|msg=" + r.message;
+        emitStat(line);
+        g_drop_active = false;
+    });
+}
+
 static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -675,9 +814,24 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case KVM_WM_PANIC:
+        g_drop_cancel = true;
+        g_file_drag = false;
+        g_drag_files.clear();
         leaveRemote(true);
         return 0;
+    case KVM_WM_DROP: {
+        if (!g_file_drag) return 0;
+        const int sx = g_tgt_x0 + g_remote_x;
+        const int sy = g_tgt_y0 + g_remote_y;
+        g_file_drag = false;
+        startFileDrop(sx, sy);
+        leaveRemote(true);
+        return 0;
+    }
     case KVM_WM_DISCONNECT:
+        g_drop_cancel = true;
+        g_file_drag = false;
+        g_drag_files.clear();
         leaveRemote(true);
         PostQuitMessage(0);
         return 0;
@@ -1023,6 +1177,32 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     memset(g_key_local, 0, sizeof(g_key_local));
     memset(g_btn_local, 0, sizeof(g_btn_local));
 
+    g_peer_ip = peer_ip;
+    g_drop_ready = false;
+    g_file_drag = false;
+    g_drag_files.clear();
+    g_drop_cancel = false;
+    g_drop_active = false;
+    g_drop_port = (uint16_t)DROP_PORT;
+    memset(g_drop_token, 0, sizeof(g_drop_token));
+
+    /* The drag-capture helper must be up before the hello: its Medium token
+     * target is what makes KVM_FEATURE_FILE_DROP safe to advertise. */
+    struct HelperGuard {
+        bool started = false;
+        ~HelperGuard() { if (started) dropHelperStop(); }
+    } helper_guard;
+    bool file_drop_capable = false;
+    if (auth && auth->file_drop) {
+        std::string why;
+        if (dropHelperStart(g_side, why)) {
+            file_drop_capable = true;
+            helper_guard.started = true;
+        } else {
+            emitStat("event=drop|state=disabled|msg=" + why);
+        }
+    }
+
     emitStat("event=stitch|state=waiting|mode=stitch|dst=" +
              std::string(peer_ip) + "|side=" + kvmSideKey(g_side));
 
@@ -1059,7 +1239,9 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
          * then falls back to the default right side. Purely informational;
          * older targets ignore it and behave like the default (right). */
         hello.reserved[0] = htonl((uint32_t)g_side + 1u);
-        hello.reserved[1] = htonl(KVM_FEATURE_HEARTBEAT);
+        hello.reserved[1] = htonl(
+            KVM_FEATURE_HEARTBEAT |
+            (file_drop_capable ? KVM_FEATURE_FILE_DROP : 0u));
         if (!kvmSendAll(g_sock, &hello, sizeof(hello))) {
             emitStatError("拼接握手发送失败");
             kvmClose(g_sock);
@@ -1219,6 +1401,42 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     }
 
     g_heartbeat = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
+
+    /* File-drop token: a fixed 1 + 8 event sequence read before drainLoop()
+     * starts, so no variable-length frame ever enters the 16-byte stream. */
+    g_drop_ready = file_drop_capable &&
+                   (ntohl(reply.reserved) & KVM_FEATURE_FILE_DROP) != 0;
+    if (g_drop_ready) {
+        KvmEvent ev = {};
+        int rv2 = kvmRecvAllPoll(g_sock, &ev, sizeof(ev), running, 35000);
+        if (rv2 != 1 || ntohl(ev.type) != KVM_EV_DROP_INFO ||
+            ntohl(ev.a) != 0x4D564B58u || ntohl(ev.b) != 1u ||
+            ntohl(ev.c) != 8u) {
+            emitStatError("拼接文件通道握手失败");
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            g_drop_ready = false;
+            return 1;
+        }
+        for (int i = 0; i < 8; i++) {
+            rv2 = kvmRecvAllPoll(g_sock, &ev, sizeof(ev), running, 35000);
+            if (rv2 != 1 || ntohl(ev.type) != KVM_EV_DROP_INFO ||
+                ntohl(ev.a) != (uint32_t)i) {
+                emitStatError("拼接文件通道令牌不完整");
+                kvmClose(g_sock);
+                g_sock = KVM_INVALID_SOCK;
+                g_drop_ready = false;
+                return 1;
+            }
+            const uint32_t word = ntohl(ev.b);
+            std::memcpy(g_drop_token + i * 4, &word, 4);
+        }
+        emitStat("event=drop|state=ready|port=" +
+                 std::to_string((int)g_drop_port));
+    } else if (auth && auth->file_drop) {
+        emitStat("event=drop|state=disabled|msg=peer does not accept files");
+    }
+
     g_tgt_x0 = (int)(int32_t)ntohl((uint32_t)reply.screen_x);
     g_tgt_y0 = (int)(int32_t)ntohl((uint32_t)reply.screen_y);
     g_tgt_w = ntohl(reply.screen_w);
@@ -1307,6 +1525,13 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     }
 
     /* ── teardown (also the Ctrl+C / disconnect path) ──────────────────── */
+    g_drop_cancel = true;
+    g_drop_ready = false;
+    g_file_drag = false;
+    g_drag_files.clear();
+    if (g_drop_thread.joinable()) g_drop_thread.join();
+    g_drop_active = false;
+    mivaraSecureZero(g_drop_token, sizeof(g_drop_token));
     KillTimer(g_hwnd, KVM_TIMER_ID);
     leaveRemote(false);
     g_drainQuit = true;
@@ -1906,7 +2131,12 @@ struct HsGuard {
 struct SessionLeaseGuard {
     MivaraSessionLease lease{};
     bool held = false;
-    ~SessionLeaseGuard() { if (held) mivaraSessionRelease(lease); }
+    bool drop = false;
+    ~SessionLeaseGuard()
+    {
+        if (drop) dropGateClear(lease.epoch);
+        if (held) mivaraSessionRelease(lease);
+    }
 };
 
 static void serveClient(kvm_sock_t client, const std::string &peer_ip,
@@ -2255,6 +2485,25 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     }
     hs.markSuccess();
 
+    /* File drop is a separate 8085 service and a separate opt-in. Install its
+     * token before the KVM reply goes out, so a controller that dials 8085
+     * immediately cannot race the gate. The guard clears it on every exit. */
+    bool drop_ok = (auth &&
+                    auth->accept_files.load(std::memory_order_relaxed) != 0) &&
+                   dropServiceStatus().state == 1 &&
+                   (ntohl(hello.reserved[1]) & KVM_FEATURE_FILE_DROP) != 0;
+    uint8_t drop_token[DROP_TOKEN_BYTES] = {};
+    if (drop_ok && !mivaraRandomBytes(drop_token, sizeof(drop_token)))
+        drop_ok = false;
+    if (drop_ok) {
+        if (dropGateInstall(drop_token, lease.lease.epoch)) lease.drop = true;
+        else drop_ok = false;
+    }
+    uint32_t feat = (ntohl(hello.reserved[1]) & KVM_FEATURE_HEARTBEAT)
+                        ? KVM_FEATURE_HEARTBEAT : 0u;
+    if (drop_ok) feat |= KVM_FEATURE_FILE_DROP;
+    reply.reserved = htonl(feat);
+
     if (mode != MIVARA_AUTH_OPEN) {
         if (!kvmSendHsResponse(client, HS_OK, sw, sh)) return;
     }
@@ -2268,7 +2517,37 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     hb.enabled = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
     hb.last_rx = GetTickCount64();
     hb.next_tx = hb.last_rx + 3000;
-    if (!kvmSendAll(client, &reply, sizeof(reply))) return;
+    if (!kvmSendAll(client, &reply, sizeof(reply))) {
+        mivaraSecureZero(drop_token, sizeof(drop_token));
+        return;
+    }
+
+    /* Fixed 1 + 8 event sequence: the controller reads it before it starts
+     * drainLoop(), so the 16-byte event parser never sees a variable frame. */
+    if (drop_ok) {
+        KvmEvent info = {};
+        info.type = htonl(KVM_EV_DROP_INFO);
+        info.a = htonl(0x4D564B58u);   /* 'MVKX' marker */
+        info.b = htonl(1u);
+        info.c = htonl(8u);
+        if (!kvmSendAll(client, &info, sizeof(info))) {
+            mivaraSecureZero(drop_token, sizeof(drop_token));
+            return;
+        }
+        for (int i = 0; i < 8; i++) {
+            uint32_t word = 0;
+            std::memcpy(&word, drop_token + i * 4, 4);
+            KvmEvent ev = {};
+            ev.type = htonl(KVM_EV_DROP_INFO);
+            ev.a = htonl((uint32_t)i);
+            ev.b = htonl(word);
+            if (!kvmSendAll(client, &ev, sizeof(ev))) {
+                mivaraSecureZero(drop_token, sizeof(drop_token));
+                return;
+            }
+        }
+    }
+    mivaraSecureZero(drop_token, sizeof(drop_token));
 
     std::cout << "[kvm] stitch session started (" << sw << "x" << sh
               << "); the peer now controls this desktop\n" << std::flush;

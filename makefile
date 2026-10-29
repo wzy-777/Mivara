@@ -122,8 +122,13 @@ ifeq ($(OS),Windows_NT)
     # -lsetupapi: enable/disable the Root\MttVDD device (vdd.cpp)
     # -ladvapi32: registry override lookup for vdd_settings.xml (vdd.cpp)
     # -luser32: stitch KVM (hooks, Raw Input, SendInput, MessageBox) in kvm.cpp
-    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi -ladvapi32 -luser32
-    RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32
+    # -lole32/-luuid/-lshell32/-lshlwapi: 8085 file-drop channel (drop.cpp,
+    # dropshell.cpp); -ladvapi32 also covers CreateProcessWithTokenW for the
+    # Medium-integrity stitchcap helper.
+    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi -ladvapi32 \
+                     -luser32 -lole32 -loleaut32 -luuid -lshell32 -lshlwapi
+    RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32 \
+                     -ladvapi32 -lole32 -loleaut32 -luuid -lshell32 -lshlwapi
     # app: -lwinhttp (update check/download), -lbcrypt (SHA-256 via CNG),
     #      -ladvapi32 (SetNamedSecurityInfo + SDDL on the update directory),
     #      -lshell32 + -luser32 (tray icon, balloons, exit confirmation)
@@ -152,8 +157,10 @@ RECEIVER_LIBS += $(FFMPEG_LIBS)
 # Windows: copy the mingw64 runtime DLL closure into bin/ (wired into 'all')
 ifeq ($(OS),Windows_NT)
     DLL_TARGET := copy-dlls
+    STITCHCAP_BIN := $(BINDIR)/stitchcap.exe
 else
     DLL_TARGET :=
+    STITCHCAP_BIN :=
 endif
 
 # ============================================================================
@@ -179,6 +186,9 @@ OBJ_THEME    := $(BUILDDIR)/theme.o
 OBJ_KVM      := $(BUILDDIR)/kvm.o
 OBJ_AUTH     := $(BUILDDIR)/auth.o
 OBJ_TRAY     := $(BUILDDIR)/tray.o
+OBJ_DROP     := $(BUILDDIR)/drop.o
+OBJ_DROPSHELL := $(BUILDDIR)/dropshell.o
+OBJ_STITCHCAP := $(BUILDDIR)/stitchcap.o
 
 # ============================================================================
 # PHONY TARGET DECLARATIONS
@@ -187,10 +197,10 @@ OBJ_TRAY     := $(BUILDDIR)/tray.o
 .PHONY: all clean debug sender receiver app run run-sender run-receiver check install-deps help copy-dlls
 
 # Default Target
-all: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(DLL_TARGET)
+all: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(STITCHCAP_BIN) $(DLL_TARGET)
 	@echo "========================================="
 	@echo "Build complete!  → $(BINDIR)/"
-	@echo "  sender$(EXE)   receiver$(EXE)   app$(EXE)"
+	@echo "  sender$(EXE)   receiver$(EXE)   app$(EXE)   stitchcap$(EXE)"
 	@echo "========================================="
 
 # Directory Generation Rule (Safe for concurrent parallel -j compilation)
@@ -232,24 +242,34 @@ $(OBJ_CONFIG): $(SRCDIR)/config.h
 $(OBJ_HISTORY): $(SRCDIR)/history.h
 $(OBJ_UPDATE): $(SRCDIR)/update.h $(SRCDIR)/version.h
 $(OBJ_THEME): $(SRCDIR)/theme.h
-$(OBJ_KVM): $(SRCDIR)/kvm.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h
+$(OBJ_KVM): $(SRCDIR)/kvm.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/drop.h
 $(OBJ_AUTH): $(SRCDIR)/auth.h
 $(OBJ_TRAY): $(SRCDIR)/tray.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
-$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
+$(OBJ_DROP): $(SRCDIR)/drop.h $(SRCDIR)/auth.h $(SRCDIR)/dropshell.h
+$(OBJ_DROPSHELL): $(SRCDIR)/drop.h $(SRCDIR)/dropshell.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
+$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
 $(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h $(SRCDIR)/logo_icon.h
 
 # ============================================================================
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
-$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_CONFIG) | $(BINDIR)
+$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_CONFIG) | $(BINDIR)
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
+
+# Medium-integrity edge drop target (asInvoker; no RES_ADMIN). It is launched
+# by sender.exe with the shell token, so it must NOT carry requireAdministrator.
+ifneq ($(STITCHCAP_BIN),)
+$(STITCHCAP_BIN): $(OBJ_STITCHCAP) | $(BINDIR)
+	$(CXX) $^ -o $@ -mwindows -lole32 -luuid -lshell32 -luser32
+	@echo "Built $(STITCHCAP_BIN)"
+endif
 
 $(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(OBJ_AUTH) $(OBJ_TRAY) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
@@ -261,9 +281,9 @@ $(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $
 # ERROR_ELEVATION_REQUIRED ("Permission denied"), so ldd silently reported
 # nothing for exactly the two binaries that need SDL2_ttf / the FFmpeg DLLs.
 # objdump reads the import tables recursively without executing anything.
-copy-dlls: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)
+copy-dlls: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(STITCHCAP_BIN)
 	@echo "Copying runtime DLLs into $(BINDIR)/ ..."
-	@queue="$(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)"; seen=""; \
+	@queue="$(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(STITCHCAP_BIN)"; seen=""; \
 	while [ -n "$$queue" ]; do \
 	    set -- $$queue; f=$$1; shift; queue="$$*"; \
 	    for d in $$(objdump -p "$$f" 2>/dev/null | awk '/DLL Name/{print $$3}'); do \
@@ -296,7 +316,7 @@ debug: clean all
 
 clean:
 	rm -rf $(BUILDDIR)
-	rm -f $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN)
+	rm -f $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(STITCHCAP_BIN)
 	@echo "Cleaned"
 
 # ============================================================================
@@ -329,6 +349,7 @@ check:
                gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
                kvm.cpp kvm.h \
+               drop.cpp drop.h dropshell.cpp dropshell.h stitchcap.cpp \
                config.cpp config.h history.cpp history.h \
 	               update.cpp update.h version.h theme.cpp theme.h \
                auth.cpp auth.h tray.cpp tray.h logo_icon.h; do \

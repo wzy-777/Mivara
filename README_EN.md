@@ -4,6 +4,8 @@
 
 **Zero-config LAN casting · Wireless second monitor**
 
+*For you who work across two computers and two screens.*
+
 Turn any computer on your LAN into a second screen. The sender captures and streams its display; the receiver shows it fullscreen. In extend mode the system gains a real virtual display, so windows and the mouse can move straight onto it.
 
 [![Version](https://img.shields.io/badge/version-0.11.2-blue)](https://github.com/wzy-777/Mivara)
@@ -20,6 +22,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 - **Extended desktop** — an extend session automatically enables a Windows virtual display that adds real desktop space; windows can be dragged onto it and the pointer crosses over. Every exit path detaches and disables the device, so nothing lingers in Settings > Display.
 - **Stitching (software KVM)** — two Windows PCs keep their own monitors and share one keyboard/mouse: choose which side of this PC the peer sits on (left / right / top / bottom) when starting, push the pointer out of that edge to take over the peer, and move back out of its facing edge (or press Ctrl+Alt+Shift+Q) to hand control back. The side can be switched mid-session and no picture is sent.
+- **Stitch file drop (optional, copy-only)** — when enabled on both ends, drag files or folders across the screen edge and release over an Explorer window or the desktop on the peer to copy them into that folder. The source is never moved or deleted, name collisions are renamed, and both ends default to off.
 - **Zero-config discovery** — SSDP finds receivers on the LAN and shows their hostnames; direct IP connection works when multicast is blocked by network policy.
 - **High quality, low latency** — H.264 / H.265 / AV1 with hardware encoding first (NVENC / QSV / AMF / VAAPI) and automatic software fallback; up to 120 FPS.
 - **Live reconfigure** — change codec, quality, bitrate, frame rate, scale or chroma mid-session; applied within seconds without dropping the stream.
@@ -89,7 +92,7 @@ If it matches: browser download bar → "…" → "Keep"; then double-click the 
 
 ## Security
 
-Mivara is designed for **trusted LANs**. The receiver can require manual approval, a password, or allow any connection; 8081 (video and authorization) and 8084 (stitch keyboard/mouse) obey the same policy, and 8082 (compute offload) and 8083 (port inspector) only accept the token of the current authorized session. Still note:
+Mivara is designed for **trusted LANs**. The receiver can require manual approval, a password, or allow any connection; 8081 (video and authorization) and 8084 (stitch keyboard/mouse) obey the same policy, 8085 (optional stitch file drop) is gated by a one-shot token from the active stitch session, and 8082 (compute offload) and 8083 (port inspector) only accept the token of the current authorized session. Still note:
 
 - **Authorization is not encryption.** The password is only an admission check (a PBKDF2 record is stored locally, the password never crosses the wire and is verified with an HMAC challenge); **the video stream and stitch events are not encrypted**, so other devices on the link can still capture them.
 - "Allow any connection" lets any device that can reach the port in directly — use it only on a network you fully control.
