@@ -8,7 +8,7 @@
 
 把局域网里的任意一台电脑变成你的第二块屏幕。发送端采集画面并推流，接收端全屏显示；扩展模式下，系统里会多出一块真实的虚拟显示器，窗口和鼠标可以直接拖过去。
 
-[![Version](https://img.shields.io/badge/version-0.11.2-blue)](https://github.com/wzy-777/Mivara)
+[![Version](https://img.shields.io/badge/version-0.11.3-blue)](https://github.com/wzy-777/Mivara)
 [![下载最新安装包](https://img.shields.io/badge/download-latest%20installer-brightgreen?logo=github&logoColor=white)](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](#环境要求)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#环境要求)
