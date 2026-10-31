@@ -79,6 +79,12 @@ static void kvmClose(kvm_sock_t s)
     if (s != KVM_INVALID_SOCK) closesocket(s);
 }
 
+/* Never retry a blocking send after a timeout: Winsock can have copied an
+ * unreported prefix into the send buffer before the timer fired, so re-sending
+ * would duplicate bytes and desynchronise the fixed 16-byte event stream. The
+ * stall tolerance instead comes from a 2 s SO_SNDTIMEO (a KVM event is 16
+ * bytes and the kernel buffer absorbs thousands of them), which rides out a
+ * congested link without ever re-sending an ambiguous buffer. */
 static bool kvmSendAll(kvm_sock_t s, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
@@ -201,11 +207,22 @@ public:
 
     bool pushMove(uint32_t x, uint32_t y)
     {
+        /* Keep headroom for key/button events. While the drain thread is
+         * blocked in a slow send, a 1-4 kHz mouse would otherwise fill the
+         * ring with moves and silently discard a key-up / button-up queued
+         * behind it, leaving the peer's Ctrl or left button held down. Moves
+         * are lossy by design (pop() already keeps only the newest of a run),
+         * key and button events are not. */
+        unsigned h = head.load(std::memory_order_relaxed);
+        unsigned t = tail.load(std::memory_order_acquire);
+        if (h - t >= CAP - 512) return false;
         KvmEvent e = {};
         e.type = KVM_EV_MOVE;
         e.a = x;
         e.b = y;
-        return push(e);
+        buf[h % CAP] = e;
+        head.store(h + 1, std::memory_order_release);
+        return true;
     }
 
     bool pop(KvmEvent &e)
@@ -254,6 +271,11 @@ uint32_t g_tgt_w = 1920;
 uint32_t g_tgt_h = 1080;
 int      g_remote_x = 0;        /* cursor inside the target desktop */
 int      g_remote_y = 0;
+/* Release point captured in the hook when a drop is posted. A deferred
+ * transfer (the helper's path list still in flight) must copy to where the
+ * user released, not to wherever the pointer moved afterwards. */
+int      g_drop_rel_x = 0;
+int      g_drop_rel_y = 0;
 int      g_edge_overshoot = 0;
 DWORD    g_leave_tick = 0;
 bool     g_cursor_hidden = false;
@@ -298,6 +320,24 @@ std::atomic<bool> g_drop_cancel{false};
 std::atomic<bool> g_drop_active{false};
 std::atomic<bool> g_discard_drag{false};
 std::thread g_drop_thread;
+
+/* The helper's DragEnter is delivered by Explorer's OLE drag loop and travels
+ * back over a named pipe, so it can arrive a few milliseconds *after* the raw
+ * edge overshoot has already called enterRemote(). Re-arming the held left
+ * button on the target immediately would turn that file drag into a phantom
+ * drag on the peer. Instead the button is left un-armed for this short grace
+ * window: if the captured list shows up, the crossing is a file drag and the
+ * button must never be armed; if it does not, this is an ordinary drag and
+ * syncHeldInput() arms it then. */
+bool      g_btn_arm_pending = false;
+ULONGLONG g_btn_arm_tick = 0;
+/* 200 ms covers the normal DragEnter -> pipe latency. A slow CF_HDROP render
+ * (cloud/virtual files, a huge selection) can take longer; while the helper
+ * has announced a drag but not finished the list, keep waiting up to this
+ * hard cap instead of arming the button and creating a phantom drag on the
+ * peer. */
+#define   DRAG_CAPTURE_GRACE_MS 200
+#define   DRAG_CAPTURE_HARD_MS  2000
 
 static std::mutex g_stat_out_mtx;
 
@@ -381,6 +421,22 @@ static void queueWheel(int delta, bool horizontal)
     g_queue.push(e);
 }
 
+/* Re-arm one held mouse button. Buttons 4/5 are the X buttons; 6/7 are never
+ * tracked. */
+static void armHeldButton(int b)
+{
+    static const int btn_vk[6] = {0, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
+                                  VK_XBUTTON1, VK_XBUTTON2};
+    if (b < 1 || b >= 8 || !g_btn_down[b]) return;
+    if (b < 6 && g_btn_local[b] &&
+        !(GetAsyncKeyState(btn_vk[b]) & 0x8000)) {
+        g_btn_down[b] = false;
+        g_btn_local[b] = false;
+        return;
+    }
+    queueButton((uint32_t)b, true);
+}
+
 /* Re-arm every key/button the user is physically holding, so the target
  * starts from the same modifier state as the controller.
  *
@@ -401,7 +457,7 @@ static void queueWheel(int delta, bool horizontal)
  * while control was Remote never reached the desktop, so its entry is
  * trusted as-is: GetAsyncKeyState knows nothing about input a hook
  * swallowed. */
-static void syncHeldInput()
+static void syncHeldInput(bool arm_left = true)
 {
     for (int vk = 0; vk < 256; vk++) {
         if (!g_key_down[vk]) continue;
@@ -412,19 +468,47 @@ static void syncHeldInput()
         }
         queueKey(1, (uint32_t)vk, g_key_scan[vk], g_key_ext[vk]);
     }
-    /* Buttons 4/5 are the X buttons; 6/7 are never tracked. */
-    static const int btn_vk[6] = {0, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
-                                  VK_XBUTTON1, VK_XBUTTON2};
     for (int b = 1; b < 8; b++) {
-        if (!g_btn_down[b]) continue;
-        if (b < 6 && g_btn_local[b] &&
-            !(GetAsyncKeyState(btn_vk[b]) & 0x8000)) {
-            g_btn_down[b] = false;
-            g_btn_local[b] = false;
-            continue;
-        }
-        queueButton((uint32_t)b, true);
+        if (b == 1 && !arm_left) continue;
+        armHeldButton(b);
     }
+}
+
+/* Resolves the short post-crossing grace window (see g_btn_arm_pending). Runs
+ * on the message-loop thread from WM_INPUT / WM_TIMER, never in a hook. */
+static void pollPendingDrag()
+{
+    if (!g_btn_arm_pending) return;
+    std::vector<std::string> files;
+    if (g_drop_ready && dropHelperDragLive() &&
+        dropHelperTakeFiles(files) && !files.empty()) {
+        g_btn_arm_pending = false;
+        g_file_drag = true;
+        g_drag_files.swap(files);
+        emitStat("event=drop|state=ready|items=" +
+                 std::to_string(g_drag_files.size()));
+        /* The physical release can land while the captured list is still in
+         * flight, so the cross-window grace must be able to finish after the
+         * button is up: run the transfer from the message loop. */
+        if (!g_btn_down[1] && g_hwnd)
+            PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
+        return;
+    }
+    const ULONGLONG age = GetTickCount64() - g_btn_arm_tick;
+    if (age < DRAG_CAPTURE_GRACE_MS) return;
+    /* The helper announced a drag but the list is still being produced: do
+     * not arm the button yet (that would start a phantom drag on the peer),
+     * but do not wait forever on a wedged drag source either. */
+    if (dropHelperDragPending() && age < DRAG_CAPTURE_HARD_MS) return;
+    if (!g_btn_down[1]) {
+        /* Released while the capture was in flight: let KVM_WM_DROP deliver
+         * the final verdict now that the grace has elapsed. */
+        if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
+        return;
+    }
+    /* A still-held ordinary drag: arm its button now. */
+    g_btn_arm_pending = false;
+    armHeldButton(1);
 }
 
 static void enterRemote()
@@ -434,19 +518,28 @@ static void enterRemote()
     /* A file drag is the one gesture where re-arming the held left button is
      * wrong: the target never received its DOWN, and the local Explorer drag
      * must keep running until the physical release. The helper captures the
-     * selection at DragEnter, before the edge is crossed. */
+     * selection at DragEnter; that notification can land just after this
+     * crossing, so when the list is not there yet the button stays un-armed
+     * for DRAG_CAPTURE_GRACE_MS and pollPendingDrag() decides. */
     g_file_drag = false;
     g_drag_files.clear();
-    if (g_btn_down[1] && g_drop_ready && dropHelperReady()) {
+    g_btn_arm_pending = false;
+    bool may_be_file_drag = false;
+    /* g_btn_local[1]: only a press that actually reached this desktop can be
+     * an Explorer drag. A button that was pressed while controlling the peer
+     * must never adopt a capture, or a stale one could be replayed. */
+    if (g_btn_down[1] && g_btn_local[1] && g_drop_ready && dropHelperReady()) {
         /* Non-blocking: this runs on the hook/message-loop thread, and a
-         * LowLevelHooksTimeout would silently remove the mouse hook. The
-         * helper's 1-pixel strip sees DragEnter before the edge overshoot. */
+         * LowLevelHooksTimeout would silently remove the mouse hook. */
         std::vector<std::string> files;
-        if (dropHelperTakeFiles(files) && !files.empty()) {
+        if (dropHelperDragLive() && dropHelperTakeFiles(files) &&
+            !files.empty()) {
             g_file_drag = true;
             g_drag_files.swap(files);
             emitStat("event=drop|state=ready|items=" +
                      std::to_string(g_drag_files.size()));
+        } else {
+            may_be_file_drag = true;
         }
     }
 
@@ -475,7 +568,13 @@ static void enterRemote()
     g_state = ControlState::Remote;
     setCursorVisible(false);
     g_queue.pushMove((uint32_t)g_remote_x, (uint32_t)g_remote_y);
-    if (!g_file_drag) syncHeldInput();
+    if (!g_file_drag) {
+        syncHeldInput(!may_be_file_drag);
+        if (may_be_file_drag) {
+            g_btn_arm_pending = true;
+            g_btn_arm_tick = GetTickCount64();
+        }
+    }
     emitStitchState("remote");
 }
 
@@ -485,6 +584,7 @@ static void leaveRemote(bool warpCursor)
     g_state = ControlState::Local;
     g_file_drag = false;
     g_drag_files.clear();
+    g_btn_arm_pending = false;
 
     KvmEvent e = {};
     e.type = KVM_EV_RELEASE_ALL;
@@ -594,9 +694,18 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
          * g_btn_local. A press made in Remote stays false (it was swallowed). */
         if (g_state != ControlState::Remote) {
             g_btn_local[btn] = down;
-            /* Defer the actual discard to the message loop: nothing blocking
-             * may run inside a low-level hook. */
-            if (btn == 1 && down) g_discard_drag = true;
+        }
+        /* Any new left press starts a new gesture, so a capture the helper
+         * reported for an earlier one must never be adopted. This also covers
+         * presses made while controlling the peer, where no local drag can be
+         * in progress (a later crossing with that button held must not replay
+         * a stale selection). Only the atomic is set here; the actual discard
+         * runs in the message loop (nothing blocking in a hook). */
+        if (btn == 1 && down) {
+            g_discard_drag = true;
+            /* A new gesture: a deferred file drag from the previous one can
+             * never be completed now. The message loop discards the capture. */
+            g_btn_arm_pending = false;
         }
     }
 
@@ -624,11 +733,34 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
     if (!btn) return 1;
 
     if (g_file_drag && btn == 1 && !down) {
-        /* End the local Explorer drag normally: the helper's 1-pixel strip
+        /* End the local Explorer drag normally: the helper's 3-pixel strip
          * rejects the local drop, and the remote transfer starts from the
          * message loop with the release point. The target never received the
-         * matching DOWN, so no button-up is sent to it. */
+         * matching DOWN, so no button-up is sent to it.
+         *
+         * An Esc-cancelled gesture ends with DragLeave, which clears the
+         * helper's live flag; that must not become a copy, and the stale
+         * g_file_drag must not hijack a later release either. Only an atomic
+         * load runs in the hook here. */
         g_btn_local[1] = false;
+        if (!dropHelperDragLive()) {
+            g_file_drag = false;
+            return CallNextHookEx(nullptr, code, wp, lp);
+        }
+        g_drop_rel_x = g_tgt_x0 + g_remote_x;
+        g_drop_rel_y = g_tgt_y0 + g_remote_y;
+        if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+
+    if (btn == 1 && !down && g_btn_arm_pending) {
+        /* Released inside the drag-capture grace window: no DOWN was armed on
+         * the target, so an UP here would be unmatched. Defer to the message
+         * loop, which can still consume a capture that landed late and start
+         * the transfer; otherwise it completes the crossing as a click. */
+        g_btn_local[1] = false;
+        g_drop_rel_x = g_tgt_x0 + g_remote_x;
+        g_drop_rel_y = g_tgt_y0 + g_remote_y;
         if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
         return CallNextHookEx(nullptr, code, wp, lp);
     }
@@ -694,6 +826,9 @@ static void onRawMouse(const RAWMOUSE &m)
      * previous gesture. Done here (message loop), never in the hook. */
     if (g_discard_drag.exchange(false))
         dropHelperDiscard();
+    /* A crossing that may be a file drag is resolved as soon as the helper
+     * reports the captured paths (usually on the first sample after entry). */
+    pollPendingDrag();
 
     /* Windows clamps the cursor to the virtual desktop, so the low-level hook
      * keeps reporting a stationary point when the user pushes further right.
@@ -807,6 +942,9 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
              * here keeps SetCursorPos/ShowCursor/STAT on the hook thread. */
             const int req = g_side_req.exchange(-1);
             if (req >= 0) applySide(req);
+            /* Also resolve the post-crossing drag grace window when the
+             * pointer is held still (no WM_INPUT to drive it). */
+            pollPendingDrag();
             if (!g_running || !g_running->load()) {
                 leaveRemote(false);
                 PostQuitMessage(0);
@@ -820,11 +958,52 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         leaveRemote(true);
         return 0;
     case KVM_WM_DROP: {
-        if (!g_file_drag) return 0;
-        const int sx = g_tgt_x0 + g_remote_x;
-        const int sy = g_tgt_y0 + g_remote_y;
+        /* mouseProc observed a live OLE drag, but a DragLeave (Esc) can be
+         * processed by the helper thread between that check and this message.
+         * A cancelled gesture must never start a transfer. A normal OLE Drop
+         * deliberately sends no NODRAG, so this only rejects a cancellation. */
+        if (g_file_drag && !dropHelperDragLive()) {
+            g_file_drag = false;
+            g_drag_files.clear();
+            g_btn_arm_pending = false;
+            leaveRemote(true);
+            return 0;
+        }
+        if (!g_file_drag) {
+            /* A release inside the drag-capture grace window is resolved
+             * here, on the message loop: consume the capture if it landed
+             * late; if it is a real file drag whose FILES_END is still in
+             * flight, keep waiting (pollPendingDrag re-posts this message);
+             * otherwise complete the crossing as an ordinary click. */
+            if (!g_btn_arm_pending) return 0;
+            std::vector<std::string> files;
+            if (g_drop_ready && dropHelperDragLive() &&
+                dropHelperTakeFiles(files) && !files.empty()) {
+                g_file_drag = true;
+                g_drag_files.swap(files);
+            } else {
+                /* The absence of a capture is ambiguous this early (the
+                 * DragEnter notification is itself in flight), so never
+                 * decide inside the grace window. Wait out the window and,
+                 * for a slow CF_HDROP render, a bounded extra period. */
+                const ULONGLONG age = GetTickCount64() - g_btn_arm_tick;
+                if (age < DRAG_CAPTURE_GRACE_MS) return 0;
+                if (dropHelperDragPending() && age < DRAG_CAPTURE_HARD_MS)
+                    return 0;
+                g_btn_arm_pending = false;
+                /* No capture and none still in flight. If the helper ever
+                 * announced a drag this was a cancelled/failed file drag and
+                 * gets no click; otherwise the press was an ordinary click
+                 * that was never armed on the peer. */
+                if (!dropHelperDragSeen() && !g_btn_down[1]) {
+                    queueButton(1, true);
+                    queueButton(1, false);
+                }
+                return 0;
+            }
+        }
         g_file_drag = false;
-        startFileDrop(sx, sy);
+        startFileDrop(g_drop_rel_x, g_drop_rel_y);
         leaveRemote(true);
         return 0;
     }
@@ -1181,6 +1360,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     g_drop_ready = false;
     g_file_drag = false;
     g_drag_files.clear();
+    g_btn_arm_pending = false;
     g_drop_cancel = false;
     g_drop_active = false;
     g_drop_port = (uint16_t)DROP_PORT;
@@ -1226,7 +1406,10 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         BOOL nodelay = TRUE;
         setsockopt(g_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay,
                    sizeof(nodelay));
-        kvmSetTimeouts(g_sock, 0, 300);
+        /* 2 s, not 300 ms: a KVM event is 16 bytes, and one send-timeout used
+         * to tear the whole session down whenever the 8085 copy channel (or a
+         * busy Wi-Fi) made the link stall for a fraction of a second. */
+        kvmSetTimeouts(g_sock, 0, 2000);
         kvmEnableKeepAlive(g_sock);
 
         KvmHello hello = {};
@@ -1529,6 +1712,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     g_drop_ready = false;
     g_file_drag = false;
     g_drag_files.clear();
+    g_btn_arm_pending = false;
     if (g_drop_thread.joinable()) g_drop_thread.join();
     g_drop_active = false;
     mivaraSecureZero(g_drop_token, sizeof(g_drop_token));
@@ -2152,7 +2336,7 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     const ULONGLONG hs_start = GetTickCount64();
     HsGuard hs(peer_ip);
 
-    kvmSetTimeouts(client, 1000, 1000);
+    kvmSetTimeouts(client, 1000, 2000);
     kvmEnableKeepAlive(client);
 
     KvmHello hello = {};

@@ -105,6 +105,12 @@
 /* ── Constants ──────────────────────────────────────────────────────────── */
 #define BYTES_PER_PIXEL       3
 #define CONNECTION_TIMEOUT_MS 10000//5000
+
+/* A single SO_SNDTIMEO expiry is a stalled link, not a dead peer. Retrying
+ * until the socket has made no progress for this long rides out a Wi-Fi
+ * roam / channel scan / congestion burst; a real disconnect still surfaces
+ * via a hard socket error (or the receiver closing). */
+#define SEND_STALL_LIMIT_MS 12000
 #define STATS_INTERVAL_SEC    5
 #define MAX_FRAME_SKIP        3
 #define MAX_FRAME_BYTES       (7680u * 4320u * 3u)
@@ -286,11 +292,31 @@ class NetworkSocket
     void raw_close()      { ::close(_s); _s = -1; }
 #endif
     bool _quiet = false;    /* one-shot probes: no error chatter */
+    bool _nonblock = false; /* streaming: exact send counts, safe to retry */
 
 public:
     ~NetworkSocket() { close(); }
 
     void close() { if (valid()) raw_close(); }
+
+    /* Switch the data socket to non-blocking for streaming. A blocking
+     * Winsock send that hits SO_SNDTIMEO may already have copied a prefix
+     * into the send buffer while reporting no byte count, so retrying it
+     * would duplicate that prefix and desynchronise the frame stream. In
+     * non-blocking mode a full buffer reports WSAEWOULDBLOCK with nothing
+     * accepted, which makes retrying safe. */
+    bool setNonBlocking() {
+        if (!valid()) return false;
+#ifdef _WIN32
+        u_long one = 1;
+        if (ioctlsocket(_s, FIONBIO, &one) != 0) return false;
+#else
+        int fl = fcntl(_s, F_GETFL, 0);
+        if (fl < 0 || fcntl(_s, F_SETFL, fl | O_NONBLOCK) < 0) return false;
+#endif
+        _nonblock = true;
+        return true;
+    }
 
     bool create() {
         close();
@@ -373,9 +399,11 @@ public:
         setsockopt(_s, IPPROTO_TCP, TCP_NODELAY, (char *)&nd, sizeof(nd));
         setsockopt(_s, SOL_SOCKET,  SO_SNDBUF,   (char *)&sb, sizeof(sb));
 
-        /* I/O timeouts: a half-dead peer must not block send/recv forever –
-         * the session has to end (and the virtual display detach) even when
-         * the connection dies silently. Windows takes DWORD milliseconds. */
+        /* Handshake I/O timeouts: a half-dead peer must not block send/recv
+         * forever. The streaming path switches to non-blocking after the
+         * handshake and enforces its own no-progress budget (sendAll), so
+         * these values only bound the pre-stream exchange. Windows takes
+         * DWORD milliseconds. */
 #ifdef _WIN32
         DWORD tmo = 2000;
         setsockopt(_s, SOL_SOCKET, SO_SNDTIMEO, (char *)&tmo, sizeof(tmo));
@@ -408,25 +436,61 @@ public:
     bool sendAll(const void *data, size_t size) {
         const char *p = (const char *)data;
         size_t sent = 0;
+        auto last_progress = std::chrono::steady_clock::now();
         while (sent < size && g_running) {
             int n = (int)send(_s, p + sent, (int)(size - sent), 0);
-#ifdef _WIN32
-            if (n == SOCKET_ERROR) {
-                if (!_quiet)
-                    std::cerr << COL_RED << "Send error: "
-                              << WSAGetLastError() << COL_RESET << "\n";
-                return false;
+            if (n > 0) {
+                sent += (size_t)n;
+                last_progress = std::chrono::steady_clock::now();
+                continue;
             }
-#else
-            if (n < 0) {
-                if (!_quiet)
-                    std::cerr << COL_RED << "Send error: "
-                              << strerror(errno) << COL_RESET << "\n";
-                return false;
-            }
-#endif
             if (n == 0) return false;
-            sent += (size_t)n;
+#ifdef _WIN32
+            const int err = WSAGetLastError();
+            const bool blocked = err == WSAEWOULDBLOCK;
+#else
+            const int err = errno;
+            const bool blocked = err == EAGAIN || err == EWOULDBLOCK;
+#endif
+            /* Only a non-blocking "would block" is retryable: no byte was
+             * accepted. A blocking socket that timed out may have queued an
+             * unreported prefix, so continuing would duplicate it. */
+            if (!_nonblock || !blocked) {
+                if (!_quiet)
+#ifdef _WIN32
+                    std::cerr << COL_RED << "Send error: " << err
+                              << COL_RESET << "\n";
+#else
+                    std::cerr << COL_RED << "Send error: " << strerror(err)
+                              << COL_RESET << "\n";
+#endif
+                return false;
+            }
+            if (std::chrono::steady_clock::now() - last_progress >=
+                std::chrono::milliseconds(SEND_STALL_LIMIT_MS)) {
+                if (!_quiet)
+                    std::cerr << COL_RED << "Send stalled for "
+                              << SEND_STALL_LIMIT_MS / 1000 << " s"
+                              << COL_RESET << "\n";
+                return false;
+            }
+            /* Wait for writability in short slices, so a stop request is
+             * noticed promptly and the stall deadline stays monotonic. */
+            fd_set wr;
+            FD_ZERO(&wr);
+            FD_SET(_s, &wr);
+            timeval tv = {0, 200000};
+#ifdef _WIN32
+            const int sel = select(0, nullptr, &wr, nullptr, &tv);
+#else
+            const int sel = select(_s + 1, nullptr, &wr, nullptr, &tv);
+#endif
+            if (sel < 0) {
+                if (!_quiet)
+                    std::cerr << COL_RED << "Send wait failed" << COL_RESET
+                              << "\n";
+                return false;
+            }
         }
         return sent == size;
     }
@@ -1975,6 +2039,17 @@ int main(int argc, char* argv[])
                   << "\n" << std::flush;
     }
 
+    /* From here on the socket is non-blocking: the streaming loop only sends,
+     * and exact byte counts are what make a stalled-link retry safe. */
+    if (!conn.setNonBlocking()) {
+        std::cerr << COL_RED
+                  << "Cannot switch the stream socket to non-blocking\n"
+                  << COL_RESET;
+        emitStatError("socket_nonblocking_failed");
+        cleanupSockets();
+        return 1;
+    }
+
     std::cout << COL_GREEN << "Streaming – Ctrl+C to stop\n" << COL_RESET;
     emitStatStart();
     /* The stdin reader already runs (started before the handshake). */
@@ -1988,6 +2063,8 @@ int main(int argc, char* argv[])
     size_t     stat_bytes  = 0;   /* payload since the last stats interval */
     int        stat_frames = 0;
     int        fbehind     = 0;
+    int        capture_misses = 0;   /* consecutive empty captures */
+    std::chrono::steady_clock::time_point capture_fail_since{};
     std::vector<uint8_t> comp_buf;
     std::vector<uint8_t> au;
 
@@ -2161,9 +2238,27 @@ int main(int argc, char* argv[])
 
         auto frame = captureScreen();
         if (frame.empty()) {
+            /* A display-mode switch, a UAC / secure-desktop transition or a
+             * driver hiccup can make a capture fail for a moment. Retry for
+             * up to ~3 s of wall-clock time (not a frame count: captureScreen
+             * allocates and zeroes the full frame, so a frame-based budget
+             * could stretch far past the receiver's read timeout). */
+            const auto now = std::chrono::steady_clock::now();
+            if (!capture_fail_since.time_since_epoch().count())
+                capture_fail_since = now;
+            if (g_running &&
+                now - capture_fail_since < std::chrono::seconds(3)) {
+                if (capture_misses++ == 0)
+                    std::cerr << COL_YELLOW
+                              << "Capture failed – retrying\n" << COL_RESET;
+                std::this_thread::sleep_for(frame_dur);
+                continue;
+            }
             emitStatError("capture_failed_or_display_changed");
             break;
         }
+        capture_misses = 0;
+        capture_fail_since = std::chrono::steady_clock::time_point{};
 
         if (isCodedCodec()) {
             /* Coded: one access unit per frame, framed like any DATA packet */

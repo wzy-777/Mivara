@@ -1769,11 +1769,14 @@ static bool runSession(GrantedSession &sess)
 
     int sb = SOCK_BUF;
     setsockopt(client, SOL_SOCKET, SO_RCVBUF, (char *)&sb, sizeof(sb));
+    /* Backstop only: the sender retries a stalled send for up to 12 s before
+     * dropping the session, so this must stay comfortably above that. A
+     * shorter value turned a transient link stall into a disconnect. */
 #ifdef _WIN32
-    DWORD to = 10000;
+    DWORD to = 30000;
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&to, sizeof(to));
 #else
-    struct timeval tv = {10, 0};
+    struct timeval tv = {30, 0};
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 

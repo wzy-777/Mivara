@@ -192,9 +192,15 @@ Driver installation and resolution configuration are covered in [Virtual Display
 | Process `exit()` | `atexit(vddShutdown)` fallback |
 | GUI "Stop streaming" | `STOP|mivara` over stdin for graceful stop (waits up to 8 s), or Ctrl+Break for a visible console without a pipe; the GUI calls `vddForceDetach()` if the sender had to be hard-killed |
 
-The streaming socket has a 2 s send timeout: when the peer disconnects or
-goes silent the send fails quickly, the session ends, and the virtual
-display is detached immediately instead of hanging.
+The socket is blocking during the handshake (2 s send timeout) and is
+switched to non-blocking for streaming: `send` then returns the exact number
+of bytes accepted, and a full buffer is waited out with `select`, so a retry
+never duplicates an already-queued prefix. The session ends only after 12 s
+without any send progress. A Wi-Fi roam, channel scan or short congestion
+burst can therefore no longer tear down a healthy session, while a peer that
+really disconnects or goes silent is still noticed and the virtual display is
+detached within a bounded time. The receiver's 10 s read timeout is relaxed
+to 30 s as the backstop, which must always stay above the sender's tolerance.
 
 ### 4 — Frame Streaming
 
@@ -273,7 +279,7 @@ The proof binds this connection with the stitch purpose (`purpose=2`): `HMAC-SHA
 
 ### 7 — Stitch File Drop (8085, optional)
 
-File drop is a companion channel of a stitch session — **not a display mode and not a new session**: it does not claim the 8081/8084 active-session slot, adds no second approval prompt and is off by default on both ends. When the controller enables `--file-drop 1` and the Medium-integrity `stitchcap.exe` helper is ready, it sets `KVM_FEATURE_FILE_DROP` in `KvmHello.reserved[1]`; the target echoes it only when `file_drop_accept=1`, the 8085 listener is up and authorization succeeded, then sends one marker plus eight fixed `KvmEvent` frames carrying a 32-byte one-shot token after `KvmReply`. The controller reads this fixed sequence before starting `drainLoop()`, so the 16-byte event stream never desynchronises. 8085 is a separate TCP service: `DropHello` carries the token, transfer id, release point and item/byte limits; manifest, chunks, per-file SHA-256 and a result frame follow. The target stages under `%LOCALAPPDATA%\Mivara\Drop\<transfer>`, verifies every file, then copies the top-level items into the Explorer/Desktop folder under the release point; copy-only, never overwrite, move or delete the source. Source-side edge capture is done by `stitchcap.exe`: an asInvoker process launched with the shell token (Medium integrity) that owns a 3-pixel topmost strip on the shared edge, reads `CF_HDROP` in `DragEnter`, reports the paths over a named pipe and returns `DROPEFFECT_NONE`, so nothing is copied locally. Medium is mandatory: a High window cannot receive a Medium Explorer's OLE drop (UIPI).
+File drop is a companion channel of a stitch session — **not a display mode and not a new session**: it does not claim the 8081/8084 active-session slot, adds no second approval prompt and is off by default on both ends. When the controller enables `--file-drop 1` and the Medium-integrity `stitchcap.exe` helper is ready, it sets `KVM_FEATURE_FILE_DROP` in `KvmHello.reserved[1]`; the target echoes it only when `file_drop_accept=1`, the 8085 listener is up and authorization succeeded, then sends one marker plus eight fixed `KvmEvent` frames carrying a 32-byte one-shot token after `KvmReply`. The controller reads this fixed sequence before starting `drainLoop()`, so the 16-byte event stream never desynchronises. 8085 is a separate TCP service: `DropHello` carries the token, transfer id, release point and item/byte limits; manifest, chunks, per-file SHA-256 and a result frame follow. The target stages under `%LOCALAPPDATA%\Mivara\Drop\<transfer>`, verifies every file, then copies the top-level items into the Explorer/Desktop folder under the release point; copy-only, never overwrite, move or delete the source. Source-side edge capture is done by `stitchcap.exe`: an asInvoker process launched with the shell token (Medium integrity) that owns a 3-pixel topmost strip on the shared edge, reads `CF_HDROP` in `DragEnter`, reports the paths over a named pipe, advertises `DROPEFFECT_COPY` from `DragEnter`/`DragOver` and returns `DROPEFFECT_NONE` from `Drop`, so nothing is copied locally. COPY is mandatory: with a NONE effect OLE never calls `Drop` on release and calls `DragLeave` instead, which clears the capture. The DragEnter report races the edge crossing: when the paths have not arrived yet, the controller leaves the held left button un-armed on the peer and keeps polling the helper for a 200 ms grace window; if the paths arrive it treats the gesture as a file drag. A release inside the window is never decided on arrival: it waits out the 200 ms window and, when the helper has announced a drag but the path list is still being produced (a slow CF_HDROP render, e.g. a cloud/virtual file), up to a 2 s hard cap. A capture that arrives then starts the transfer at the release point; only a gesture with no drag announcement is completed as an ordinary click, and a drag cancelled with Esc/DragLeave is never turned into a copy. Medium is mandatory: a High window cannot receive a Medium Explorer's OLE drop (UIPI).
 
 ## Protocol Reference
 

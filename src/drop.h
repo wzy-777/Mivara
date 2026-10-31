@@ -126,6 +126,17 @@ void dropHelperStop();
 bool dropHelperReady();
 /** Take the most recently captured drag selection (UTF-8 paths). Clears it. */
 bool dropHelperTakeFiles(std::vector<std::string> &out);
+/** True while the helper still has an active OLE drag (FILES_END seen, no
+ *  DragLeave yet; OLE Drop deliberately does not clear it, so the release
+ *  handler can still read the paths). Lets the release handler ignore an
+ *  Esc-cancelled drag. */
+bool dropHelperDragLive();
+/** True from the helper's DragEnter until the next left-button down (FILES_END
+ *  or not). Distinguishes a file drag from an ordinary click at release. */
+bool dropHelperDragSeen();
+/** True after the helper announced a drag but before FILES_END/NODRAG: the
+ *  path list is still being produced (slow CF_HDROP render). */
+bool dropHelperDragPending();
 /** Drop a stale captured selection (called on a new local button-down). */
 void dropHelperDiscard();
 /** Move the helper's 1-pixel strip to another edge. */

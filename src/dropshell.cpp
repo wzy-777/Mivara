@@ -576,6 +576,21 @@ struct HelperState {
     std::atomic<bool> hello{false};
     std::atomic<int> il{0x3000};
     std::atomic<int> shell_il{0x2000};
+    /* True between the helper's FILES_END and the next NODRAG. The edge
+     * release handler consults this so an Esc-cancelled drag is not turned
+     * into a copy. Written by helperReader, read from the hook thread. */
+    std::atomic<bool> drag_live{false};
+    /* True from the helper's DragEnter ("DRAG") until the next left-button
+     * down. Lets a release inside the capture grace window tell a real file
+     * drag (wait for FILES_END) from an ordinary click (complete it now),
+     * even when the captured list has not arrived yet. */
+    std::atomic<bool> drag_seen{false};
+    /* The helper announced a drag ("DRAG") but FILES_END has not arrived
+     * yet. A slow CF_HDROP render (cloud/virtual files, a large selection)
+     * can take far longer than the grace window, so the controller keeps the
+     * press un-armed while this is set (bounded by a hard cap). Cleared by
+     * FILES_END, NODRAG, discard and stop. */
+    std::atomic<bool> drag_pending{false};
     std::vector<std::string> files;
     uint64_t files_tick = 0;
     std::string pipe_name;
@@ -716,7 +731,10 @@ void helperReader()
         std::string msg(buf.data(), got);
         while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
             msg.pop_back();
-        if (msg.rfind("READY\t", 0) == 0) {
+        if (msg == "DRAG") {
+            g_helper.drag_seen = true;
+            g_helper.drag_pending = true;
+        } else if (msg.rfind("READY\t", 0) == 0) {
             const int il = (int)strtol(msg.c_str() + 6, nullptr, 0);
             g_helper.il = il;
             g_helper.hello = true;
@@ -736,14 +754,23 @@ void helperReader()
                 start = tab + 1;
             }
         } else if (msg == "FILES_END") {
-            std::lock_guard<std::mutex> lk(g_helper.m);
-            g_helper.files = pending;
-            g_helper.files_tick = GetTickCount64();
-            pending.clear();
+            {
+                std::lock_guard<std::mutex> lk(g_helper.m);
+                g_helper.files = pending;
+                g_helper.files_tick = GetTickCount64();
+                pending.clear();
+            }
+            g_helper.drag_live = true;
+            g_helper.drag_seen = true;
+            g_helper.drag_pending = false;
         } else if (msg == "NODRAG") {
-            std::lock_guard<std::mutex> lk(g_helper.m);
-            g_helper.files.clear();
-            pending.clear();
+            {
+                std::lock_guard<std::mutex> lk(g_helper.m);
+                g_helper.files.clear();
+                pending.clear();
+            }
+            g_helper.drag_live = false;
+            g_helper.drag_pending = false;
         } else if (msg == "BYE" || msg == "QUIT") {
             break;
         }
@@ -832,6 +859,9 @@ void dropHelperStop()
         g_helper.proc = nullptr;
     }
     g_helper.ready = false;
+    g_helper.drag_live = false;
+    g_helper.drag_seen = false;
+    g_helper.drag_pending = false;
     std::lock_guard<std::mutex> lk(g_helper.m);
     g_helper.files.clear();
 }
@@ -852,8 +882,28 @@ bool dropHelperTakeFiles(std::vector<std::string> &out)
 
 void dropHelperDiscard()
 {
-    std::lock_guard<std::mutex> lk(g_helper.m);
-    g_helper.files.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_helper.m);
+        g_helper.files.clear();
+    }
+    g_helper.drag_live = false;
+    g_helper.drag_seen = false;
+    g_helper.drag_pending = false;
+}
+
+bool dropHelperDragLive()
+{
+    return g_helper.drag_live.load();
+}
+
+bool dropHelperDragSeen()
+{
+    return g_helper.drag_seen.load();
+}
+
+bool dropHelperDragPending()
+{
+    return g_helper.drag_pending.load();
 }
 
 void dropHelperSetSide(int side)
@@ -875,6 +925,9 @@ void dropHelperStop() {}
 bool dropHelperReady() { return false; }
 bool dropHelperTakeFiles(std::vector<std::string> &) { return false; }
 void dropHelperDiscard() {}
+bool dropHelperDragLive() { return false; }
+bool dropHelperDragSeen() { return false; }
+bool dropHelperDragPending() { return false; }
 void dropHelperSetSide(int) {}
 
 #endif /* _WIN32 */

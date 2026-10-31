@@ -5,9 +5,11 @@
  * Medium Explorer from dropping onto a High window, so the controller launches
  * this tiny asInvoker helper with the shell token. It owns a 3-pixel topmost
  * strip on the shared edge, registers IDropTarget, captures CF_HDROP on
- * DragEnter and forwards the path list over a named pipe. It returns
- * DROPEFFECT_NONE, so it never performs a local copy; the controller does the
- * network transfer and the target commits at the release point.
+ * DragEnter and forwards the path list over a named pipe. DragEnter/DragOver
+ * advertise DROPEFFECT_COPY so OLE delivers Drop (rather than DragLeave) on
+ * release; Drop itself returns DROPEFFECT_NONE, so it never performs a local
+ * copy. The controller does the network transfer and the target commits at
+ * the release point.
  *
  * No file data is read here. Only the dragged paths are forwarded.
  */
@@ -128,8 +130,17 @@ public:
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL,
                                         DWORD *effect) override
     {
-        if (effect) *effect = DROPEFFECT_NONE;
+        /* Advertise COPY while the drag is over the strip: OLE only calls
+         * IDropTarget::Drop when the last DragOver effect is not NONE. With
+         * NONE it calls DragLeave on release, which would erase the captured
+         * paths exactly when the controller needs them. Drop itself still
+         * returns NONE, so nothing is ever copied locally. */
+        if (effect) *effect = DROPEFFECT_COPY;
         if (!data) return S_OK;
+        /* Announce the gesture before the (potentially slower) path
+         * extraction, so the controller can tell a file drag from an ordinary
+         * click even when FILES_END is still in flight at release. */
+        sendLine("DRAG\n");
         FORMATETC fmt = {(CLIPFORMAT)CF_HDROP, nullptr, DVASPECT_CONTENT, -1,
                          TYMED_HGLOBAL};
         STGMEDIUM stg = {};
@@ -149,13 +160,22 @@ public:
             }
         }
         ReleaseStgMedium(&stg);
-        if (!paths.empty()) sendFiles(paths);
+        if (paths.empty()) {
+            /* Not an HDROP drag (text, an image, a failed render): no list is
+             * coming, so clear the controller's "capture in flight" state at
+             * once instead of making it wait for the hard cap. */
+            sendLine("NODRAG\n");
+        } else {
+            sendFiles(paths);
+        }
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD *effect) override
     {
-        if (effect) *effect = DROPEFFECT_NONE;
+        /* Must stay non-NONE or OLE turns the release into DragLeave instead
+         * of Drop (see DragEnter). */
+        if (effect) *effect = DROPEFFECT_COPY;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DragLeave() override
@@ -167,9 +187,13 @@ public:
                                    DWORD *effect) override
     {
         if (effect) *effect = DROPEFFECT_NONE;
-        /* Drop is not always followed by DragLeave; clear the captured list
-         * so a release on the strip cannot leak into the next gesture. */
-        sendLine("NODRAG\n");
+        /* Deliberately no NODRAG here: OLE calls Drop for every normal
+         * release over the strip (DragEnter/DragOver advertise COPY), and the
+         * controller's posted drop work may run after this callback. Sending
+         * NODRAG would clear the captured paths before the transfer starts.
+         * A cancelled drag still sends NODRAG from DragLeave, and the
+         * controller also discards the list on its next left-button down, so
+         * nothing leaks into the next gesture. */
         return S_OK;
     }
 };

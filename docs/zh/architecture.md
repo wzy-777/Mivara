@@ -194,7 +194,7 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 | 进程 `exit()` | `atexit(vddShutdown)` 兜底 |
 | GUI「停止推流」 | 通过 stdin 发送 `STOP|mivara` 优雅停止（最长等 8 秒）；无管道的可见控制台使用 Ctrl+Break，若被强杀则 GUI 调 `vddForceDetach()` 兜底 |
 
-推流套接字带 2 秒发送超时：对端断开或假死时发送很快失败，会话立即收尾拆除虚拟显示器，不会卡死。
+推流握手阶段的套接字是阻塞的，单次发送超时为 2 秒；进入推流后套接字切换为非阻塞：`send` 返回实际接受的字节数，缓冲区满时用 `select` 等待可写，因此重试不会重复发送已排队的字节。连续 12 秒没有任何发送进展才结束会话。这样 Wi-Fi 漫游、信道扫描或短时拥塞不会把正常会话拆掉，而对端真正断开或假死时仍能在有限时间内收尾并拆除虚拟显示器。接收端 10 秒读超时相应放宽到 30 秒，作为兜底（发送端的容忍上限必须始终低于它）。
 
 ### 4 — 帧流
 
@@ -273,7 +273,7 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 
 ### 7 — 拼接文件投放（8085，可选）
 
-文件投放是拼接会话的伴随通道，**不是新的显示模式，也不是新的会话**：它不占用 8081/8084 的活动会话槽，不额外弹授权框，默认在两端关闭。控制器开启 `--file-drop 1` 且 Medium 完整性的 `stitchcap.exe` 就绪时，在 `KvmHello.reserved[1]` 置 `KVM_FEATURE_FILE_DROP`；接收端仅在 `file_drop_accept=1`、8085 监听正常且授权成功时回显该位，并在 `KvmReply` 之后发送「1 个标记 + 8 个固定 `KvmEvent`」承载 32 字节一次性令牌。控制器在启动 `drainLoop()` 之前按固定长度读完，因此 16 字节事件流不会失步。8085 是独立 TCP 服务：`DropHello` 携带令牌、传输 id、松手坐标与数量/字节上限；之后是 manifest、分块、逐文件 SHA-256 与结果帧。接收端把文件写入 `%LOCALAPPDATA%\Mivara\Drop\<transfer>`，校验通过后复制到松手位置所在的资源管理器/桌面文件夹；只复制，绝不覆盖、移动或删除源文件。发送端的边缘捕获由 `stitchcap.exe` 完成：它是 asInvoker 进程（用 shell 令牌启动，Medium 完整性），在共享边放一条 3 像素置顶窗口，`DragEnter` 读取 `CF_HDROP` 后经命名管道上报，并返回 `DROPEFFECT_NONE`，因此本机不会发生复制。Medium 是硬要求：High 窗口收不到 Medium Explorer 的 OLE drop（UIPI）。
+文件投放是拼接会话的伴随通道，**不是新的显示模式，也不是新的会话**：它不占用 8081/8084 的活动会话槽，不额外弹授权框，默认在两端关闭。控制器开启 `--file-drop 1` 且 Medium 完整性的 `stitchcap.exe` 就绪时，在 `KvmHello.reserved[1]` 置 `KVM_FEATURE_FILE_DROP`；接收端仅在 `file_drop_accept=1`、8085 监听正常且授权成功时回显该位，并在 `KvmReply` 之后发送「1 个标记 + 8 个固定 `KvmEvent`」承载 32 字节一次性令牌。控制器在启动 `drainLoop()` 之前按固定长度读完，因此 16 字节事件流不会失步。8085 是独立 TCP 服务：`DropHello` 携带令牌、传输 id、松手坐标与数量/字节上限；之后是 manifest、分块、逐文件 SHA-256 与结果帧。接收端把文件写入 `%LOCALAPPDATA%\Mivara\Drop\<transfer>`，校验通过后复制到松手位置所在的资源管理器/桌面文件夹；只复制，绝不覆盖、移动或删除源文件。发送端的边缘捕获由 `stitchcap.exe` 完成：它是 asInvoker 进程（用 shell 令牌启动，Medium 完整性），在共享边放一条 3 像素置顶窗口，`DragEnter` 读取 `CF_HDROP` 后经命名管道上报；`DragEnter`/`DragOver` 返回 `DROPEFFECT_COPY`、`Drop` 返回 `DROPEFFECT_NONE`，因此本机不会发生复制。COPY 是必需的：若拖拽过程中返回 NONE，OLE 松开鼠标时根本不会调用 `Drop`，而是调用会清空捕获的 `DragLeave`。`DragEnter` 上报与边缘穿越之间存在异步竞态：控制器在跨屏时若还没拿到路径，会先不向对端补发按住的左键，并在 200 毫秒宽限期内继续轮询助手；拿到路径就按文件拖拽处理。宽限期内的松手不会当场判定：先等满 200 毫秒；若助手已经宣布拖拽但路径列表仍在生成（例如云文件/虚拟文件的 `CF_HDROP` 渲染较慢），再最多等 2 秒。路径到达就按松手时快照的坐标发起复制；只有完全没有拖拽通知的普通点击才补成点击，取消的拖拽不会被当成复制。Medium 是硬要求：High 窗口收不到 Medium Explorer 的 OLE drop（UIPI）。
 
 ## 协议速查
 
