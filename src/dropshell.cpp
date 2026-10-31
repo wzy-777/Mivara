@@ -36,6 +36,7 @@
 #  include <shlguid.h>
 #  include <shellapi.h>
 #  include <knownfolders.h>
+#  include <sddl.h>
 #endif
 
 #ifdef _WIN32
@@ -248,9 +249,15 @@ bool explorerFolder(HWND root, POINT screen, HWND hit, std::wstring &out,
             continue;
         ComPtr<IShellView> view;
         if (FAILED(browser->QueryActiveShellView(&view)) || !view) continue;
+        /* GetItemObject(SVGIO_BACKGROUND, IID_IFolderView) is the classic
+         * route, but Windows 11 26200 returns E_NOINTERFACE for it (and for a
+         * QI to IOleWindow on the view). The view object itself implements
+         * IFolderView, and IShellView derives from IOleWindow, so both are
+         * reachable directly — without this every drop over Explorer silently
+         * fell back to Downloads\Mivara. */
         ComPtr<IFolderView> folderView;
-        if (FAILED(view->GetItemObject(SVGIO_BACKGROUND, IID_IFolderView,
-                                       (void **)&folderView)) || !folderView)
+        if (FAILED(view->QueryInterface(IID_IFolderView,
+                                        (void **)&folderView)) || !folderView)
             continue;
         ComPtr<IShellFolder> shellFolder;
         if (FAILED(folderView->GetFolder(IID_IShellFolder,
@@ -267,10 +274,9 @@ bool explorerFolder(HWND root, POINT screen, HWND hit, std::wstring &out,
         const bool currentIsFs = SHGetPathFromIDListW(pidl, current) != FALSE;
 
         HWND viewWnd = nullptr;
-        ComPtr<IOleWindow> oleWindow;
-        if (SUCCEEDED(view->QueryInterface(IID_IOleWindow,
-                                           (void **)&oleWindow)) && oleWindow)
-            oleWindow->GetWindow(&viewWnd);
+        /* IShellView inherits IOleWindow; a QI to IID_IOleWindow is refused
+         * on Windows 11 26200, the inherited method is not. */
+        view->GetWindow(&viewWnd);
 
         /* Win11 tabs share one top-level HWND: the hidden tab's view keeps a
          * rect over the same screen area, so geometry alone can pick the wrong
@@ -568,7 +574,17 @@ namespace {
 struct HelperState {
     std::mutex m;
     std::mutex write_m;
-    HANDLE pipe = INVALID_HANDLE_VALUE;
+    /* Two ONE-WAY pipes, not one duplex pipe. A named-pipe handle created
+     * without FILE_FLAG_OVERLAPPED is a synchronous file object, and the I/O
+     * manager serializes every operation on it: a ReadFile pending on one
+     * thread blocks a WriteFile from another thread (and vice versa) until the
+     * read completes. The helper always has a read pending for SIDE/QUIT, so
+     * a duplex handle would deadlock both directions — the helper could never
+     * report DRAG/FILES, and this side could never send SIDE/QUIT. Each handle
+     * below carries traffic in exactly one direction, so synchronous I/O is
+     * safe. */
+    HANDLE pipe = INVALID_HANDLE_VALUE;  /* inbound: helper -> controller */
+    HANDLE ctl = INVALID_HANDLE_VALUE;   /* outbound: controller -> helper */
     HANDLE proc = nullptr;
     std::thread reader;
     std::atomic<bool> stop{false};
@@ -616,13 +632,45 @@ int tokenIntegrity(HANDLE tok)
     return (int)*GetSidSubAuthority(label->Label.Sid, count - 1);
 }
 
+/* Both server pipes are opened overlapped. A synchronous ConnectNamedPipe /
+ * ReadFile cannot be cancelled, so a helper that dies before connecting would
+ * wedge dropHelperStop (and the sender's startup/teardown) forever. Overlapped
+ * I/O lets the reader wait in short slices, notice g_helper.stop, and cancel. */
+bool waitOverlapped(HANDLE h, OVERLAPPED &ov, DWORD &transferred)
+{
+    for (;;) {
+        if (g_helper.stop.load()) {
+            CancelIoEx(h, &ov);
+            WaitForSingleObject(ov.hEvent, 1000);
+            return false;
+        }
+        const DWORD w = WaitForSingleObject(ov.hEvent, 50);
+        if (w == WAIT_OBJECT_0)
+            return GetOverlappedResult(h, &ov, &transferred, FALSE) != FALSE;
+        if (w != WAIT_TIMEOUT) return false;
+    }
+}
+
 bool writeLine(const std::string &line)
 {
     std::lock_guard<std::mutex> lk(g_helper.write_m);
-    if (g_helper.pipe == INVALID_HANDLE_VALUE) return false;
+    if (g_helper.ctl == INVALID_HANDLE_VALUE) return false;
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) return false;
     DWORD wrote = 0;
-    return WriteFile(g_helper.pipe, line.data(), (DWORD)line.size(), &wrote,
-                     nullptr) != FALSE;
+    BOOL ok = WriteFile(g_helper.ctl, line.data(), (DWORD)line.size(), &wrote,
+                        &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        if (WaitForSingleObject(ov.hEvent, 2000) == WAIT_OBJECT_0)
+            ok = GetOverlappedResult(g_helper.ctl, &ov, &wrote, FALSE);
+        else {
+            CancelIoEx(g_helper.ctl, &ov);
+            ok = FALSE;
+        }
+    }
+    CloseHandle(ov.hEvent);
+    return ok != FALSE;
 }
 
 std::wstring helperExePath()
@@ -637,11 +685,86 @@ std::wstring helperExePath()
     return s.substr(0, sep + 1) + L"stitchcap.exe";
 }
 
-bool launchHelper(const std::wstring &exe, const std::wstring &pipe,
-                  int side, HANDLE &proc, int &shell_il)
+std::wstring sidStringFromToken(HANDLE tok)
 {
-    const std::wstring cmd = L"\"" + exe + L"\" --pipe \"" + pipe +
-                             L"\" --side " + std::to_wstring(side);
+    if (!tok) return std::wstring();
+    DWORD len = 0;
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &len);
+    if (!len) return std::wstring();
+    std::vector<BYTE> buf(len);
+    if (!GetTokenInformation(tok, TokenUser, buf.data(), len, &len))
+        return std::wstring();
+    LPWSTR s = nullptr;
+    if (!ConvertSidToStringSidW(((TOKEN_USER *)buf.data())->User.Sid, &s))
+        return std::wstring();
+    std::wstring out(s);
+    LocalFree(s);
+    return out;
+}
+
+/* The account the helper will run as: the shell's user (the helper is started
+ * with a duplicated shell token), falling back to this process's user. */
+std::wstring interactiveUserSid()
+{
+    HWND shell = GetShellWindow();
+    if (shell) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(shell, &pid);
+        if (pid) {
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                      pid);
+            if (proc) {
+                HANDLE tok = nullptr;
+                std::wstring sid;
+                if (OpenProcessToken(proc, TOKEN_QUERY, &tok)) {
+                    sid = sidStringFromToken(tok);
+                    CloseHandle(tok);
+                }
+                CloseHandle(proc);
+                if (!sid.empty()) return sid;
+            }
+        }
+    }
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        const std::wstring sid = sidStringFromToken(tok);
+        CloseHandle(tok);
+        return sid;
+    }
+    return std::wstring();
+}
+
+/* The sender is elevated (High) while stitchcap runs at the shell's integrity
+ * (Medium normally). A named pipe created with default attributes inherits the
+ * creator's High mandatory label, and MIC's no-write-up rule then denies the
+ * Medium helper's CreateFile(..., GENERIC_WRITE) — dropHelperStart would time
+ * out with "did not become ready" and the feature would never work in the real
+ * (elevated) app. Give both pipes a Medium label (NW) and a DACL for the
+ * interactive user, so the helper can connect while Low-integrity sandboxes
+ * still cannot. */
+bool makePipeSecurity(SECURITY_ATTRIBUTES &sa, PSECURITY_DESCRIPTOR &sd)
+{
+    sa = {};
+    sd = nullptr;
+    const std::wstring sid = interactiveUserSid();
+    if (sid.empty()) return false;
+    const std::wstring sddl = L"D:(A;;GA;;;" + sid + L")S:(ML;;NW;;;ME)";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(), SDDL_REVISION_1, &sd, nullptr))
+        return false;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    return true;
+}
+
+bool launchHelper(const std::wstring &exe, const std::wstring &dataPipe,
+                  const std::wstring &ctlPipe, int side, HANDLE &proc,
+                  int &shell_il)
+{
+    const std::wstring cmd = L"\"" + exe + L"\" --pipe \"" + dataPipe +
+                             L"\" --ctl \"" + ctlPipe + L"\" --side " +
+                             std::to_wstring(side);
     std::wstring mutableCmd = cmd;
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
@@ -705,10 +828,37 @@ bool launchHelper(const std::wstring &exe, const std::wstring &pipe,
 void helperReader()
 {
     HANDLE pipe = g_helper.pipe;
-    if (pipe == INVALID_HANDLE_VALUE) return;
-    const BOOL connected = ConnectNamedPipe(pipe, nullptr);
-    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+    HANDLE ctl = g_helper.ctl;
+    if (pipe == INVALID_HANDLE_VALUE || ctl == INVALID_HANDLE_VALUE) return;
+
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) {
         g_helper.ready = false;
+        return;
+    }
+    /* Reusing an OVERLAPPED requires clearing its status fields; only hEvent
+     * survives (and is reset) between operations. */
+    const auto prepare = [&ov] {
+        const HANDLE ev = ov.hEvent;
+        std::memset(&ov, 0, sizeof(ov));
+        ov.hEvent = ev;
+        ResetEvent(ev);
+    };
+    /* ConnectNamedPipe on an overlapped handle completes through the event;
+     * ERROR_PIPE_CONNECTED means a client is already there. */
+    const auto connect = [&](HANDLE h) -> bool {
+        prepare();
+        if (ConnectNamedPipe(h, &ov)) return true;
+        const DWORD err = GetLastError();
+        if (err == ERROR_PIPE_CONNECTED) return true;
+        if (err != ERROR_IO_PENDING) return false;
+        DWORD transferred = 0;
+        return waitOverlapped(h, ov, transferred);
+    };
+    if (!connect(pipe)) {
+        g_helper.ready = false;
+        CloseHandle(ov.hEvent);
         return;
     }
     /* Same-user Medium processes can enumerate the pipe name and race the
@@ -719,14 +869,36 @@ void helperReader()
         client_pid != GetProcessId(g_helper.proc)) {
         g_helper.ready = false;
         DisconnectNamedPipe(pipe);
+        CloseHandle(ov.hEvent);
+        return;
+    }
+    /* The control pipe is the other direction of the same connection; check
+     * that it is the same launched process too (it only carries SIDE/QUIT,
+     * but a stray local client must not be fed the session's commands). */
+    if (!connect(ctl)) {
+        g_helper.ready = false;
+        DisconnectNamedPipe(pipe);
+        CloseHandle(ov.hEvent);
+        return;
+    }
+    ULONG ctl_pid = 0;
+    if (!GetNamedPipeClientProcessId(ctl, &ctl_pid) || !g_helper.proc ||
+        ctl_pid != GetProcessId(g_helper.proc)) {
+        g_helper.ready = false;
+        DisconnectNamedPipe(pipe);
+        DisconnectNamedPipe(ctl);
+        CloseHandle(ov.hEvent);
         return;
     }
     std::vector<std::string> pending;
     std::vector<char> buf(1024 * 1024);
     while (!g_helper.stop.load()) {
         DWORD got = 0;
-        if (!ReadFile(pipe, buf.data(), (DWORD)buf.size(), &got, nullptr))
-            break;
+        prepare();
+        if (!ReadFile(pipe, buf.data(), (DWORD)buf.size(), &got, &ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) break;
+            if (!waitOverlapped(pipe, ov, got)) break;
+        }
         if (got == 0) continue;
         std::string msg(buf.data(), got);
         while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
@@ -775,6 +947,7 @@ void helperReader()
             break;
         }
     }
+    CloseHandle(ov.hEvent);
     g_helper.ready = false;
 }
 
@@ -791,30 +964,60 @@ bool dropHelperStart(int side, std::string &err)
         err = "stitchcap.exe is missing";
         return false;
     }
-    const std::string name =
+    const std::string base =
         "\\\\.\\pipe\\MivaraStitchCap-" + std::to_string(GetCurrentProcessId()) +
         "-" + std::to_string(GetTickCount64());
-    const std::wstring wname(name.begin(), name.end());
+    const std::string ctl_name = base + "-ctl";
+    const std::wstring wname(base.begin(), base.end());
+    const std::wstring wctl(ctl_name.begin(), ctl_name.end());
+    /* PIPE_REJECT_REMOTE_CLIENTS belongs to dwPipeMode, not dwOpenMode. Some
+     * Windows builds silently ignore the misplaced bit, but Windows 11
+     * 10.0.26200 rejects it with ERROR_INVALID_PARAMETER (87) — which used to
+     * make dropHelperStart fail with "cannot create the capture pipe" and
+     * disabled the whole drag-to-copy feature on that build.
+     *
+     * Each pipe carries one direction only (see HelperState): a synchronous
+     * duplex handle would deadlock, because the helper's always-pending read
+     * blocks its writes and vice versa. */
+    SECURITY_ATTRIBUTES sa = {};
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const bool have_sa = makePipeSecurity(sa, sd);
+    LPSECURITY_ATTRIBUTES lpsa = have_sa ? &sa : nullptr;
     HANDLE pipe = CreateNamedPipeW(
-        wname.c_str(), PIPE_ACCESS_DUPLEX | PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1,
-        1024 * 1024, 1024 * 1024, 0, nullptr);
+        wname.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
+            PIPE_REJECT_REMOTE_CLIENTS,
+        1, 1024 * 1024, 1024 * 1024, 0, lpsa);
     if (pipe == INVALID_HANDLE_VALUE) {
+        if (sd) LocalFree(sd);
         err = "cannot create the capture pipe";
+        return false;
+    }
+    HANDLE ctl = CreateNamedPipeW(
+        wctl.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+        1024 * 1024, 1024 * 1024, 0, lpsa);
+    if (sd) LocalFree(sd);
+    if (ctl == INVALID_HANDLE_VALUE) {
+        CloseHandle(pipe);
+        err = "cannot create the capture control pipe";
         return false;
     }
     g_helper.stop = false;
     g_helper.ready = false;
     g_helper.hello = false;
     g_helper.pipe = pipe;
-    g_helper.pipe_name = name;
+    g_helper.ctl = ctl;
+    g_helper.pipe_name = base;
     g_helper.side = side;
 
     HANDLE proc = nullptr;
     int shell_il = 0x2000;
-    if (!launchHelper(exe, wname, side, proc, shell_il)) {
+    if (!launchHelper(exe, wname, wctl, side, proc, shell_il)) {
         CloseHandle(pipe);
+        CloseHandle(ctl);
         g_helper.pipe = INVALID_HANDLE_VALUE;
+        g_helper.ctl = INVALID_HANDLE_VALUE;
         err = "cannot launch stitchcap.exe";
         return false;
     }
@@ -840,17 +1043,25 @@ bool dropHelperStart(int side, std::string &err)
 void dropHelperStop()
 {
     g_helper.stop = true;
-    if (g_helper.pipe != INVALID_HANDLE_VALUE) {
-        writeLine("QUIT\n");
-        DisconnectNamedPipe(g_helper.pipe);
-        CloseHandle(g_helper.pipe);
-        g_helper.pipe = INVALID_HANDLE_VALUE;
-    }
+    /* QUIT first (bounded: the ctl pipe is overlapped), then let the reader
+     * notice the stop flag and cancel its pending overlapped I/O before the
+     * handles are closed underneath it. */
+    if (g_helper.ctl != INVALID_HANDLE_VALUE) writeLine("QUIT\n");
     if (g_helper.reader.joinable()) {
         if (g_helper.reader.get_id() != std::this_thread::get_id())
             g_helper.reader.join();
         else
             g_helper.reader.detach();
+    }
+    if (g_helper.ctl != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(g_helper.ctl);
+        CloseHandle(g_helper.ctl);
+        g_helper.ctl = INVALID_HANDLE_VALUE;
+    }
+    if (g_helper.pipe != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(g_helper.pipe);
+        CloseHandle(g_helper.pipe);
+        g_helper.pipe = INVALID_HANDLE_VALUE;
     }
     if (g_helper.proc) {
         if (WaitForSingleObject(g_helper.proc, 500) == WAIT_TIMEOUT)

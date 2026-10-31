@@ -520,15 +520,25 @@ static void enterRemote()
      * must keep running until the physical release. The helper captures the
      * selection at DragEnter; that notification can land just after this
      * crossing, so when the list is not there yet the button stays un-armed
-     * for DRAG_CAPTURE_GRACE_MS and pollPendingDrag() decides. */
-    g_file_drag = false;
-    g_drag_files.clear();
+     * for DRAG_CAPTURE_GRACE_MS and pollPendingDrag() decides.
+     *
+     * A capture that was already adopted and is still physically held survives
+     * a back-crossing (leaveRemote keeps it): the helper sends FILES only on
+     * DragEnter, so re-entering without the list would silently lose the drag. */
+    const bool keep_capture =
+        g_file_drag && !g_drag_files.empty() && g_btn_down[1] &&
+        g_btn_local[1];
+    if (!keep_capture) {
+        g_file_drag = false;
+        g_drag_files.clear();
+    }
     g_btn_arm_pending = false;
     bool may_be_file_drag = false;
     /* g_btn_local[1]: only a press that actually reached this desktop can be
      * an Explorer drag. A button that was pressed while controlling the peer
      * must never adopt a capture, or a stale one could be replayed. */
-    if (g_btn_down[1] && g_btn_local[1] && g_drop_ready && dropHelperReady()) {
+    if (!keep_capture && g_btn_down[1] && g_btn_local[1] && g_drop_ready &&
+        dropHelperReady()) {
         /* Non-blocking: this runs on the hook/message-loop thread, and a
          * LowLevelHooksTimeout would silently remove the mouse hook. */
         std::vector<std::string> files;
@@ -578,12 +588,19 @@ static void enterRemote()
     emitStitchState("remote");
 }
 
-static void leaveRemote(bool warpCursor)
+static void leaveRemote(bool warpCursor, bool keepCapturedDrag = false)
 {
     if (g_state != ControlState::Remote) return;
     g_state = ControlState::Local;
-    g_file_drag = false;
-    g_drag_files.clear();
+    /* Going back across the edge is not the end of the gesture: the user can
+     * still push out again or release locally. A capture that was already
+     * adopted is kept while the physical button is down, because the helper
+     * only re-sends the list on a fresh DragEnter. Everything else (release,
+     * side switch, panic, disconnect) discards it. */
+    if (!keepCapturedDrag || !g_btn_down[1]) {
+        g_file_drag = false;
+        g_drag_files.clear();
+    }
     g_btn_arm_pending = false;
 
     KvmEvent e = {};
@@ -629,7 +646,7 @@ static void moveRemote(int dx, int dy)
     default:              back = (nx < 0);                break;
     }
     if (back) {
-        leaveRemote(true);
+        leaveRemote(true, /*keepCapturedDrag=*/true);
         return;
     }
     nx = clampInt(nx, 0, (int)g_tgt_w - 1);

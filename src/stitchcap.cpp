@@ -32,7 +32,14 @@
 
 namespace {
 
-HANDLE g_pipe = INVALID_HANDLE_VALUE;
+/* Two one-way pipes: a duplex handle created without FILE_FLAG_OVERLAPPED is
+ * a synchronous file object, and Windows serializes every operation on it — a
+ * pending ReadFile blocks a WriteFile from another thread. This helper always
+ * has a read pending for SIDE/QUIT, so a duplex handle would deadlock: it
+ * could never report DRAG/FILES. g_tx carries paths to the controller, g_rx
+ * carries the controller's commands. */
+HANDLE g_tx = INVALID_HANDLE_VALUE;
+HANDLE g_rx = INVALID_HANDLE_VALUE;
 HWND   g_hwnd = nullptr;
 int    g_side = 1;
 std::mutex g_pipe_mtx;
@@ -44,9 +51,9 @@ int g_ref = 1;
 void sendLine(const std::string &line)
 {
     std::lock_guard<std::mutex> lk(g_pipe_mtx);
-    if (g_pipe == INVALID_HANDLE_VALUE) return;
+    if (g_tx == INVALID_HANDLE_VALUE) return;
     DWORD wrote = 0;
-    WriteFile(g_pipe, line.data(), (DWORD)line.size(), &wrote, nullptr);
+    WriteFile(g_tx, line.data(), (DWORD)line.size(), &wrote, nullptr);
 }
 
 std::string wideToUtf8(const std::wstring &w)
@@ -243,12 +250,12 @@ DWORD integrityLevel()
 void pipeReader()
 {
     std::vector<char> buf(4096);
-    while (g_pipe != INVALID_HANDLE_VALUE) {
+    while (g_rx != INVALID_HANDLE_VALUE) {
         DWORD got = 0;
-        if (!ReadFile(g_pipe, buf.data(), (DWORD)buf.size(), &got, nullptr)) {
-            /* The pipe is the only lifeline: a closed server handle means the
-             * controller crashed or exited. Do not leave an invisible topmost
-             * 3-pixel drop target behind. */
+        if (!ReadFile(g_rx, buf.data(), (DWORD)buf.size(), &got, nullptr)) {
+            /* The control pipe is the only lifeline: a closed server handle
+             * means the controller crashed or exited. Do not leave an
+             * invisible topmost 3-pixel drop target behind. */
             if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
             break;
         }
@@ -284,32 +291,46 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 {
     enableDpiAwareness();
 
-    std::wstring pipeName;
+    std::wstring pipeName;   /* tx: paths -> controller */
+    std::wstring ctlName;    /* rx: controller commands (SIDE/QUIT) */
     int side = 1;
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
         for (int i = 1; i + 1 < argc; i++) {
             if (wcscmp(argv[i], L"--pipe") == 0) pipeName = argv[i + 1];
+            else if (wcscmp(argv[i], L"--ctl") == 0) ctlName = argv[i + 1];
             else if (wcscmp(argv[i], L"--side") == 0) side = _wtoi(argv[i + 1]);
         }
         LocalFree(argv);
     }
-    if (pipeName.empty()) return 2;
+    if (pipeName.empty() || ctlName.empty()) return 2;
     if (side < 0 || side > 3) side = 1;
 
-    /* Retry while the controller is still creating the server end. */
-    for (int i = 0; i < 100 && g_pipe == INVALID_HANDLE_VALUE; i++) {
-        g_pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                             nullptr, OPEN_EXISTING, 0, nullptr);
-        if (g_pipe == INVALID_HANDLE_VALUE) Sleep(50);
+    /* Retry while the controller is still creating the server ends. */
+    for (int i = 0; i < 100 && (g_tx == INVALID_HANDLE_VALUE ||
+                                g_rx == INVALID_HANDLE_VALUE);
+         i++) {
+        if (g_tx == INVALID_HANDLE_VALUE)
+            g_tx = CreateFileW(pipeName.c_str(), GENERIC_WRITE, 0, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (g_rx == INVALID_HANDLE_VALUE)
+            g_rx = CreateFileW(ctlName.c_str(), GENERIC_READ, 0, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (g_tx == INVALID_HANDLE_VALUE || g_rx == INVALID_HANDLE_VALUE)
+            Sleep(50);
     }
-    if (g_pipe == INVALID_HANDLE_VALUE) return 3;
+    if (g_tx == INVALID_HANDLE_VALUE || g_rx == INVALID_HANDLE_VALUE) {
+        if (g_tx != INVALID_HANDLE_VALUE) CloseHandle(g_tx);
+        if (g_rx != INVALID_HANDLE_VALUE) CloseHandle(g_rx);
+        return 3;
+    }
     DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(g_pipe, &mode, nullptr, nullptr);
+    SetNamedPipeHandleState(g_rx, &mode, nullptr, nullptr);
 
     if (FAILED(OleInitialize(nullptr))) {
-        CloseHandle(g_pipe);
+        CloseHandle(g_tx);
+        CloseHandle(g_rx);
         return 4;
     }
 
@@ -320,7 +341,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     wc.lpszClassName = L"MivaraStitchCap";
     if (!RegisterClassExW(&wc)) {
         OleUninitialize();
-        CloseHandle(g_pipe);
+        CloseHandle(g_tx);
+        CloseHandle(g_rx);
         return 5;
     }
     g_hwnd = CreateWindowExW(
@@ -329,7 +351,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) {
         OleUninitialize();
-        CloseHandle(g_pipe);
+        CloseHandle(g_tx);
+        CloseHandle(g_rx);
         return 6;
     }
     SetLayeredWindowAttributes(g_hwnd, 0, 1, LWA_ALPHA);
@@ -339,7 +362,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     if (FAILED(RegisterDragDrop(g_hwnd, &g_dropTarget))) {
         DestroyWindow(g_hwnd);
         OleUninitialize();
-        CloseHandle(g_pipe);
+        CloseHandle(g_tx);
+        CloseHandle(g_rx);
         return 7;
     }
 
@@ -360,9 +384,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     if (g_hwnd) DestroyWindow(g_hwnd);
     OleUninitialize();
     if (reader.joinable()) reader.detach();
-    if (g_pipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_pipe);
-        g_pipe = INVALID_HANDLE_VALUE;
+    if (g_tx != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_tx);
+        g_tx = INVALID_HANDLE_VALUE;
+    }
+    if (g_rx != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_rx);
+        g_rx = INVALID_HANDLE_VALUE;
     }
     return 0;
 }

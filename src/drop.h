@@ -114,7 +114,7 @@ DropResult dropSendFiles(const DropOptions &opt,
  * A tiny asInvoker process hosts a 1-pixel OLE drop target on the shared
  * edge. It must run at Medium integrity, otherwise UIPI blocks Explorer's
  * (Medium) drop. The controller launches it with the shell token. It reports
- * the dragged CF_HDROP paths over a named pipe; it never copies anything
+ * the dragged CF_HDROP paths over a pair of one-way named pipes; it never copies anything
  * locally. */
 
 /** Start the helper and wait (up to 3 s) for its READY + integrity level.
