@@ -28,4 +28,4 @@ For the link's bandwidth and firewall requirements, see [Network & Firewall](net
 
 ## Statistics Output
 
-The receiver writes statistics to `gpu_stats.json` every 60 seconds and prints a console summary every 30 seconds.
+The receiver writes statistics to `gpu_stats.json` every 60 seconds. The console gets one summary line only when the counters changed (at most once every 30 seconds); an idle receiver prints nothing, and the last line is forced at shutdown.

@@ -52,6 +52,7 @@
 #include <deque>
 #include <memory>
 #include <map>
+#include <sstream>
 
 #include <SDL2/SDL.h>
 #include "auth.h"
@@ -170,6 +171,13 @@ struct GPUStats
 
     // Per-client tracking
     std::map<std::string, uint64_t> client_connections;
+
+    // Snapshot of the counters covered by the last console line, so the
+    // periodic tick stays silent while the receiver is idle. Guarded by
+    // stats_mutex and only touched by printStats().
+    uint64_t reported_operations = 0;
+    uint64_t reported_total_clients = 0;
+    uint64_t reported_active_clients = 0;
 
     // Mutex for thread safety
     std::mutex stats_mutex;
@@ -301,48 +309,44 @@ struct GPUStats
         last_stats_write = now;
     }
 
-    void printStats()
+    /* One-line console summary. The previous implementation drew a 28-line
+     * box every 30 s, idle or not; the receiver's stdout is mirrored into the
+     * GUI log window and app.log, so it drowned everything else. Now the
+     * periodic tick stays silent unless the counters actually changed, and
+     * the final summary is forced once at shutdown. */
+    void printStats(bool force = false)
     {
         std::lock_guard<std::mutex> lock(stats_mutex);
+
+        if (!force &&
+            total_operations == reported_operations &&
+            total_clients == reported_total_clients &&
+            active_clients == reported_active_clients)
+            return;
+        reported_operations = total_operations;
+        reported_total_clients = total_clients;
+        reported_active_clients = active_clients;
 
         auto now = std::chrono::system_clock::now();
         auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
 
-        std::cout << "\n"
-                  << COLOR_CYAN << COLOR_BOLD
-                  << "╔══════════════════════════════════════════════════════════╗\n"
-                  << "║                 GPU SERVICE STATISTICS                   ║\n"
-                  << "╠══════════════════════════════════════════════════════════╣\n"
-                  << "║ Operations:                                              ║\n"
-                  << "║   Total: " << std::setw(35) << std::left << (std::to_string(total_operations) + " ops") << "║\n"
-                  << "║   Compress: " << std::setw(34) << std::left << (std::to_string(compress_ops) + " ops") << "║\n"
-                  << "║   Colorfix: " << std::setw(34) << std::left << (std::to_string(colorfix_ops) + " ops") << "║\n"
-                  << "║   Ping: " << std::setw(38) << std::left << (std::to_string(ping_ops) + " ops") << "║\n"
-                  << "║                                                          ║\n"
-                  << "║ Data Processed:                                         ║\n"
-                  << "║   In:  " << std::setw(37) << std::left
-                  << (std::to_string(total_bytes_in / (1024 * 1024)) + " MB") << "║\n"
-                  << "║   Out: " << std::setw(37) << std::left
-                  << (std::to_string(total_bytes_out / (1024 * 1024)) + " MB") << "║\n"
-                  << "║                                                          ║\n"
-                  << "║ Compression:                                            ║\n"
-                  << "║   Avg Ratio: " << std::setw(33) << std::left
-                  << (std::to_string(avg_compression_ratio * 100.0) + "%") << "║\n"
-                  << "║   Saved: " << std::setw(37) << std::left
-                  << (std::to_string((compressed_bytes_in - compressed_bytes_out) / (1024 * 1024)) + " MB") << "║\n"
-                  << "║                                                          ║\n"
-                  << "║ Performance:                                            ║\n"
-                  << "║   Avg ms/op: " << std::setw(32) << std::left
-                  << (std::to_string(total_operations > 0 ? total_processing_ms / total_operations : 0.0) + " ms") << "║\n"
-                  << "║   Ops/sec: " << std::setw(34) << std::left
-                  << (std::to_string(uptime > 0 ? (double)total_operations / uptime : 0.0)) << "║\n"
-                  << "║                                                          ║\n"
-                  << "║ Clients:                                                ║\n"
-                  << "║   Active: " << std::setw(35) << std::left << std::to_string(active_clients) << "║\n"
-                  << "║   Peak: " << std::setw(37) << std::left << std::to_string(peak_clients) << "║\n"
-                  << "║   Unique IPs: " << std::setw(31) << std::left << std::to_string(client_connections.size()) << "║\n"
-                  << "╚══════════════════════════════════════════════════════════╝\n"
-                  << COLOR_RESET << std::endl;
+        /* Build the line first: std::cout is written from several threads and
+         * a single insertion keeps another service's line from splitting it. */
+        std::ostringstream os;
+        os << COLOR_CYAN << "[GPU-SVC] ops=" << total_operations
+           << " in=" << std::fixed << std::setprecision(1)
+           << (total_bytes_in / (1024.0 * 1024.0)) << "MB"
+           << " out=" << (total_bytes_out / (1024.0 * 1024.0)) << "MB";
+        if (compress_ops)
+            os << " ratio=" << (avg_compression_ratio * 100.0) << "%"
+               << " saved=" << ((compressed_bytes_in - compressed_bytes_out) / (1024 * 1024)) << "MB";
+        if (total_operations)
+            os << " avg=" << std::setprecision(2)
+               << (total_processing_ms / total_operations) << "ms";
+        os << " clients=" << active_clients
+           << " peak=" << peak_clients
+           << " uptime=" << uptime << "s" << COLOR_RESET;
+        std::cout << os.str() << "\n";
     }
 };
 
@@ -1318,7 +1322,7 @@ static void gpuStatsWriterThread()
             g_gpu_stats.writeStatsToFile();
         }
 
-        // Print to console every 30 seconds
+        /* Check every 30 s; printStats() itself skips an unchanged tick. */
         if (elapsed >= 30)
         {
             g_gpu_stats.printStats();
@@ -1326,9 +1330,9 @@ static void gpuStatsWriterThread()
         }
     }
 
-    // Final stats write on exit
+    // Final JSON write on exit; main() prints the closing summary after the
+    // other threads have joined, so it stays the last line in the log.
     g_gpu_stats.writeStatsToFile();
-    g_gpu_stats.printStats();
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -2660,9 +2664,9 @@ int main(int argc, char* argv[])
     drop_thread.join();
     cleanupSockets();
 
-    // Final stats write
+    // Final stats write + forced one-line summary
     g_gpu_stats.writeStatsToFile();
-    g_gpu_stats.printStats();
+    g_gpu_stats.printStats(true);
 
     std::cout << "Receiver shut down\n";
     return 0;
