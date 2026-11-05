@@ -18,7 +18,7 @@
  * fresh 32-byte randomness for every connection, and the bound bytes are the
  * handshake request itself. A recorded proof cannot be replayed (new nonce),
  * cannot be reused with different stream parameters (bound bytes), and carries
- * a purpose tag so 8081 and 8084 transcripts are not interchangeable.
+ * a purpose tag so 8081, 8084 and 8086 transcripts are not interchangeable.
  *
  * These are standard primitives (FIPS 180-4 SHA-256, RFC 2104 HMAC,
  * RFC 8018 PBKDF2). Nothing here invents a cipher or a custom construction.
@@ -94,8 +94,8 @@ void mivaraPasswordFoldAscii(std::string &pw);
 
 /** Derive the PBKDF2 record key for a typed password. Copies the plaintext,
  *  folds ASCII case, runs PBKDF2 and wipes the copy. Record creation, the
- *  8081 sender and the 8084 stitch controller must all use this function so
- *  they agree byte-for-byte; the receiver only ever holds the record. */
+ *  8081 sender, 8084 stitch controller and 8086 app client must all use this
+ *  function so they agree byte-for-byte; the receiver only ever holds the record. */
 void mivaraPasswordKey(const std::string &pw, const uint8_t *salt,
                        size_t salt_len, uint32_t iterations, uint8_t out[32]);
 
@@ -119,8 +119,8 @@ void mivaraSecureZero(void *p, size_t n);
 /* ── password proof ────────────────────────────────────────────────────────
  * `record` is the stored PBKDF2 output (or the value a sender derived from the
  * typed password — they are equal on success). The proof is domain-separated
- * per purpose so a 8081 transcript can never be replayed against 8084 and the
- * stored record is never used directly as a MAC key:
+ * per purpose so a transcript from 8081, 8084 or 8086 cannot be replayed on
+ * another port and the stored record is never used directly as a MAC key:
  *
  *   purpose_key = HMAC-SHA256(record, "Mivara/v1/auth-key"    || purpose)
  *   proof       = HMAC-SHA256(purpose_key,
@@ -133,7 +133,8 @@ void mivaraSecureZero(void *p, size_t n);
  * prevent either. A future protocol should move to an audited aPAKE. */
 enum MivaraAuthPurpose : uint8_t {
     MIVARA_AUTH_PURPOSE_VIDEO  = 1,   /* 8081 video / extend */
-    MIVARA_AUTH_PURPOSE_STITCH = 2    /* 8084 stitch input  */
+    MIVARA_AUTH_PURPOSE_STITCH = 2,   /* 8084 stitch input  */
+    MIVARA_AUTH_PURPOSE_FILES  = 3    /* 8086 file transfer */
 };
 
 /** Iteration target for new records. Existing records keep the count they were
@@ -222,7 +223,7 @@ private:
     int applyCooldown(Entry &e) const;
 };
 
-/* Process-wide throttle shared by 8081 and 8084: the two paths use the same
+/* Process-wide throttle shared by 8081, 8084 and 8086: all paths use the same
  * connection password, so alternating ports must not grant two free budgets.
  * The implementation serialises access internally; callers must not hold
  * another lock while calling these. */

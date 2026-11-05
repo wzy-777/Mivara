@@ -4,7 +4,7 @@
 
 本页说明 Mivara 在局域网中使用的端口、接收端需要放行的防火墙规则，以及链路层面的要求。完整的端口定义与各服务的协议用途见[架构与协议 · 网络端口](architecture.md#网络端口)，本页不再重复端口表。
 
-> **仅限可信局域网。** Mivara 的接收端可以要求手动授权或密码（8081/8084 同一策略），8082/8083 也只接受当前会话令牌；但所有通道**都不加密**，授权只决定谁能接入。请勿将 UDP 1900 或 TCP 8081–8085 暴露到公网，也不要为它们做端口转发。完整威胁模型见 [SECURITY.md](../../SECURITY.md)。
+> **仅限可信局域网。** Mivara 的接收端可以要求手动授权或密码（8081/8084 同一策略），8082/8083 也只接受当前会话令牌；但所有通道**都不加密**，授权只决定谁能接入。请勿将 UDP 1900 或 TCP 8081–8086 暴露到公网，也不要为它们做端口转发。完整威胁模型见 [SECURITY.md](../../SECURITY.md)。
 
 ## 防火墙规则（接收端）
 
@@ -19,6 +19,8 @@ New-NetFirewallRule -DisplayName "Mivara Ports"   -Direction Inbound -Protocol T
 New-NetFirewallRule -DisplayName "Mivara Stitch"  -Direction Inbound -Protocol TCP -LocalPort 8084 -Action Allow
 # 仅在使用拼接文件投放时（可选，两端默认关闭）：
 New-NetFirewallRule -DisplayName "Mivara FileDrop" -Direction Inbound -Protocol TCP -LocalPort 8085 -Action Allow
+# 仅在使用双向文件传输时（可选，默认关闭）：
+New-NetFirewallRule -DisplayName "Mivara FileTransfer" -Direction Inbound -Protocol TCP -LocalPort 8086 -Action Allow
 ```
 
 ```bash
@@ -29,6 +31,7 @@ sudo ufw allow 8082/tcp comment 'Mivara Compute Offload'
 sudo ufw allow 8083/tcp comment 'Mivara Port Inspector'
 sudo ufw allow 8084/tcp comment 'Mivara Stitch KVM'
 sudo ufw allow 8085/tcp comment 'Mivara Stitch File Drop (optional)'
+sudo ufw allow 8086/tcp comment 'Mivara Two-way File Transfer (optional)'
 ```
 
 ## 授权与附加服务安全提示
@@ -36,6 +39,7 @@ sudo ufw allow 8085/tcp comment 'Mivara Stitch File Drop (optional)'
 - **8081 / 8084** 执行接收端「设置 → 接收与安全」里的同一策略：允许任意连接 / 仅密码 / 每次手动授权（默认）。两者共享同一个活动会话槽：任一端已有会话时，另一端的连接直接收到「忙」。密码只在本机保存 PBKDF2 记录，验证用一次性随机数 + 按端口用途分离的 HMAC 应答，密码不出网；但**画面与键鼠事件不加密**。
 - **8082 / 8083** 需要本次已授权 8081 会话的 32 字节令牌：连接时出示，之后**每个请求前**都会重新校验，会话结束即失效——已建立的旁路连接会在下一次请求时断开，旧令牌的新连接也会被拒绝。它们仍不加密，因此能窃听链路的设备仍可读取查询结果或终止进程请求。
 - **8085** 是拼接文件投放的伴随通道（可选，两端默认关闭）：接收端由当前拼接会话生成一次性 32 字节令牌，在 8084 授权成功后下发，8085 连接出示令牌才被接受，会话结束即失效。它不占用 8084/8081 的活动会话槽，也不额外弹授权框；但通道不加密，**能嗅探 8084 的设备可以截获令牌并抢连 8085 写入文件**。只在可信网络开启，并把接收目录视为该会话可写的位置。
+- **8086** 是独立双向文件传输（可选，默认关闭）：通过 8081/8084 相同的接收策略，但使用独立授权用途、独立单客户端槽，不占用视频/拼接会话。授权后可浏览目录、上传/下载文件（支持多选排队）并在当前目录新建文件夹；开关在每个请求前重新检查。协议为 v2（目录项含隐藏标记与修改时间，握手后对端上报设备名，新增 MKDIR），**两端必须同时升级**，旧端会收到版本不兼容。客户端只连接最近连接中记录的数字 IP，不解析主机名；服务端仅监听 IPv4。目录和文件内容均为明文，能嗅探链路的设备可读取它们，请只为完全信任的对端开启。
 - 「允许任意连接」等于对任何可达设备放行，只在完全可控的网络里使用。
 - 请只在可信局域网内使用，不要将这些端口暴露到公网，也不要通过路由器做端口转发。
 

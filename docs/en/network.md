@@ -4,7 +4,7 @@
 
 This page covers the ports Mivara uses on the LAN, the firewall rules the receiver needs, and link-level requirements. For the full port definitions and what each service speaks, see [Architecture & Protocol · Network Ports](architecture.md#network-ports); this page does not repeat the port table.
 
-> **Trusted LAN only.** The receiver can require manual approval or a password (the same policy for 8081 and 8084), and 8082/8083 only accept the current session token — but **no channel is encrypted**, and authorization only decides who may connect. Never expose UDP 1900 or TCP 8081–8085 to the internet, and do not port-forward them. See [SECURITY.md](../../SECURITY.md) for the full threat model.
+> **Trusted LAN only.** The receiver can require manual approval or a password (the same policy for 8081 and 8084), and 8082/8083 only accept the current session token — but **no channel is encrypted**, and authorization only decides who may connect. Never expose UDP 1900 or TCP 8081–8086 to the internet, and do not port-forward them. See [SECURITY.md](../../SECURITY.md) for the full threat model.
 
 ## Firewall Rules (Receiver)
 
@@ -19,6 +19,8 @@ New-NetFirewallRule -DisplayName "Mivara Ports"   -Direction Inbound -Protocol T
 New-NetFirewallRule -DisplayName "Mivara Stitch"  -Direction Inbound -Protocol TCP -LocalPort 8084 -Action Allow
 # Only for stitch file drop (optional, off by default on both ends):
 New-NetFirewallRule -DisplayName "Mivara FileDrop" -Direction Inbound -Protocol TCP -LocalPort 8085 -Action Allow
+# Only for two-way file transfer (optional, off by default):
+New-NetFirewallRule -DisplayName "Mivara FileTransfer" -Direction Inbound -Protocol TCP -LocalPort 8086 -Action Allow
 ```
 
 ```bash
@@ -29,6 +31,7 @@ sudo ufw allow 8082/tcp comment 'Mivara Compute Offload'
 sudo ufw allow 8083/tcp comment 'Mivara Port Inspector'
 sudo ufw allow 8084/tcp comment 'Mivara Stitch KVM'
 sudo ufw allow 8085/tcp comment 'Mivara Stitch File Drop (optional)'
+sudo ufw allow 8086/tcp comment 'Mivara Two-way File Transfer (optional)'
 ```
 
 ## Authorization and Sidecar Security Notice
@@ -36,6 +39,7 @@ sudo ufw allow 8085/tcp comment 'Mivara Stitch File Drop (optional)'
 - **8081 / 8084** obey the same policy from Settings → Receiving & Security: allow any connection / password only / manual approval (the default). They share one active-session slot: while either has a session, the other is answered "busy". Only a PBKDF2 record is stored locally and the password never crosses the wire (a fresh nonce is answered with a proof domain-separated per port), but **the video and input events are not encrypted**.
 - **8082 / 8083** require the 32-byte token of the current authorized 8081 session. It is presented on connect and **re-checked before every request**; the gate is cleared when the session ends, so an already-open sidecar connection loses access on its next request and a new connection with the old token is refused. They are still unencrypted, so a device sniffing the link can read query results or kill requests.
 - **8085** is the companion file-drop channel for stitch (optional, off by default on both ends): the receiver generates a one-shot 32-byte token for the current stitch session and hands it over after 8084 authorization; 8085 accepts a connection only with that token, and the token dies with the session. It does not claim the 8081/8084 active-session slot and does not add a second approval prompt — but it is unencrypted, so **a device that can sniff 8084 can capture the token and race it to write files over 8085**. Enable it only on trusted networks and treat the receive folder as writable by that session.
+- **8086** is independent two-way file transfer (optional, off by default): it follows the same receive policy as 8081/8084 with a separate proof purpose and single-client slot, and does not occupy the video/stitch session. Authorization permits directory browsing, upload/download (multi-select with a queue) and creating one folder in the current directory; the opt-in is re-checked before every request. Protocol v2 adds entry hidden/mtime metadata, a post-admission device-name frame and MKDIR, so **both ends must be upgraded together**; an older peer gets a version error. The client dials only the numeric IP recorded in Recent connections, never resolves hostnames, and the service listens on IPv4 only. Paths and contents are plaintext and visible to a device sniffing the link, so enable this only for a fully trusted peer.
 - "Allow any connection" lets any reachable device in — use it only on a network you fully control.
 - Keep the ports on a trusted LAN only — never expose them to the internet or forward them through a router.
 

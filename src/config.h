@@ -44,6 +44,13 @@ struct AppConfig
                                            to the peer (opt-in, default off) */
     int file_drop_accept = 0;           /* stitch: 1 = accept incoming files
                                            (opt-in, default off) */
+    int file_transfer_accept = 0;       /* 8086: 1 = allow authorized peers to
+                                           browse, upload and download files
+                                           (separate opt-in, default off) */
+    int file_transfer_detach = 0;       /* 1 = open the file-transfer page in
+                                           its own window (next open only;
+                                           the page's 分离 button toggles it
+                                           for the current session) */
     /* ── 接收与安全 ────────────────────────────────────────────────────────
      * Connection policy. The default for a new install (and for an upgraded
      * config with no policy key) is manual approval — never open. */

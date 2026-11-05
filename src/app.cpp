@@ -39,6 +39,7 @@
 #include <deque>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -48,6 +49,7 @@
 #include "config.h"
 #include "discover.h"
 #include "history.h"
+#include "filexfer.h"
 #include "kvm.h"
 #include "logo_icon.h"
 #include "theme.h"
@@ -194,6 +196,113 @@
 #define HIST_PAGER_Y 674                /* footer caption, clear of the card's
                                          * bottom edge at 660 and its shadow */
 #define HIST_CARD_H_EMPTY 132
+#define HIST_FOLDER_W 24
+#define HIST_FOLDER_H 20
+#define HIST_FOLDER_GAP 6
+
+/* 文件传输: a dynamic layout computed from a canvas rect. Attached mode uses
+ * the body column; the detached window uses its whole client area. Both
+ * buildButtons() and the renderer read fileLayout(), so a control can never be
+ * painted in one place and clicked in another. */
+#define FILE_PANE_GAP 12
+#define FILE_ROW_H 32
+#define FILE_COL_H 22
+#define FILE_VISIBLE 6
+#define FILE_TASK_ROW_H 30
+#define FILE_TASK_VISIBLE_MAX 6
+#define FILE_TOOL_BTN 26
+#define FILE_TITLE_H 28
+#define FILE_DEV_H 32
+#define FILE_TASK_HDR_H 30
+
+struct FileLayout {
+    SDL_Rect canvas, title, dev;
+    SDL_Rect panes[2], tools[2], toolBtn[2][5], pathBox[2], roots[2];
+    SDL_Rect colHdr[2], rows[2][FILE_VISIBLE], checks[2][FILE_VISIBLE];
+    SDL_Rect checkAll[2], send[2], foot[2];
+    SDL_Rect detach, backMain;
+    SDL_Rect card, cardHdr, cardCols, cardFooter, qa[4];
+    SDL_Rect taskRows[FILE_TASK_VISIBLE_MAX];
+    SDL_Rect taskLoc[FILE_TASK_VISIBLE_MAX], taskRem[FILE_TASK_VISIBLE_MAX];
+    int task_visible = 0;
+};
+
+static SDL_Rect fileCanvas(bool detached)
+{
+    if (detached) return SDL_Rect{PAD, 12, WIN_W - PAD * 2, WIN_H - 24};
+    return SDL_Rect{BODY_X, 64, BODY_W, WIN_H - 76};
+}
+
+static FileLayout fileLayout(const SDL_Rect &c)
+{
+    FileLayout L{};
+    L.canvas = c;
+    L.title = SDL_Rect{c.x, c.y, c.w, FILE_TITLE_H};
+    L.dev = SDL_Rect{c.x, L.title.y + L.title.h + 6, c.w, FILE_DEV_H};
+    const int pane_top = L.dev.y + L.dev.h + 6;
+    const int pane_w = (c.w - FILE_PANE_GAP) / 2;
+    /* 28 tools + 4 gap + 22 column header + 6 rows + 18 footer text. The
+     * footer is drawn with the 14 px face, so its box must be taller than the
+     * old 12 px allowance or the baseline overflows the card. */
+    const int pane_h = 28 + 4 + FILE_COL_H + FILE_VISIBLE * FILE_ROW_H + 18;
+    for (int side = 0; side < 2; ++side) {
+        SDL_Rect &p = L.panes[side];
+        p = SDL_Rect{c.x + side * (pane_w + FILE_PANE_GAP), pane_top,
+                     pane_w, pane_h};
+        L.tools[side] = SDL_Rect{p.x, p.y, p.w, 28};
+        int bx = p.x;
+        for (int i = 0; i < 5; ++i) {
+            L.toolBtn[side][i] = SDL_Rect{bx, p.y + 1, FILE_TOOL_BTN,
+                                          FILE_TOOL_BTN};
+            bx += FILE_TOOL_BTN + 4;
+        }
+        const int root_w = 22;
+        L.pathBox[side] = SDL_Rect{bx + 2, p.y + 2,
+                                   p.x + p.w - (bx + 2) - root_w - 2, 24};
+        L.roots[side] = SDL_Rect{p.x + p.w - root_w, p.y + 2, root_w, 24};
+        L.colHdr[side] = SDL_Rect{p.x + 4, p.y + 32, p.w - 8, FILE_COL_H};
+        L.checkAll[side] = SDL_Rect{p.x + 8, p.y + 35, 16, 16};
+        for (int slot = 0; slot < FILE_VISIBLE; ++slot) {
+            SDL_Rect &r = L.rows[side][slot];
+            r = SDL_Rect{p.x + 4, p.y + 54 + slot * FILE_ROW_H,
+                         p.w - 8, FILE_ROW_H - 2};
+            L.checks[side][slot] = SDL_Rect{r.x + 4, r.y + 8, 16, 16};
+        }
+        L.foot[side] = SDL_Rect{p.x + 8, p.y + pane_h - 18, p.w - 16, 18};
+    }
+    L.send[0] = SDL_Rect{L.panes[0].x + L.panes[0].w - 80, L.dev.y + 3, 80, 26};
+    L.send[1] = SDL_Rect{L.panes[1].x, L.dev.y + 3, 80, 26};
+    L.detach = SDL_Rect{c.x + c.w - 64, c.y + 1, 64, 26};
+    L.backMain = SDL_Rect{c.x + c.w - 134, c.y + 1, 64, 26};
+
+    L.card = SDL_Rect{c.x, pane_top + pane_h + 6, c.w,
+                      c.y + c.h - (pane_top + pane_h + 6)};
+    L.cardHdr = SDL_Rect{L.card.x, L.card.y, L.card.w, FILE_TASK_HDR_H};
+    L.cardCols = SDL_Rect{L.card.x + 12, L.card.y + FILE_TASK_HDR_H,
+                          L.card.w - 24, FILE_COL_H};
+    L.cardFooter = SDL_Rect{L.card.x, L.card.y + L.card.h - 28, L.card.w, 28};
+    int qx = L.card.x + L.card.w - 12;
+    static const int qw[4] = {62, 62, 62, 92};
+    for (int i = 3; i >= 0; --i) {
+        qx -= qw[i];
+        L.qa[i] = SDL_Rect{qx, L.card.y + 4, qw[i], 22};
+        qx -= 6;
+    }
+    const int rows_top = L.card.y + FILE_TASK_HDR_H + FILE_COL_H;
+    const int avail = L.cardFooter.y - rows_top - 6;
+    L.task_visible = avail / FILE_TASK_ROW_H;
+    if (L.task_visible > FILE_TASK_VISIBLE_MAX)
+        L.task_visible = FILE_TASK_VISIBLE_MAX;
+    if (L.task_visible < 2) L.task_visible = 2;
+    for (int slot = 0; slot < L.task_visible; ++slot) {
+        SDL_Rect &r = L.taskRows[slot];
+        r = SDL_Rect{L.card.x + 12, rows_top + slot * FILE_TASK_ROW_H,
+                     L.card.w - 24, FILE_TASK_ROW_H - 2};
+        L.taskRem[slot] = SDL_Rect{r.x + r.w - 46, r.y + 4, 46, 22};
+        L.taskLoc[slot] = SDL_Rect{r.x + r.w - 96, r.y + 4, 46, 22};
+    }
+    return L;
+}
 
 /* found-devices list: the rows are laid out from the top, so the action row
  * follows the last one instead of floating at a fixed y with a hole above it */
@@ -378,6 +487,7 @@ enum Screen {
     SCR_MANUAL_IP,
     SCR_STREAMING,
     SCR_SETTINGS,
+    SCR_FILES,
 };
 
 /* Left-nav tabs. SCR_SETTINGS maps to its tab; every other screen belongs
@@ -504,9 +614,11 @@ enum BtnId {
     /* 拼接文件投放 (both default off; copy-only) */
     BTN_SET_FILEDROP_ACCEPT = 7070,     /* 允许对端发送文件 */
     BTN_SET_FILEDROP_SEND,              /* 拖拽到边缘发送文件 */
+    BTN_SET_FILEXFER_ACCEPT,            /* 允许文件传输（8086） */
+    BTN_SET_FILEXFER_DETACH,            /* 文件传输窗口默认分离 */
     /* history rows (drawn on the home screen under 接收/发送) */
     BTN_HIST_BASE = 5000,               /* row i: +i*10 +0 row / +1 投屏 / +2 扩展
-                                         * / +3 拼接 / +4 删除 */
+                                         * / +3 拼接 / +4 删除 / +5 文件 */
     BTN_HIST_CLEAR = 5300,
     /* device rows on FOUND */
     BTN_DEV_BASE = 1000,                /* +i*10 +1 投屏 / +2 扩展 / +3 拼接 */
@@ -552,7 +664,63 @@ enum BtnId {
     BTN_SETPW_FIELD_A,
     BTN_DISCARD_KEEP = 9130,
     BTN_DISCARD_CONFIRM,
+
+    /* Independent two-way file page. Slot ids address visible positions; the
+     * data index adds that pane's scroll offset. */
+    BTN_FILE_BACK = 9200,
+    BTN_FILE_DETACH,                    /* 分离 / 合回 */
+    BTN_FILE_LOCAL_HOME,
+    BTN_FILE_LOCAL_BACK,
+    BTN_FILE_LOCAL_UP,
+    BTN_FILE_LOCAL_REFRESH,
+    BTN_FILE_LOCAL_NEWDIR,
+    BTN_FILE_LOCAL_HIDDEN,
+    BTN_FILE_LOCAL_ROOTS,
+    BTN_FILE_LOCAL_PATH,
+    BTN_FILE_REMOTE_HOME,
+    BTN_FILE_REMOTE_BACK,
+    BTN_FILE_REMOTE_UP,
+    BTN_FILE_REMOTE_REFRESH,
+    BTN_FILE_REMOTE_NEWDIR,
+    BTN_FILE_REMOTE_HIDDEN,
+    BTN_FILE_REMOTE_ROOTS,
+    BTN_FILE_REMOTE_PATH,
+    BTN_FILE_UPLOAD,
+    BTN_FILE_DOWNLOAD,
+    BTN_FILE_CANCEL,
+    BTN_FILE_RECONNECT,
+    BTN_FILE_PAUSE,
+    BTN_FILE_RESUME,
+    BTN_FILE_CANCEL_ALL,
+    BTN_FILE_CLEAR_DONE,
+    BTN_FILE_LOCAL_ROW_BASE = 9300,     /* +0..5 */
+    BTN_FILE_REMOTE_ROW_BASE = 9310,    /* +0..5 */
+    BTN_FILE_LOCAL_CHECK_BASE = 9320,   /* +0..5 */
+    BTN_FILE_REMOTE_CHECK_BASE = 9330,  /* +0..5 */
+    BTN_FILE_LOCAL_CHECKALL = 9340,
+    BTN_FILE_REMOTE_CHECKALL,
+    BTN_FILE_TASK_LOCATE_BASE = 9350,   /* +0..5 */
+    BTN_FILE_TASK_REMOVE_BASE = 9360,   /* +0..5 */
 };
+
+/* The file-page ranges are dispatched by first-match arithmetic; keep them
+ * disjoint if FILE_VISIBLE or the task row count changes. */
+static_assert(BTN_FILE_LOCAL_ROW_BASE + FILE_VISIBLE <= BTN_FILE_REMOTE_ROW_BASE,
+              "file row id ranges overlap");
+static_assert(BTN_FILE_REMOTE_ROW_BASE + FILE_VISIBLE <=
+                  BTN_FILE_LOCAL_CHECK_BASE,
+              "file row/check id ranges overlap");
+static_assert(BTN_FILE_LOCAL_CHECK_BASE + FILE_VISIBLE <=
+                  BTN_FILE_REMOTE_CHECK_BASE,
+              "file check id ranges overlap");
+static_assert(BTN_FILE_REMOTE_CHECK_BASE + FILE_VISIBLE <=
+                  BTN_FILE_LOCAL_CHECKALL,
+              "file check/check-all id ranges overlap");
+static_assert(BTN_FILE_LOCAL_CHECKALL + 1 <= BTN_FILE_TASK_LOCATE_BASE,
+              "file check-all/task id ranges overlap");
+static_assert(BTN_FILE_TASK_LOCATE_BASE + FILE_TASK_VISIBLE_MAX <=
+                  BTN_FILE_TASK_REMOVE_BASE,
+              "file task id ranges overlap");
 
 /* 接收与安全 policy radios — kept outside the enum arithmetic so the three
  * policies cannot drift from auth.h's MivaraAuthMode values. */
@@ -616,6 +784,7 @@ enum GlyphId {
     GLYPH_SUN,          /* appearance: 亮色                       */
     GLYPH_MOON,         /* appearance: 暗色                       */
     GLYPH_UPDATE,       /* header: 有可用更新                     */
+    GLYPH_FOLDER,       /* history / file page: directory         */
     GLYPH_LOGO,         /* original overlapping-frame Mivara mark   */
 };
 
@@ -663,7 +832,7 @@ struct LiveStats {
     std::string side;       /* event=stitch: left | right | top | bottom */
     std::string id;         /* event=auth: approval request id            */
     std::string dev, ip;    /* event=auth|start|stop: peer identity      */
-    std::string req;        /* event=auth: video (8081) | stitch (8084)  */
+    std::string req;        /* event=auth: video (8081) | stitch (8084) | files (8086) */
     std::string policy;     /* receiver: open | password | manual        */
     std::string record;     /* receiver: ok | bad (password record)      */
     std::string svc;        /* receiver: gpu | ports | kvm (event=svc)   */
@@ -703,7 +872,7 @@ struct AuthAsk {
     bool   open = false;
     long   id = 0;
     std::string dev, ip;
-    std::string req;              /* "video" | "stitch" (empty = video) */
+    std::string req;              /* "video" | "stitch" | "files" */
     Uint32 deadline = 0;
 };
 
@@ -733,13 +902,14 @@ struct RecvServiceState {
     std::string err;              /* stable token (bind_failed, …) */
 };
 struct RecvServices {
-    RecvServiceState gpu, ports, kvm, drop;
+    RecvServiceState gpu, ports, kvm, drop, files;
     RecvServices()
     {
         gpu.port = 8082;
         ports.port = 8083;
         kvm.port = 8084;
         drop.port = 8085;
+        files.port = FILEXFER_PORT;
     }
 };
 
@@ -787,6 +957,77 @@ static bool                  g_history_recorded = false;
 static bool                  g_sender_stop_requested = false;
 static bool                  g_details_open = false;
 static bool                  g_recv_details_open = false;
+
+/* Independent file page. The target strings are owned here, not borrowed from
+ * g_hist (history reloads can invalidate those references). */
+/* One queued copy. Paths are captured when the user presses 发送, so later
+ * navigation or a listing refresh cannot change what an item refers to. */
+enum FileTaskState {
+    FTS_QUEUED = 0,
+    FTS_ACTIVE,
+    FTS_DONE,
+    FTS_FAILED,
+    FTS_CANCELLED
+};
+struct FileTask {
+    bool        upload = false;   /* true: local -> remote */
+    std::string name;
+    std::string source_dir;       /* display side */
+    std::string dest_dir;         /* display side */
+    std::string source_path;      /* absolute source used by the client op */
+    std::string dest_path;        /* destination directory */
+    uint64_t    size = 0;
+    uint64_t    bytes = 0;
+    uint64_t    total = 0;
+    int         state = FTS_QUEUED;
+    std::string detail;           /* final path on success, error otherwise */
+};
+
+static bool                  g_file_open = false;
+static std::string           g_file_ip;
+static std::string           g_file_name;        /* peer known at open */
+static std::string           g_file_remote_name; /* announced by the service */
+static std::string           g_file_local_name;  /* this machine */
+static FtClientState         g_file_state = FT_CLIENT_DISCONNECTED;
+static FtListing             g_file_local;
+static FtListing             g_file_remote;
+static int                   g_file_local_sel = -1;   /* entry index */
+static int                   g_file_remote_sel = -1;
+static int                   g_file_local_scroll = 0;  /* visible slot */
+static int                   g_file_remote_scroll = 0;
+static std::set<std::string> g_file_local_marks;       /* checked names */
+static std::set<std::string> g_file_remote_marks;
+static bool                  g_file_local_show_hidden = true;
+static bool                  g_file_remote_show_hidden = true;
+static std::vector<std::string> g_file_local_hist;
+static std::vector<std::string> g_file_remote_hist;
+static std::string           g_file_message;
+static bool                  g_file_refresh_notice = false;
+static bool                  g_file_refresh_pending = false;
+static bool                  g_file_remote_push_pending = false;
+static std::vector<FileTask> g_file_tasks;
+static int                   g_file_task_active = -1;
+static int                   g_file_task_scroll = 0;
+static bool                  g_file_queue_paused = false;
+static uint64_t              g_file_done_count = 0;
+static int                   g_file_edit_side = -1;   /* -1, 0 local, 1 remote */
+static std::string           g_file_edit_text;
+static bool                  g_file_edit_select_all = false;
+static Uint32                g_file_edit_blink = 0;
+static SDL_Window           *g_file_win = nullptr;
+static SDL_Renderer         *g_file_ren = nullptr;
+static bool                  g_file_detached = false;
+static std::vector<Button>   g_file_buttons;
+static int                   g_file_hot = BTN_NONE;
+static int                   g_file_press = BTN_NONE;
+static bool                  g_pw_file_transfer = false;
+/* The single password modal can be claimed by the sender or the file client.
+ * A request that arrives while the other owner holds it waits here instead of
+ * being dropped or having its prompt closed by the other side's STAT lines. */
+static bool                  g_pw_sender_pending = false;
+static std::string           g_pw_sender_error;
+static bool                  g_file_pw_pending = false;
+static int                   g_mouse_clicks = 0;
 
 static std::vector<DiscoveredDevice> g_devices;
 static std::mutex                  g_dev_mtx;
@@ -1653,6 +1894,15 @@ static void glyphMonitor(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color 
     fillRoundRect(ren, SDL_Rect{cx - w / 4, cy + h / 2 - 2, w / 2, 2}, 1, c);
 }
 
+static void glyphFolder(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
+{
+    const int w = size;
+    const int left = cx - w / 2;
+    const int top = cy - size / 2;
+    fillRoundRect(ren, SDL_Rect{left + 1, top + 1, (w * 2) / 5, 5}, 2, c);
+    fillRoundRect(ren, SDL_Rect{left, top + 4, w, size - 5}, 2, c);
+}
+
 static void glyphLogo(SDL_Renderer *ren, int cx, int cy, int size, SDL_Color c)
 {
     const int left = cx - size / 2, top = cy - size / 2;
@@ -1886,6 +2136,7 @@ static void paintGlyph(SDL_Renderer *ren, int glyph, int cx, int cy, int size)
     case GLYPH_SUN:        glyphSun(ren, cx, cy, size, WHITE); break;
     case GLYPH_MOON:       glyphMoon(ren, cx, cy, size, WHITE); break;
     case GLYPH_UPDATE:     glyphUpdate(ren, cx, cy, size, WHITE); break;
+    case GLYPH_FOLDER:     glyphFolder(ren, cx, cy, size, WHITE); break;
     case GLYPH_LOGO:       glyphLogo(ren, cx, cy, size, WHITE); break;
     default: break;
     }
@@ -2128,6 +2379,14 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
     }
 }
 
+/* buildButtons() targets g_buttons; a detached file-transfer window builds its
+ * own list. Every add* helper appends to whichever list is active. */
+static std::vector<Button> *g_btn_target = &g_buttons;
+static std::vector<Button> &buttonTarget()
+{
+    return g_btn_target ? *g_btn_target : g_buttons;
+}
+
 static void addButton(int x, int y, int w, int h, const std::string &label, int id,
                       int variant = BTN_V_SECONDARY, int glyph = GLYPH_NONE,
                       TTF_Font *font = nullptr, bool enabled = true)
@@ -2140,7 +2399,7 @@ static void addButton(int x, int y, int w, int h, const std::string &label, int 
     b.glyph   = glyph;
     b.font    = font;
     b.enabled = enabled;
-    g_buttons.push_back(b);
+    buttonTarget().push_back(b);
 }
 
 /** A selectable cell; 'on' fills it with the accent. Pass a glyph and leave
@@ -2157,7 +2416,7 @@ static void addChoice(int x, int y, int w, int h, const std::string &label,
     b.glyph   = glyph;
     b.on      = on;
     b.font    = font;
-    g_buttons.push_back(b);
+    buttonTarget().push_back(b);
 }
 
 /** A cell of the header appearance switcher: a BTN_V_CHOICE that paints no
@@ -2166,7 +2425,7 @@ static void addChoice(int x, int y, int w, int h, const std::string &label,
 static void addSegment(int x, int y, int w, int h, int id, bool on, int glyph)
 {
     addChoice(x, y, w, h, "", id, on, nullptr, glyph);
-    g_buttons.back().framed = false;
+    buttonTarget().back().framed = false;
 }
 
 /** A nav-rail item; 'on' marks the active tab. */
@@ -2179,7 +2438,7 @@ static void addNav(int y, const std::string &label, int id, int glyph, bool on)
     b.variant = BTN_V_NAV;
     b.glyph   = glyph;
     b.on      = on;
-    g_buttons.push_back(b);
+    buttonTarget().push_back(b);
 }
 
 static SDL_Color statusToneColor()
@@ -2418,6 +2677,47 @@ static std::string fitText(const std::string &s, TTF_Font *font, int maxW)
     return "…";
 }
 
+/* Editing variant of fitText: keep the END of a long single-line string
+ * visible, because the caret is always at the end. fitText hides exactly the
+ * part the user is editing on a long path. */
+static std::string tailFitText(const std::string &s, TTF_Font *font, int maxW)
+{
+    if (!font || s.empty() || maxW <= 0) return s;
+    const int limit = uiPx(maxW);
+    int w = 0, h = 0;
+    TTF_SizeUTF8(font, s.c_str(), &w, &h);
+    if (w <= limit) return s;
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t next = start + 1;
+        while (next < s.size() && ((unsigned char)s[next] & 0xC0) == 0x80)
+            ++next;
+        start = next;
+        const std::string shown = "…" + s.substr(start);
+        TTF_SizeUTF8(font, shown.c_str(), &w, &h);
+        if (w <= limit) return shown;
+    }
+    return "…";
+}
+
+/* Shared by history hit-testing and painting: the folder icon follows the
+ * ACTUAL ellipsized name, with device-pixel font metrics converted back to
+ * logical coordinates. The body hit area is registered after this icon. */
+static void histNameLayout(const HistEntry &e, const SDL_Rect &row,
+                           std::string &name, SDL_Rect &icon)
+{
+    const int textX = row.x + 12;
+    const int right = HIST_BTN_X - 8;
+    name = fitText(truncateUtf8(e.name.empty() ? e.ip : e.name, 14), g_fontS,
+                   right - textX - HIST_FOLDER_W - HIST_FOLDER_GAP);
+    int w = 0, h = 0;
+    TTF_SizeUTF8(g_fontS, name.c_str(), &w, &h);
+    icon = SDL_Rect{textX + uiCoord(w) + HIST_FOLDER_GAP, row.y + 1,
+                    HIST_FOLDER_W, HIST_FOLDER_H};
+    const int maxX = right - HIST_FOLDER_W;
+    if (icon.x > maxX) icon.x = maxX;
+}
+
 /* ── log ring + STAT parsing ─────────────────────────────────────────────── */
 static std::string persistLogPath()
 {
@@ -2474,6 +2774,9 @@ static void logPush(const std::string &line)
 
 static void closeAuthAsk(long id);
 static void openPasswordAsk(const std::string &error);
+static void closePasswordAsk(bool cancel);
+static void openNextPasswordAsk();
+static void dismissSenderPasswordPrompt();
 static void showFromTray();
 
 /* Short, non-leaking description of a receiver error token. */
@@ -2545,10 +2848,11 @@ static std::string recvServiceErrorText(const std::string &err)
 static std::string recvServicesIssue(const RecvServices &svc)
 {
     struct Item { const char *label; const RecvServiceState *st; };
-    const Item items[4] = {{"计算", &svc.gpu},
+    const Item items[5] = {{"计算", &svc.gpu},
                            {"端口", &svc.ports},
                            {"拼接", &svc.kvm},
-                           {"文件投放", &svc.drop}};
+                           {"文件投放", &svc.drop},
+                           {"文件传输", &svc.files}};
     std::string out;
     for (const Item &it : items) {
         if (it.st->state != 1) continue;     /* only fail() is a problem */
@@ -2564,8 +2868,8 @@ static std::string recvServicesIssue(const RecvServices &svc)
 /* Home-screen status bar state, driven by the receiver's STAT lines. */
 static void applyReceiverStat(const LiveStats &s)
 {
-    if (s.event == "drop") {
-        logPush("[drop] state=" + s.state +
+    if (s.event == "drop" || s.event == "files") {
+        logPush("[" + s.event + "] state=" + s.state +
                 (s.msg.empty() ? "" : " · " + s.msg));
         return;
     }
@@ -2644,9 +2948,11 @@ static void applyReceiverStat(const LiveStats &s)
                 showFromTray();
                 trayNotify("有设备请求连接",
                            (s.dev.empty() ? s.ip : s.dev) +
-                               (s.req == "stitch"
-                                    ? " 请求拼接控制，请在 30 秒内选择"
-                                    : " 请求投屏/扩展，请在 30 秒内选择"));
+                               (s.req == "files"
+                                    ? " 请求浏览和传输文件，请在 30 秒内选择"
+                                    : s.req == "stitch"
+                                          ? " 请求拼接控制，请在 30 秒内选择"
+                                          : " 请求投屏/扩展，请在 30 秒内选择"));
             }
         } else if (s.state == "done") {
             const long id = std::atol(s.id.c_str());
@@ -2686,6 +2992,7 @@ static void applyReceiverStat(const LiveStats &s)
         else if (s.svc == "ports") dst = &g_recv_services.ports;
         else if (s.svc == "kvm")   dst = &g_recv_services.kvm;
         else if (s.svc == "drop")  dst = &g_recv_services.drop;
+        else if (s.svc == "files") dst = &g_recv_services.files;
         if (!dst) return;
         dst->state = val;
         if (s.port > 0) dst->port = s.port;
@@ -2769,8 +3076,8 @@ static void parseStatLine(const std::string &line, bool from_receiver)
     }
     /* File-drop progress is informational and must not replace the live
      * session snapshot (a drop line carries no frames/codec fields). */
-    if (s.event == "drop") {
-        logPush("[drop] state=" + s.state +
+    if (s.event == "drop" || s.event == "files") {
+        logPush("[" + s.event + "] state=" + s.state +
                 (s.msg.empty() ? "" : " · " + s.msg));
         return;
     }
@@ -2785,24 +3092,40 @@ static void parseStatLine(const std::string &line, bool from_receiver)
     if (s.event == "auth") {
         if (s.state == "need_password") {
             setSendPhase(SP_PASSWORD);
-            openPasswordAsk(std::string());
+            if (g_pw_ask.open && g_pw_file_transfer) {
+                /* The file client owns the one modal; show the sender prompt
+                 * as soon as that one closes. */
+                g_pw_sender_pending = true;
+                g_pw_sender_error.clear();
+            } else {
+                openPasswordAsk(std::string());
+            }
         } else if (s.state == "authenticating") {
-            g_pw_ask.open = false;
+            dismissSenderPasswordPrompt();
             setSendPhase(SP_VERIFY);
             g_auth_wait_note = "正在验证连接密码…";
         } else if (s.state == "waiting") {
-            g_pw_ask.open = false;
+            dismissSenderPasswordPrompt();
             setSendPhase(SP_WAIT_AUTH);
             g_auth_wait_note = "已发送连接请求，等待对方授权（最多 30 秒）…";
         } else if (s.state == "granted") {
+            g_pw_sender_pending = false;
+            g_pw_sender_error.clear();
             setSendPhase(SP_GRANTED);
             g_auth_wait_note = "对方已允许连接";
         } else if (s.state == "cancelled") {
-            g_pw_ask.open = false;
+            /* The sender gave up; a prompt queued behind the file client must
+             * not pop up later for a session that no longer exists. */
+            g_pw_sender_pending = false;
+            g_pw_sender_error.clear();
+            dismissSenderPasswordPrompt();
             setSendPhase(SP_CONNECTING);
             g_auth_wait_note.clear();
         }
     } else if (s.event == "error") {
+        g_pw_sender_pending = false;
+        g_pw_sender_error.clear();
+        if (g_pw_ask.open && !g_pw_file_transfer) closePasswordAsk(false);
         if (!(g_sender_stop_requested && s.msg == "send_failed")) {
             setSendPhase(SP_FAILED);
             g_status_tone = StatusTone::Error;
@@ -2952,6 +3275,15 @@ static void answerAuthAsk(bool allow)
     if (g_receiver.active) g_recv_state = RSV_WAITING;
 }
 
+/* Text input is application-global. Closing one owner must not silently turn
+ * it off for a field that still needs it. */
+static void stopPasswordTextInput()
+{
+    SDL_StopTextInput();
+    if (g_file_edit_side >= 0 || g_set_pw.open || g_screen == SCR_MANUAL_IP)
+        SDL_StartTextInput();
+}
+
 /* Sender side: the receiver's policy is 仅允许密码连接. The password is typed
  * here, sent over stdin (never argv), and cleared as soon as it is handed
  * over. */
@@ -2977,19 +3309,84 @@ static void openPasswordAsk(const std::string &error)
     }
 }
 
+static void offerPendingFilePassword()
+{
+    if (!g_file_open || g_file_state != FT_CLIENT_NEED_PASSWORD) return;
+    if (g_pw_ask.open) {
+        /* A sender password prompt owns the modal; wait for it to close. The
+         * previous code simply dropped the file request and let the client
+         * time out after 120 s. */
+        g_file_pw_pending = true;
+        return;
+    }
+    g_file_pw_pending = false;
+    g_pw_file_transfer = true;
+    openPasswordAsk("");
+    /* The prompt lives in the main window; when the page is detached, move
+     * input focus there (after openPasswordAsk may have restored a hidden
+     * main window) so keystrokes reach the password field. */
+    if (g_file_detached && g_file_win) {
+        SDL_RestoreWindow(g_win);
+        SDL_RaiseWindow(g_win);
+        SDL_SetWindowInputFocus(g_win);
+    }
+}
+
+/* The single modal is shared by the sender and the file client. Open whichever
+ * request is still waiting after the previous owner closes it. */
+static void openNextPasswordAsk()
+{
+    if (g_pw_ask.open) return;
+    if (g_file_pw_pending && g_file_open &&
+        g_file_state == FT_CLIENT_NEED_PASSWORD) {
+        offerPendingFilePassword();
+        return;
+    }
+    g_file_pw_pending = false;
+    if (g_pw_sender_pending) {
+        g_pw_sender_pending = false;
+        g_pw_file_transfer = false;
+        const std::string error = g_pw_sender_error;
+        g_pw_sender_error.clear();
+        openPasswordAsk(error);
+    }
+}
+
+/* A sender STAT line must never close a prompt that belongs to the file
+ * client. When the sender still owns it, release the modal and hand it to any
+ * waiting file request. */
+static void dismissSenderPasswordPrompt()
+{
+    if (!g_pw_ask.open || g_pw_file_transfer) return;
+    g_pw_ask.open = false;
+    g_pw_ask.text.assign(g_pw_ask.text.size(), '\0');
+    g_pw_ask.text.clear();
+    stopPasswordTextInput();
+    openNextPasswordAsk();
+}
+
 static void closePasswordAsk(bool cancel)
 {
     if (!g_pw_ask.open) return;
     const bool was_open = g_pw_ask.open;
+    const bool for_files = g_pw_file_transfer;
     g_pw_ask.open = false;
+    g_pw_file_transfer = false;
     g_pw_ask.text.assign(g_pw_ask.text.size(), '\0');
     g_pw_ask.text.clear();
-    SDL_StopTextInput();
+    stopPasswordTextInput();
     if (cancel && was_open) {
-        sendToChild(g_sender, "AUTH|cancel");
-        setSendPhase(SP_CONNECTING);
-        g_auth_wait_note.clear();
+        if (for_files) {
+            ftClientPassword("");
+            g_file_message = "已取消密码输入";
+        } else {
+            sendToChild(g_sender, "AUTH|cancel");
+            setSendPhase(SP_CONNECTING);
+            g_auth_wait_note.clear();
+        }
     }
+    if (for_files) g_file_pw_pending = false;
+    openNextPasswordAsk();
 }
 
 static void submitPassword()
@@ -2998,13 +3395,23 @@ static void submitPassword()
         g_pw_ask.error = mivaraPasswordRule();
         return;
     }
-    sendToChild(g_sender, "AUTH|password=" + g_pw_ask.text);
+    const bool for_files = g_pw_file_transfer;
+    if (for_files) ftClientPassword(g_pw_ask.text);
+    else           sendToChild(g_sender, "AUTH|password=" + g_pw_ask.text);
     g_pw_ask.open = false;
+    g_pw_file_transfer = false;
     g_pw_ask.text.assign(g_pw_ask.text.size(), '\0');
     g_pw_ask.text.clear();
-    SDL_StopTextInput();
-    setSendPhase(SP_VERIFY);
-    g_auth_wait_note = "正在验证连接密码…";
+    stopPasswordTextInput();
+    if (for_files) {
+        g_file_state = FT_CLIENT_VERIFYING;
+        g_file_message = "正在验证连接密码…";
+    } else {
+        setSendPhase(SP_VERIFY);
+        g_auth_wait_note = "正在验证连接密码…";
+    }
+    if (for_files) g_file_pw_pending = false;
+    openNextPasswordAsk();
 }
 
 /* Single source of truth for the 4–8 character password field. A too-long
@@ -3560,6 +3967,10 @@ static void stopSender()
     g_send_phase = SP_IDLE;
     g_auth_wait_note.clear();
     g_status_tone = StatusTone::Info;
+    /* A queued sender password request is meaningless once the child is gone. */
+    g_pw_sender_pending = false;
+    g_pw_sender_error.clear();
+    if (g_pw_ask.open && !g_pw_file_transfer) closePasswordAsk(false);
 }
 
 /* A receiver that never reports ready is not "正在开启" forever. Ten seconds
@@ -3951,6 +4362,1134 @@ static void startSendMode(const std::string &ip, int port, int mode,
     else launchStream(ip, port, mode, name);
 }
 
+/* ── independent two-way file page ────────────────────────────────────────── */
+/* The page is rendered either in the main window's body column or in a
+ * detached window. Both paths use fileLayout()/fileCanvas(); only the renderer
+ * and the button list differ. */
+static void drawFilePage(SDL_Renderer *ren, const FileLayout &L, int hot,
+                         int press, bool detached);
+static void fileStopEdit(bool commit);
+static int &fileScroll(bool remote);
+static bool settingsDirty();
+
+static bool fileRemoteReady()
+{
+    return g_file_open && g_file_state == FT_CLIENT_READY;
+}
+
+static const FtListing &fileListing(bool remote)
+{
+    return remote ? g_file_remote : g_file_local;
+}
+
+/* Entry indices actually visible in a pane (hidden files filtered). */
+static std::vector<int> fileVisibleIndices(bool remote)
+{
+    const FtListing &list = fileListing(remote);
+    const bool show_hidden = remote ? g_file_remote_show_hidden
+                                    : g_file_local_show_hidden;
+    std::vector<int> out;
+    out.reserve(list.entries.size());
+    for (int i = 0; i < (int)list.entries.size(); ++i) {
+        const FtEntry &e = list.entries[(size_t)i];
+        if (!show_hidden && e.hidden) continue;
+        out.push_back(i);
+    }
+    return out;
+}
+
+static int fileMaxScroll(bool remote)
+{
+    const int count = (int)fileVisibleIndices(remote).size();
+    return std::max(0, count - FILE_VISIBLE);
+}
+
+static int fileEntryAtSlot(bool remote, int slot, int scroll)
+{
+    const std::vector<int> idx = fileVisibleIndices(remote);
+    const int pos = scroll + slot;
+    if (pos < 0 || pos >= (int)idx.size()) return -1;
+    return idx[(size_t)pos];
+}
+
+static void fileResetPane(bool remote)
+{
+    int &sel = remote ? g_file_remote_sel : g_file_local_sel;
+    int &scroll = remote ? g_file_remote_scroll : g_file_local_scroll;
+    std::set<std::string> &marks = remote ? g_file_remote_marks
+                                          : g_file_local_marks;
+    sel = -1;
+    scroll = 0;
+    marks.clear();
+    /* Do not touch g_file_edit_* here: a background listing refresh must not
+     * silently disarm the select-all state of an in-progress path edit. */
+    /* A listing replacement invalidates the slot indices a pending press was
+     * aimed at; do not let the matching release act on the new mapping. */
+    g_press = BTN_NONE;
+    g_file_press = BTN_NONE;
+}
+
+static void filePushHistory(bool remote, const std::string &path)
+{
+    std::vector<std::string> &hist = remote ? g_file_remote_hist
+                                            : g_file_local_hist;
+    if (path.empty() || (!hist.empty() && hist.back() == path)) return;
+    hist.push_back(path);
+    if (hist.size() > 64) hist.erase(hist.begin());
+}
+
+/* Load the local pane. push_history is false for refresh/back/home, where the
+ * caller owns the history entry. preserve_view keeps the user's checks,
+ * selection-by-name and scroll across a background refresh (the transfer
+ * queue drain) instead of resetting the pane under their hands. */
+static void fileLoadLocal(const std::string &path, bool push_history = true,
+                          bool preserve_view = false)
+{
+    FtListing next;
+    std::string error;
+    if (!ftLocalList(path, next, error)) {
+        g_file_message = error.empty() ? "无法读取本机目录" : error;
+        return;
+    }
+    std::string sel_name;
+    if (g_file_local_sel >= 0 &&
+        g_file_local_sel < (int)g_file_local.entries.size())
+        sel_name = g_file_local.entries[(size_t)g_file_local_sel].name;
+    if (push_history && !g_file_local.path.empty() &&
+        g_file_local.path != next.path)
+        filePushHistory(false, g_file_local.path);
+    g_file_local = std::move(next);
+    if (!preserve_view) {
+        fileResetPane(false);
+        return;
+    }
+    g_file_local_sel = -1;
+    if (!sel_name.empty()) {
+        for (int i = 0; i < (int)g_file_local.entries.size(); ++i) {
+            if (g_file_local.entries[(size_t)i].name == sel_name) {
+                g_file_local_sel = i;
+                break;
+            }
+        }
+    }
+    std::set<std::string> keep;
+    for (const FtEntry &e : g_file_local.entries)
+        if (g_file_local_marks.count(e.name)) keep.insert(e.name);
+    g_file_local_marks.swap(keep);
+    const int max_scroll = std::max(
+        0, (int)fileVisibleIndices(false).size() - FILE_VISIBLE);
+    if (g_file_local_scroll > max_scroll) g_file_local_scroll = max_scroll;
+    if (g_file_local_scroll < 0) g_file_local_scroll = 0;
+}
+
+static void fileLocalHome()
+{
+    std::string home, error;
+    g_file_local_hist.clear();
+    if (ftLocalHome(home, error)) fileLoadLocal(home, false);
+    else                          fileLoadLocal("", false);
+}
+
+static void fileLocalUp()
+{
+    fileLoadLocal(ftPathParent(g_file_local.path));
+}
+
+static void fileLocalBack()
+{
+    if (g_file_local_hist.empty()) return;
+    const std::string path = g_file_local_hist.back();
+    g_file_local_hist.pop_back();
+    fileLoadLocal(path, false);
+}
+
+static void fileLocalRoots()
+{
+    fileLoadLocal("");
+}
+
+static void fileRemoteHome()
+{
+    if (!fileRemoteReady() || ftClientBusy()) return;
+    g_file_remote_hist.clear();
+    g_file_remote_push_pending = false;
+    g_file_message = "正在读取对端主目录…";
+    g_file_refresh_notice = false;
+    if (!ftClientListHome())
+        g_file_message = "目录请求未能发送，请重新连接";
+}
+
+static void fileRemoteList(const std::string &path, bool preserve_notice = false,
+                           bool push_history = true)
+{
+    if (!fileRemoteReady() || ftClientBusy()) return;
+    /* Push the old path only when the LIST actually succeeds; a rejected path
+     * must not leave a bogus entry in the back history. */
+    g_file_remote_push_pending =
+        push_history && !g_file_remote.path.empty() && g_file_remote.path != path;
+    g_file_refresh_notice = preserve_notice;
+    if (!preserve_notice)
+        g_file_message = path.empty() ? "正在读取对端位置…"
+                                      : "正在读取对端目录…";
+    if (!ftClientList(path)) {
+        g_file_refresh_notice = false;
+        g_file_message = "路径无效、过长，或连接已关闭";
+    }
+}
+
+static void fileRemoteRefresh()
+{
+    if (!fileRemoteReady() || ftClientBusy()) return;
+    if (g_file_remote.path.empty()) {
+        if (!ftClientRoots())
+            g_file_message = "路径无效、过长，或连接已关闭";
+    } else {
+        fileRemoteList(g_file_remote.path, false, false);
+    }
+}
+
+static void fileRemoteUp()
+{
+    fileRemoteList(ftPathParent(g_file_remote.path));
+}
+
+static void fileRemoteBack()
+{
+    if (g_file_remote_hist.empty()) return;
+    if (!fileRemoteReady() || ftClientBusy()) return;
+    const std::string path = g_file_remote_hist.back();
+    g_file_remote_hist.pop_back();
+    fileRemoteList(path, false, false);
+}
+
+static void fileRemoteRoots()
+{
+    fileRemoteList("");
+}
+
+/* ── detached window ─────────────────────────────────────────────────────── */
+static bool openFileWindow()
+{
+    if (g_file_win) return true;
+    g_file_win = SDL_CreateWindow("文件传输 · Mivara", SDL_WINDOWPOS_CENTERED,
+                                  SDL_WINDOWPOS_CENTERED, uiPx(WIN_W),
+                                  uiPx(WIN_H), 0);
+    if (!g_file_win) return false;
+    applyMivaraWindowIcon(g_file_win);
+    /* The main window's vsync paces the shared loop; a second vsynced
+     * presenter here would serialise two D3D swaps per frame. */
+    g_file_ren = SDL_CreateRenderer(g_file_win, -1,
+                                    SDL_RENDERER_ACCELERATED);
+    if (!g_file_ren) {
+        SDL_DestroyWindow(g_file_win);
+        g_file_win = nullptr;
+        return false;
+    }
+    SDL_SetRenderDrawBlendMode(g_file_ren, SDL_BLENDMODE_BLEND);
+    SDL_RenderSetScale(g_file_ren, g_uiScale, g_uiScale);
+    g_file_hot = BTN_NONE;
+    g_file_press = BTN_NONE;
+    return true;
+}
+
+static void closeFileWindow()
+{
+    if (!g_file_ren && !g_file_win) return;
+    /* A mask texture may not outlive the renderer that made it. */
+    if (g_file_ren) dropMasks(g_file_ren);
+    if (g_file_ren) SDL_DestroyRenderer(g_file_ren);
+    if (g_file_win) SDL_DestroyWindow(g_file_win);
+    g_file_ren = nullptr;
+    g_file_win = nullptr;
+    g_file_hot = BTN_NONE;
+    g_file_press = BTN_NONE;
+    g_file_buttons.clear();
+}
+
+static bool fileOpenDetached()
+{
+    if (!openFileWindow()) return false;
+    g_file_detached = true;
+    if (g_screen == SCR_FILES) setScreen(SCR_HOME);
+    g_press = BTN_NONE;
+    g_file_press = BTN_NONE;
+    return true;
+}
+
+static void fileAttachToMain()
+{
+    /* Attaching replaces the main window's page; never do that underneath an
+     * unsaved Settings card, where the pending edits would be silently lost. */
+    if (g_screen == SCR_SETTINGS && settingsDirty()) {
+        g_file_message = "设置尚未保存，请先保存或取消后再合回";
+        return;
+    }
+    closeFileWindow();
+    g_file_detached = false;
+    setScreen(SCR_FILES);
+    if (g_hidden) {
+        showFromTray();
+    } else {
+        /* A minimized or occluded main window would otherwise hide the page
+         * the user just asked to move back into. */
+        SDL_RestoreWindow(g_win);
+        SDL_RaiseWindow(g_win);
+        SDL_SetWindowInputFocus(g_win);
+    }
+    g_press = BTN_NONE;
+    g_file_press = BTN_NONE;
+}
+
+static void fileToggleDetached()
+{
+    if (g_file_detached) {
+        fileAttachToMain();
+    } else if (!fileOpenDetached()) {
+        g_file_message = "无法创建独立窗口，已保留在主窗口";
+    }
+}
+
+static void renderFileWindow()
+{
+    if (!g_file_detached || !g_file_win || !g_file_ren) return;
+    const Uint32 flags = SDL_GetWindowFlags(g_file_win);
+    if (flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) return;
+    setColor(g_file_ren, THEME.bg);
+    SDL_RenderClear(g_file_ren);
+    const FileLayout L = fileLayout(fileCanvas(true));
+    /* drawButton() reads the shared hover/press globals; swap in the detached
+     * window's state for this present only. */
+    const int old_hot = g_hot;
+    const int old_press = g_press;
+    g_hot = g_file_hot;
+    g_press = g_file_press;
+    drawFilePage(g_file_ren, L, g_file_hot, g_file_press, true);
+    for (const Button &b : g_file_buttons) drawButton(g_file_ren, b);
+    g_hot = old_hot;
+    g_press = old_press;
+    SDL_RenderPresent(g_file_ren);
+}
+
+/* Wheel over the detached page: task list first, then whichever pane holds the
+ * pointer. Coordinates are window-local logical units. */
+static void fileScrollWheel(int dir, int mx, int my, bool detached)
+{
+    const FileLayout L = fileLayout(fileCanvas(detached));
+    const SDL_Point p{mx, my};
+    if (SDL_PointInRect(&p, &L.card)) {
+        const int max_scroll =
+            std::max(0, (int)g_file_tasks.size() - L.task_visible);
+        g_file_task_scroll -= dir * 2;
+        if (g_file_task_scroll < 0) g_file_task_scroll = 0;
+        if (g_file_task_scroll > max_scroll) g_file_task_scroll = max_scroll;
+        /* The hit rects still describe the pre-scroll frame; cancel a press
+         * so a release in this event batch cannot remove the wrong task. */
+        if (detached) g_file_press = BTN_NONE;
+        else          g_press = BTN_NONE;
+        return;
+    }
+    for (int side = 0; side < 2; ++side) {
+        if (!SDL_PointInRect(&p, &L.panes[side])) continue;
+        const bool remote = side != 0;
+        int &scroll = fileScroll(remote);
+        scroll -= dir * 3;
+        if (scroll < 0) scroll = 0;
+        const int max_scroll = fileMaxScroll(remote);
+        if (scroll > max_scroll) scroll = max_scroll;
+        if (detached) g_file_press = BTN_NONE;
+        else          g_press = BTN_NONE;
+        return;
+    }
+}
+
+/* ── page lifecycle ──────────────────────────────────────────────────────── */
+static void closeFileTransfer()
+{
+    fileStopEdit(false);
+    g_file_pw_pending = false;
+    if (g_pw_file_transfer && g_pw_ask.open) closePasswordAsk(false);
+    ftClientStop();
+    closeFileWindow();
+    g_file_detached = false;
+    g_file_open = false;
+    if (g_screen == SCR_FILES) setScreen(SCR_HOME);
+    if (g_session_screen == SCR_FILES) g_session_screen = SCR_HOME;
+    g_file_state = FT_CLIENT_DISCONNECTED;
+    g_file_refresh_notice = false;
+    g_file_remote_push_pending = false;
+    g_file_local = FtListing{};
+    g_file_remote = FtListing{};
+    fileResetPane(false);
+    fileResetPane(true);
+    g_file_local_hist.clear();
+    g_file_remote_hist.clear();
+    g_file_tasks.clear();
+    g_file_task_active = -1;
+    g_file_task_scroll = 0;
+    g_file_queue_paused = false;
+    g_file_done_count = 0;
+    g_file_refresh_pending = false;
+    g_file_remote_name.clear();
+    g_file_message.clear();
+    g_press = BTN_NONE;
+}
+
+static bool fileStartConnection()
+{
+    g_file_state = FT_CLIENT_CONNECTING;
+    g_file_pw_pending = false;
+    g_file_message = "正在连接 " + g_file_ip + ":" +
+                     std::to_string(FILEXFER_PORT) + "…";
+    g_file_remote = FtListing{};
+    g_file_remote_hist.clear();
+    g_file_remote_push_pending = false;
+    fileResetPane(true);
+    g_file_refresh_notice = false;
+    fileStopEdit(false);
+    /* ftClientStart clears the event deque: a completion from the previous
+     * connection can no longer arrive. Retry the lost active item instead of
+     * leaving the queue pinned to a dead index. */
+    g_file_task_active = -1;
+    for (FileTask &t : g_file_tasks) {
+        if (t.state == FTS_ACTIVE) {
+            t.state = FTS_QUEUED;
+            t.bytes = 0;
+            t.detail.clear();
+        }
+    }
+    if (!ftClientStart(g_file_ip, FILEXFER_PORT)) {
+        g_file_state = FT_CLIENT_ERROR;
+        g_file_message = "无法启动文件传输连接（请确认对端 IP 地址有效）";
+        return false;
+    }
+    return true;
+}
+
+static void openFileTransfer(const std::string &ip, const std::string &name)
+{
+    /* Re-clicking the same peer's folder icon must not tear down a live page
+     * and its transfer queue; just bring the page back. */
+    if (g_file_open && !g_file_ip.empty() && g_file_ip == ip) {
+        if (g_file_detached && g_file_win) {
+            SDL_RestoreWindow(g_file_win);
+            SDL_RaiseWindow(g_file_win);
+            SDL_SetWindowInputFocus(g_file_win);
+        } else {
+            setScreen(SCR_FILES);
+        }
+        return;
+    }
+    if (g_file_open) closeFileTransfer();
+    else ftClientStop();             /* discard events from an earlier page */
+    g_file_open = true;
+    g_file_ip = ip;
+    g_file_name = name.empty() ? ip : name;
+    g_file_remote_name = g_file_name;
+    g_file_local_name = ftLocalDeviceName();
+    g_file_local = FtListing{};
+    g_file_remote = FtListing{};
+    g_file_local_hist.clear();
+    g_file_remote_hist.clear();
+    g_file_tasks.clear();
+    g_file_task_active = -1;
+    g_file_task_scroll = 0;
+    g_file_queue_paused = false;
+    g_file_done_count = 0;
+    g_file_pw_pending = false;
+    g_file_message.clear();
+    g_file_refresh_notice = false;
+    g_file_refresh_pending = false;
+    g_file_remote_push_pending = false;
+    fileResetPane(false);
+    fileResetPane(true);
+    std::string home, error;
+    if (ftLocalHome(home, error)) fileLoadLocal(home, false);
+    else                          fileLoadLocal("", false);
+    if (g_cfg.file_transfer_detach) {
+        if (!fileOpenDetached()) {
+            setScreen(SCR_FILES);
+            g_file_message = "无法创建独立窗口，已嵌入主窗口";
+        }
+    } else {
+        setScreen(SCR_FILES);
+    }
+    fileStartConnection();
+}
+
+static void reconnectFileTransfer()
+{
+    if (!g_file_open || g_file_ip.empty()) return;
+    g_file_pw_pending = false;
+    if (g_pw_file_transfer && g_pw_ask.open) closePasswordAsk(false);
+    ftClientStop();
+    g_file_queue_paused = false;
+    fileStartConnection();
+}
+
+/* ── selection ───────────────────────────────────────────────────────────── */
+static std::set<std::string> &fileMarks(bool remote)
+{
+    return remote ? g_file_remote_marks : g_file_local_marks;
+}
+
+static int &fileSel(bool remote)
+{
+    return remote ? g_file_remote_sel : g_file_local_sel;
+}
+
+static int &fileScroll(bool remote)
+{
+    return remote ? g_file_remote_scroll : g_file_local_scroll;
+}
+
+static std::vector<const FtEntry *> fileSelection(bool remote)
+{
+    const FtListing &list = fileListing(remote);
+    std::set<std::string> &marks = fileMarks(remote);
+    std::vector<const FtEntry *> out;
+    if (!marks.empty()) {
+        for (const FtEntry &e : list.entries)
+            if (marks.count(e.name)) out.push_back(&e);
+    } else {
+        const int sel = fileSel(remote);
+        if (sel >= 0 && sel < (int)list.entries.size())
+            out.push_back(&list.entries[(size_t)sel]);
+    }
+    return out;
+}
+
+static int fileSelectedCount()
+{
+    int n = 0;
+    for (int side = 0; side < 2; ++side) {
+        const bool remote = side != 0;
+        const FtListing &list = fileListing(remote);
+        const std::set<std::string> &marks = fileMarks(remote);
+        if (!marks.empty()) {
+            for (const FtEntry &e : list.entries)
+                if (marks.count(e.name)) ++n;
+        } else {
+            const int sel = fileSel(remote);
+            if (sel >= 0 && sel < (int)list.entries.size()) ++n;
+        }
+    }
+    return n;
+}
+
+static int fileSideSelectedFiles(bool remote)
+{
+    const FtListing &list = fileListing(remote);
+    const std::set<std::string> &marks = fileMarks(remote);
+    int n = 0;
+    if (!marks.empty()) {
+        for (const FtEntry &e : list.entries)
+            if (!e.directory && marks.count(e.name)) ++n;
+    } else {
+        const int sel = fileSel(remote);
+        if (sel >= 0 && sel < (int)list.entries.size() &&
+            !list.entries[(size_t)sel].directory)
+            ++n;
+    }
+    return n;
+}
+
+static void fileToggleMark(bool remote, int slot)
+{
+    const int idx = fileEntryAtSlot(remote, slot, fileScroll(remote));
+    if (idx < 0) return;
+    const std::string &name = fileListing(remote).entries[(size_t)idx].name;
+    std::set<std::string> &marks = fileMarks(remote);
+    if (!marks.erase(name)) marks.insert(name);
+}
+
+static void fileToggleMarkAll(bool remote)
+{
+    const std::vector<int> idx = fileVisibleIndices(remote);
+    std::set<std::string> &marks = fileMarks(remote);
+    const FtListing &list = fileListing(remote);
+    bool all = !idx.empty();
+    for (int i : idx) {
+        if (!marks.count(list.entries[(size_t)i].name)) {
+            all = false;
+            break;
+        }
+    }
+    if (all) {
+        marks.clear();
+    } else {
+        for (int i : idx) marks.insert(list.entries[(size_t)i].name);
+    }
+}
+
+static void fileActivateRow(bool remote, int slot)
+{
+    const int idx = fileEntryAtSlot(remote, slot, fileScroll(remote));
+    if (idx < 0) return;
+    if (remote && (!fileRemoteReady() || ftClientBusy())) return;
+    const FtListing &list = fileListing(remote);
+    fileSel(remote) = idx;
+    const FtEntry entry = list.entries[(size_t)idx]; /* stable across refresh */
+    if (g_mouse_clicks < 2 || !entry.directory) return;
+    const std::string path = ftPathJoin(list.path, entry.name);
+    if (path.empty()) return;
+    if (remote) fileRemoteList(path);
+    else        fileLoadLocal(path);
+}
+
+/* ── transfer queue ──────────────────────────────────────────────────────── */
+static bool fileQueueFull()
+{
+    return g_file_tasks.size() >= 200;
+}
+
+static bool fileEnqueue(bool remote, const FtEntry &e)
+{
+    if (fileQueueFull()) return false;
+    FileTask t;
+    t.upload = !remote;
+    t.name = e.name;
+    t.size = e.size;
+    if (!remote) {
+        t.source_dir = g_file_local.path;
+        t.dest_dir = g_file_remote.path;
+        t.source_path = ftPathJoin(g_file_local.path, e.name);
+        t.dest_path = g_file_remote.path;
+    } else {
+        t.source_dir = g_file_remote.path;
+        t.dest_dir = g_file_local.path;
+        t.source_path = ftPathJoin(g_file_remote.path, e.name);
+        t.dest_path = g_file_local.path;
+    }
+    if (t.source_path.empty() || t.dest_path.empty()) return false;
+    g_file_tasks.push_back(std::move(t));
+    return true;
+}
+
+static void fileRefreshAfterQueue()
+{
+    if (!g_file_open) return;
+    if (fileRemoteReady() && !ftClientBusy())
+        fileRemoteList(g_file_remote.path, true, false);
+    fileLoadLocal(g_file_local.path, false, true);
+}
+
+static bool fileQueueAdvance()
+{
+    if (!g_file_open || g_file_queue_paused || g_file_task_active >= 0)
+        return false;
+    if (!fileRemoteReady() || ftClientBusy()) return false;
+    for (int i = 0; i < (int)g_file_tasks.size(); ++i) {
+        FileTask &t = g_file_tasks[(size_t)i];
+        if (t.state != FTS_QUEUED) continue;
+        t.state = FTS_ACTIVE;
+        t.bytes = 0;
+        t.detail.clear();
+        g_file_task_active = i;
+        const bool ok = t.upload
+                            ? ftClientUpload(t.source_path, t.dest_path)
+                            : ftClientDownload(t.source_path, t.dest_path);
+        if (!ok) {
+            /* Paths were validated at enqueue, so this is the client being
+             * busy or already dead. Keep the item queued and pause instead of
+             * failing the whole queue one item at a time. */
+            t.state = FTS_QUEUED;
+            t.bytes = 0;
+            t.detail.clear();
+            g_file_task_active = -1;
+            g_file_queue_paused = true;
+            g_file_message = "连接已断开，传输队列已暂停";
+            return false;
+        }
+        g_file_message = (t.upload ? "正在发送 " : "正在接收 ") + t.name;
+        return true;
+    }
+    return false;
+}
+
+/* Single scheduling point, called once per frame after the event drain. The
+ * queue is never advanced from inside a completion event: a terminal download
+ * cancel pushes COMPLETE and then DISCONNECTED in the same drain, and starting
+ * the next item on the dead socket would mark it failed for no reason. */
+static void filePump()
+{
+    if (!g_file_open) return;
+    if (g_file_task_active < 0 && !g_file_queue_paused &&
+        fileRemoteReady() && !ftClientBusy())
+        fileQueueAdvance();
+    if (g_file_refresh_pending && g_file_task_active < 0 &&
+        !ftClientBusy()) {
+        g_file_refresh_pending = false;
+        fileRefreshAfterQueue();
+    }
+}
+
+static void fileTaskComplete(const FtEvent &e)
+{
+    if (g_file_task_active < 0 ||
+        g_file_task_active >= (int)g_file_tasks.size())
+        return;
+    /* The client serialises operations, so a non-mkdir COMPLETE while an item
+     * is active always belongs to that item. Do not match on the name: a
+     * successful download may report a final name chosen locally. */
+    FileTask &t = g_file_tasks[(size_t)g_file_task_active];
+    t.bytes = e.bytes;
+    t.total = e.total;
+    if (e.status == FT_OK) {
+        t.state = FTS_DONE;
+        t.detail = e.message;
+        ++g_file_done_count;
+        g_file_message = (t.upload ? "已发送：" : "已接收：") + t.name;
+    } else if (e.status == FT_ERR_CANCELLED) {
+        t.state = FTS_CANCELLED;
+        t.detail = e.message.empty() ? "已取消" : e.message;
+        g_file_message = t.name + "：已取消";
+    } else {
+        t.state = FTS_FAILED;
+        t.detail = e.message.empty() ? ftStatusText(e.status) : e.message;
+        g_file_message = t.name + "：" + t.detail;
+    }
+    g_file_task_active = -1;
+    /* Refreshed by filePump once the queue is genuinely idle, not here: the
+     * following STATE event may still invalidate the connection. */
+    g_file_refresh_pending = true;
+}
+
+static void fileSendSelection(bool remote)
+{
+    if (!fileRemoteReady() || ftClientBusy()) return;
+    if (remote ? g_file_local.path.empty() : g_file_remote.path.empty()) {
+        g_file_message = "请先进入接收目录";
+        return;
+    }
+    const std::vector<const FtEntry *> sel = fileSelection(remote);
+    if (sel.empty()) {
+        g_file_message = "请先选择要发送的文件";
+        return;
+    }
+    int added = 0, dirs = 0, rejected = 0;
+    for (const FtEntry *e : sel) {
+        if (e->directory) {
+            ++dirs;
+            continue;
+        }
+        if (fileEnqueue(remote, *e)) ++added;
+        else                        ++rejected;
+    }
+    if (!added) {
+        g_file_message = dirs ? "暂不支持发送文件夹" : "无法加入传输队列";
+        return;
+    }
+    std::string msg = "已加入传输列表：" + std::to_string(added) + " 个文件";
+    if (dirs)     msg += "，跳过 " + std::to_string(dirs) + " 个文件夹";
+    if (rejected) msg += "，" + std::to_string(rejected) + " 个无法排队";
+    g_file_message = msg;
+    fileMarks(remote).clear();
+    g_file_queue_paused = false;
+    fileQueueAdvance();
+}
+
+static void filePauseQueue()
+{
+    g_file_queue_paused = true;
+    g_file_message = "传输队列已暂停；当前文件会继续完成";
+}
+
+static void fileResumeQueue()
+{
+    g_file_queue_paused = false;
+    g_file_message = "继续传输";
+    fileQueueAdvance();
+}
+
+static void fileCancelAll()
+{
+    bool queued = false;
+    for (FileTask &t : g_file_tasks) {
+        if (t.state == FTS_QUEUED) {
+            t.state = FTS_CANCELLED;
+            t.detail = "已取消";
+            queued = true;
+        }
+    }
+    if (g_file_task_active >= 0) {
+        g_file_queue_paused = true;
+        ftClientCancelOperation();
+        g_file_message = "正在取消当前传输…";
+    } else if (queued) {
+        g_file_message = "已取消排队中的传输";
+    }
+}
+
+static void fileClearFinished()
+{
+    std::vector<FileTask> keep;
+    keep.reserve(g_file_tasks.size());
+    int new_active = -1;
+    for (int i = 0; i < (int)g_file_tasks.size(); ++i) {
+        const FileTask &t = g_file_tasks[(size_t)i];
+        if (i == g_file_task_active) {
+            new_active = (int)keep.size();
+            keep.push_back(t);
+        } else if (t.state == FTS_QUEUED) {
+            keep.push_back(t);
+        }
+    }
+    g_file_tasks = std::move(keep);
+    g_file_task_active = new_active;
+    g_file_task_scroll = 0;
+    g_file_message = "已清除完结任务";
+}
+
+static void fileRemoveTask(int slot)
+{
+    const int idx = g_file_task_scroll + slot;
+    if (idx < 0 || idx >= (int)g_file_tasks.size()) return;
+    const FileTask &t = g_file_tasks[(size_t)idx];
+    if (idx == g_file_task_active) {
+        g_file_queue_paused = true;
+        ftClientCancelOperation();
+        g_file_message = "正在取消当前传输…";
+        return;
+    }
+    if (t.state == FTS_ACTIVE) return;
+    g_file_tasks.erase(g_file_tasks.begin() + idx);
+    if (g_file_task_active > idx) --g_file_task_active;
+    const int max_scroll = std::max(0, (int)g_file_tasks.size() - 1);
+    if (g_file_task_scroll > max_scroll) g_file_task_scroll = max_scroll;
+}
+
+static void fileLocateTask(int slot)
+{
+    const int idx = g_file_task_scroll + slot;
+    if (idx < 0 || idx >= (int)g_file_tasks.size()) return;
+    const FileTask &t = g_file_tasks[(size_t)idx];
+    bool target_remote;
+    std::string dir;
+    if (t.state == FTS_DONE) {
+        target_remote = t.upload;      /* destination: remote for upload */
+        dir = t.dest_dir;
+    } else {
+        target_remote = !t.upload;     /* source: remote for download */
+        dir = t.source_dir;
+    }
+    if (target_remote) {
+        if (!fileRemoteReady() || ftClientBusy()) {
+            g_file_message = "对端连接不可用";
+            return;
+        }
+        fileRemoteList(dir);
+    } else {
+        fileLoadLocal(dir);
+    }
+}
+
+static std::string fileUniqueDirName(const FtListing &list,
+                                     const std::string &base)
+{
+    /* A file with the same name also blocks mkdir, so reserve every entry. */
+    std::set<std::string> names;
+    for (const FtEntry &e : list.entries) names.insert(e.name);
+    if (!names.count(base)) return base;
+    for (int i = 1; i < 1000; ++i) {
+        const std::string candidate = base + " (" + std::to_string(i) + ")";
+        if (!names.count(candidate)) return candidate;
+    }
+    return std::string();
+}
+
+static void fileNewFolder(bool remote)
+{
+    const FtListing &list = fileListing(remote);
+    if (list.path.empty()) {
+        g_file_message = "请先进入一个目录";
+        return;
+    }
+    if (remote && (!fileRemoteReady() || ftClientBusy())) return;
+    const std::string name = fileUniqueDirName(list, "新建文件夹");
+    if (name.empty()) {
+        g_file_message = "无法生成文件夹名称";
+        return;
+    }
+    if (remote) {
+        if (ftClientMkdir(list.path, name))
+            g_file_message = "正在新建文件夹…";
+        else
+            g_file_message = "无法新建文件夹：连接已关闭或正忙";
+    } else {
+        const std::string dir = list.path;
+        std::string created, error;
+        if (ftLocalMkdir(dir, name, created, error)) {
+            g_file_message = "已新建文件夹：" + name;
+            fileLoadLocal(dir, false);
+        } else {
+            g_file_message = error;
+        }
+    }
+}
+
+/* ── editable path box ───────────────────────────────────────────────────── */
+static void fileStopEdit(bool commit)
+{
+    if (g_file_edit_side < 0) return;
+    const int side = g_file_edit_side;
+    const std::string text = g_file_edit_text;
+    g_file_edit_side = -1;
+    g_file_edit_text.clear();
+    g_file_edit_select_all = false;
+    SDL_StopTextInput();
+    /* SDL_StartTextInput is application-global. If the main window still owns
+     * a text field (manual IP, password editor), re-arm it; otherwise leaving
+     * the detached path box would silently disable that field. */
+    if (g_pw_ask.open || g_set_pw.open || g_screen == SCR_MANUAL_IP)
+        SDL_StartTextInput();
+    if (!commit) return;
+    if (side == 0) {
+        fileLoadLocal(text);
+    } else {
+        if (!fileRemoteReady() || ftClientBusy()) {
+            g_file_message = "连接不可用，无法跳转";
+            return;
+        }
+        fileRemoteList(text);
+    }
+}
+
+static void fileStartEdit(int side)
+{
+    if (g_file_edit_side == side) return;
+    if (g_file_edit_side >= 0) fileStopEdit(false);
+    g_file_edit_side = side;
+    g_file_edit_text = side == 0 ? g_file_local.path : g_file_remote.path;
+    g_file_edit_select_all = true;
+    g_file_edit_blink = SDL_GetTicks();
+    /* Keep the IME candidate window over the field, not at the window origin. */
+    {
+        SDL_Rect caret = fileLayout(fileCanvas(g_file_detached)).pathBox[side];
+        caret.x = uiPx(caret.x);
+        caret.y = uiPx(caret.y);
+        caret.w = uiPx(caret.w);
+        caret.h = uiPx(caret.h);
+        SDL_SetTextInputRect(&caret);
+    }
+    SDL_StartTextInput();
+}
+
+static void fileEditAppend(const std::string &text)
+{
+    if (g_file_edit_side < 0) return;
+    if (g_file_edit_select_all) {
+        g_file_edit_text.clear();
+        g_file_edit_select_all = false;
+    }
+    for (unsigned char c : text) {
+        if (c < 0x20 || c == 0x7f) continue;
+        if (g_file_edit_text.size() >= FILEXFER_MAX_PATH_BYTES) break;
+        g_file_edit_text.push_back((char)c);
+    }
+}
+
+static void fileEditBackspace()
+{
+    if (g_file_edit_side < 0) return;
+    if (g_file_edit_select_all) {
+        g_file_edit_text.clear();
+        g_file_edit_select_all = false;
+        return;
+    }
+    while (!g_file_edit_text.empty()) {
+        const unsigned char c = (unsigned char)g_file_edit_text.back();
+        g_file_edit_text.pop_back();
+        if ((c & 0xC0) != 0x80) break;
+    }
+}
+
+/* ── formatting ──────────────────────────────────────────────────────────── */
+static std::string fileStateText()
+{
+    switch (g_file_state) {
+    case FT_CLIENT_CONNECTING:    return "正在连接";
+    case FT_CLIENT_NEED_PASSWORD: return "等待密码";
+    case FT_CLIENT_WAIT_AUTH:     return "等待对方授权";
+    case FT_CLIENT_VERIFYING:     return "正在验证";
+    case FT_CLIENT_READY:         return ftClientBusy() ? "正在处理" : "已连接";
+    case FT_CLIENT_ERROR:         return "连接失败";
+    default:                      return "未连接";
+    }
+}
+
+static std::string fileSizeText(uint64_t bytes)
+{
+    static const char *unit[] = {"B", "KB", "MB", "GB", "TB"};
+    double n = (double)bytes;
+    int u = 0;
+    while (n >= 1024.0 && u < 4) { n /= 1024.0; ++u; }
+    char buf[48];
+    if (u == 0) std::snprintf(buf, sizeof(buf), "%llu B",
+                              (unsigned long long)bytes);
+    else        std::snprintf(buf, sizeof(buf), n >= 100.0 ? "%.0f %s"
+                                                          : "%.1f %s", n, unit[u]);
+    return buf;
+}
+
+static std::string fileDateText(uint64_t mtime, bool compact)
+{
+    if (!mtime) return "—";
+    time_t t = (time_t)std::min<uint64_t>(mtime, FILEXFER_MAX_MTIME);
+    struct tm tmv{};
+#ifdef _WIN32
+    if (localtime_s(&tmv, &t) != 0) return "—";
+#else
+    if (!localtime_r(&t, &tmv)) return "—";
+#endif
+    char buf[32] = {};
+    if (!std::strftime(buf, sizeof(buf),
+                       compact ? "%m/%d %H:%M" : "%Y/%m/%d %H:%M", &tmv))
+        return "—";
+    return buf;
+}
+
+static std::string fileTypeText(const FtEntry &e, bool compact)
+{
+    if (e.directory) return compact ? "目录" : "文件夹";
+    const size_t dot = e.name.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= e.name.size()) return "文件";
+    std::string ext = e.name.substr(dot + 1);
+    if (ext.size() > 10) ext.resize(10);
+    for (char &c : ext) c = (char)std::tolower((unsigned char)c);
+    return ext;
+}
+
+static std::string fileTaskStatusText(const FileTask &t)
+{
+    switch (t.state) {
+    case FTS_ACTIVE: {
+        const int pct = t.total
+            ? (int)std::min<uint64_t>(100, t.bytes * 100 / t.total) : 0;
+        /* Short form: the status column is only ~80 logical px wide. */
+        return (t.upload ? "发送 " : "接收 ") + std::to_string(pct) + "%";
+    }
+    case FTS_DONE:      return t.upload ? "已发送" : "已接收";
+    case FTS_FAILED:    return "失败";
+    case FTS_CANCELLED: return "已取消";
+    default:            return g_file_queue_paused ? "已暂停" : "等待中";
+    }
+}
+
+/* Called on the GUI thread once per frame. The worker never touches SDL. */
+static void drainFileEvents()
+{
+    FtEvent e;
+    while (ftClientPoll(e)) {
+        if (!g_file_open) continue;
+        switch (e.type) {
+        case FT_EV_STATE:
+            g_file_state = e.state;
+            if (!e.message.empty()) g_file_message = e.message;
+            if (e.state == FT_CLIENT_NEED_PASSWORD) {
+                fileStopEdit(false);
+                offerPendingFilePassword();
+            } else if (g_pw_file_transfer && g_pw_ask.open) {
+                closePasswordAsk(false);
+            }
+            if (e.state == FT_CLIENT_READY) {
+                fileRemoteHome();
+            }
+            if (e.state == FT_CLIENT_DISCONNECTED ||
+                e.state == FT_CLIENT_ERROR) {
+                g_file_queue_paused = true;
+                if (g_file_task_active >= 0 &&
+                    g_file_task_active < (int)g_file_tasks.size()) {
+                    FileTask &t = g_file_tasks[(size_t)g_file_task_active];
+                    t.state = e.status == FT_ERR_CANCELLED ? FTS_CANCELLED
+                                                           : FTS_FAILED;
+                    if (t.detail.empty()) t.detail = e.message;
+                    g_file_refresh_pending = true;
+                }
+                g_file_task_active = -1;
+            }
+            break;
+        case FT_EV_INFO:
+            if (!e.device.empty()) g_file_remote_name = e.device;
+            break;
+        case FT_EV_LIST: {
+            const bool preserve = g_file_refresh_notice;
+            if (e.status == FT_OK) {
+                if (g_file_remote_push_pending && !g_file_remote.path.empty() &&
+                    g_file_remote.path != e.listing.path)
+                    filePushHistory(true, g_file_remote.path);
+                std::string sel_name;
+                if (g_file_remote_sel >= 0 &&
+                    g_file_remote_sel < (int)g_file_remote.entries.size())
+                    sel_name =
+                        g_file_remote.entries[(size_t)g_file_remote_sel].name;
+                g_file_remote = std::move(e.listing);
+                if (preserve) {
+                    g_file_remote_sel = -1;
+                    if (!sel_name.empty()) {
+                        for (int i = 0; i < (int)g_file_remote.entries.size();
+                             ++i) {
+                            if (g_file_remote.entries[(size_t)i].name ==
+                                sel_name) {
+                                g_file_remote_sel = i;
+                                break;
+                            }
+                        }
+                    }
+                    std::set<std::string> keep;
+                    for (const FtEntry &en : g_file_remote.entries)
+                        if (g_file_remote_marks.count(en.name))
+                            keep.insert(en.name);
+                    g_file_remote_marks.swap(keep);
+                    const int max_scroll = std::max(
+                        0,
+                        (int)fileVisibleIndices(true).size() - FILE_VISIBLE);
+                    if (g_file_remote_scroll > max_scroll)
+                        g_file_remote_scroll = max_scroll;
+                    if (g_file_remote_scroll < 0) g_file_remote_scroll = 0;
+                } else {
+                    fileResetPane(true);
+                }
+                g_file_refresh_notice = false;
+                if (!preserve) g_file_message = "目录已更新";
+            } else {
+                g_file_refresh_notice = false;
+                g_file_message = e.message.empty() ? ftStatusText(e.status)
+                                                   : e.message;
+            }
+            g_file_remote_push_pending = false;
+            break;
+        }
+        case FT_EV_PROGRESS:
+            if (g_file_task_active >= 0 &&
+                g_file_task_active < (int)g_file_tasks.size()) {
+                FileTask &t = g_file_tasks[(size_t)g_file_task_active];
+                t.bytes = e.bytes;
+                t.total = e.total;
+            }
+            break;
+        case FT_EV_COMPLETE:
+            if (e.mkdir) {
+                if (e.status == FT_OK) {
+                    g_file_message = "已新建文件夹：" + e.name;
+                    fileRemoteList(g_file_remote.path, true, false);
+                } else if (e.status == FT_ERR_EXISTS) {
+                    g_file_message = "同名文件夹已存在";
+                    fileRemoteList(g_file_remote.path, true, false);
+                } else {
+                    g_file_message = e.message.empty() ? ftStatusText(e.status)
+                                                       : e.message;
+                }
+            } else {
+                fileTaskComplete(e);
+            }
+            break;
+        case FT_EV_NOTICE:
+            if (!e.message.empty()) g_file_message = e.message;
+            break;
+        }
+    }
+}
+
 /* True while the receive service is actually up. Derived exclusively from the
  * state machine — never from a persisted preference (auto_receive is only the
  * next-launch preference; the old allow_receive key is ignored at startup). */
@@ -4014,7 +5553,9 @@ static void launchReceiver()
         (g_cfg.show_status_console ? (unsigned)SPAWN_CONSOLE : 0u);
     if (!spawnChild(g_receiver, path,
                     {"--gui", "--accept-files",
-                     g_cfg.file_drop_accept ? "1" : "0"},
+                     g_cfg.file_drop_accept ? "1" : "0",
+                     "--accept-file-transfer",
+                     g_cfg.file_transfer_accept ? "1" : "0"},
                     flags, /*is_receiver=*/true, epoch)) {
         g_status_note = "启动 receiver 失败";
         {
@@ -4077,6 +5618,8 @@ static bool settingsDirty()
            g_cfg_edit.stitch_side != g_cfg.stitch_side ||
            g_cfg_edit.file_drop_send != g_cfg.file_drop_send ||
            g_cfg_edit.file_drop_accept != g_cfg.file_drop_accept ||
+           g_cfg_edit.file_transfer_accept != g_cfg.file_transfer_accept ||
+           g_cfg_edit.file_transfer_detach != g_cfg.file_transfer_detach ||
            g_cfg_edit.auth_mode != g_cfg.auth_mode ||
            g_cfg_edit.auth_salt != g_cfg.auth_salt ||
            g_cfg_edit.auth_hash != g_cfg.auth_hash ||
@@ -4250,6 +5793,8 @@ static SDL_Color recvStateColor(int st)
 static bool hasActiveSession()
 {
     if (g_sender.active) return true;
+    if (g_file_open && g_file_state != FT_CLIENT_DISCONNECTED &&
+        g_file_state != FT_CLIENT_ERROR) return true;
     const int st = g_recv_state.load();
     return st == RSV_AUTH || st == RSV_STREAMING;
 }
@@ -4291,6 +5836,7 @@ static void hideToTray()
         return;
     SDL_HideWindow(g_win);
     if (g_log_win && g_log_open) SDL_HideWindow(g_log_win);
+    if (g_file_win) SDL_HideWindow(g_file_win);
     g_hidden = true;
     if (!g_cfg.tray_hint_shown) {
         /* One time only; the flag lives in config.ini and changes nothing
@@ -4313,6 +5859,10 @@ static void showFromTray()
     SDL_RestoreWindow(g_win);
     SDL_RaiseWindow(g_win);
     if (g_log_win && g_log_open) SDL_ShowWindow(g_log_win);
+    if (g_file_win) {
+        SDL_ShowWindow(g_file_win);
+        SDL_RestoreWindow(g_file_win);
+    }
 }
 
 /* State summary for the tray tooltip (≤127 chars after conversion). */
@@ -4418,8 +5968,152 @@ static void appendModalButtons()
     }
 }
 
+/* File-page controls. Called by buildButtons() for the embedded page and by
+ * the detached window's own build pass; the caller owns the target list. */
+static void buildFileButtons()
+{
+    const bool detached = g_file_detached;
+    const FileLayout L = fileLayout(fileCanvas(detached));
+    const bool ready = fileRemoteReady();
+    const bool busy = ftClientBusy();
+    const bool active = ftClientActive();
+    const int max_scroll =
+        std::max(0, (int)g_file_tasks.size() - L.task_visible);
+    if (g_file_task_scroll > max_scroll) g_file_task_scroll = max_scroll;
+    if (g_file_task_scroll < 0) g_file_task_scroll = 0;
+
+    addButton(L.detach.x, L.detach.y, L.detach.w, L.detach.h,
+              detached ? "合回" : "分离", BTN_FILE_DETACH, BTN_V_SECONDARY,
+              GLYPH_NONE, g_fontS);
+    if (!detached)
+        addButton(L.backMain.x, L.backMain.y, L.backMain.w, L.backMain.h,
+                  "返回", BTN_FILE_BACK, BTN_V_SECONDARY, GLYPH_NONE, g_fontS);
+
+    addButton(L.send[0].x, L.send[0].y, L.send[0].w, L.send[0].h,
+              "发送 →", BTN_FILE_UPLOAD, BTN_V_PRIMARY, GLYPH_NONE, g_fontS,
+              ready && !busy && fileSideSelectedFiles(false) > 0 &&
+                  !g_file_remote.path.empty());
+    addButton(L.send[1].x, L.send[1].y, L.send[1].w, L.send[1].h,
+              "← 发送", BTN_FILE_DOWNLOAD, BTN_V_PRIMARY, GLYPH_NONE, g_fontS,
+              ready && !busy && fileSideSelectedFiles(true) > 0 &&
+                  !g_file_local.path.empty());
+
+    static const int home_ids[2] = {BTN_FILE_LOCAL_HOME, BTN_FILE_REMOTE_HOME};
+    static const int back_ids[2] = {BTN_FILE_LOCAL_BACK, BTN_FILE_REMOTE_BACK};
+    static const int up_ids[2] = {BTN_FILE_LOCAL_UP, BTN_FILE_REMOTE_UP};
+    static const int refresh_ids[2] = {BTN_FILE_LOCAL_REFRESH,
+                                       BTN_FILE_REMOTE_REFRESH};
+    static const int newdir_ids[2] = {BTN_FILE_LOCAL_NEWDIR,
+                                      BTN_FILE_REMOTE_NEWDIR};
+    static const int hidden_ids[2] = {BTN_FILE_LOCAL_HIDDEN,
+                                      BTN_FILE_REMOTE_HIDDEN};
+    static const int roots_ids[2] = {BTN_FILE_LOCAL_ROOTS,
+                                     BTN_FILE_REMOTE_ROOTS};
+    static const int path_ids[2] = {BTN_FILE_LOCAL_PATH, BTN_FILE_REMOTE_PATH};
+    static const int check_all_ids[2] = {BTN_FILE_LOCAL_CHECKALL,
+                                         BTN_FILE_REMOTE_CHECKALL};
+    static const int row_base[2] = {BTN_FILE_LOCAL_ROW_BASE,
+                                    BTN_FILE_REMOTE_ROW_BASE};
+    static const int check_base[2] = {BTN_FILE_LOCAL_CHECK_BASE,
+                                      BTN_FILE_REMOTE_CHECK_BASE};
+    static const char *tool_label[5] = {"←", "↑", "↻", "＋", "隐"};
+    for (int side = 0; side < 2; ++side) {
+        const bool remote = side != 0;
+        const FtListing &list = fileListing(remote);
+        const std::vector<int> vis = fileVisibleIndices(remote);
+        const bool can_nav = !remote || (ready && !busy);
+        const bool has_hist = !(remote ? g_file_remote_hist
+                                       : g_file_local_hist).empty();
+        for (int i = 0; i < 5; ++i) {
+            const SDL_Rect r = L.toolBtn[side][i];
+            if (i == 4) {
+                addChoice(r.x, r.y, r.w, r.h, tool_label[i], hidden_ids[side],
+                          remote ? g_file_remote_show_hidden
+                                 : g_file_local_show_hidden,
+                          g_fontS);
+                continue;
+            }
+            int id = home_ids[side];
+            bool on = true;
+            switch (i) {
+            case 0: id = back_ids[side]; on = has_hist; break;
+            case 1: id = up_ids[side];   on = !list.path.empty(); break;
+            case 2: id = refresh_ids[side]; break;
+            case 3: id = newdir_ids[side];  on = !list.path.empty(); break;
+            default: break;
+            }
+            addButton(r.x, r.y, r.w, r.h, tool_label[i], id, BTN_V_SECONDARY,
+                      GLYPH_NONE, g_fontS, can_nav && on);
+        }
+        addButton(L.pathBox[side].x, L.pathBox[side].y, L.pathBox[side].w,
+                  L.pathBox[side].h, "", path_ids[side], BTN_V_GHOST,
+                  GLYPH_NONE, nullptr, can_nav);
+        addButton(L.roots[side].x, L.roots[side].y, L.roots[side].w,
+                  L.roots[side].h, "▾", roots_ids[side], BTN_V_SECONDARY,
+                  GLYPH_NONE, g_fontS, can_nav);
+        addButton(L.checkAll[side].x, L.checkAll[side].y, L.checkAll[side].w,
+                  L.checkAll[side].h, "", check_all_ids[side], BTN_V_GHOST,
+                  GLYPH_NONE, nullptr, !vis.empty());
+        for (int slot = 0; slot < FILE_VISIBLE; ++slot) {
+            if (fileEntryAtSlot(remote, slot, fileScroll(remote)) < 0) break;
+            const SDL_Rect cb = L.checks[side][slot];
+            addButton(cb.x, cb.y, cb.w, cb.h, "",
+                      check_base[side] + slot, BTN_V_GHOST);
+            const SDL_Rect row = L.rows[side][slot];
+            addButton(row.x, row.y, row.w, row.h, "",
+                      row_base[side] + slot, BTN_V_GHOST);
+        }
+    }
+
+    bool any_queued = false, any_finished = false;
+    for (const FileTask &t : g_file_tasks) {
+        if (t.state == FTS_QUEUED) any_queued = true;
+        if (t.state == FTS_DONE || t.state == FTS_FAILED ||
+            t.state == FTS_CANCELLED)
+            any_finished = true;
+    }
+    const bool any_active = g_file_task_active >= 0;
+    addButton(L.qa[0].x, L.qa[0].y, L.qa[0].w, L.qa[0].h, "全部暂停",
+              BTN_FILE_PAUSE, BTN_V_SECONDARY, GLYPH_NONE, g_fontS,
+              any_queued && !g_file_queue_paused);
+    addButton(L.qa[1].x, L.qa[1].y, L.qa[1].w, L.qa[1].h, "全部开始",
+              BTN_FILE_RESUME, BTN_V_SECONDARY, GLYPH_NONE, g_fontS,
+              g_file_queue_paused && any_queued);
+    addButton(L.qa[2].x, L.qa[2].y, L.qa[2].w, L.qa[2].h, "全部取消",
+              BTN_FILE_CANCEL_ALL, BTN_V_SECONDARY, GLYPH_NONE, g_fontS,
+              any_queued || any_active);
+    addButton(L.qa[3].x, L.qa[3].y, L.qa[3].w, L.qa[3].h, "清除完结任务",
+              BTN_FILE_CLEAR_DONE, BTN_V_SECONDARY, GLYPH_NONE, g_fontS,
+              any_finished);
+
+    for (int slot = 0; slot < L.task_visible; ++slot) {
+        const int idx = g_file_task_scroll + slot;
+        if (idx < 0 || idx >= (int)g_file_tasks.size()) break;
+        const bool row_active = idx == g_file_task_active;
+        addButton(L.taskLoc[slot].x, L.taskLoc[slot].y, L.taskLoc[slot].w,
+                  L.taskLoc[slot].h, "定位", BTN_FILE_TASK_LOCATE_BASE + slot,
+                  BTN_V_SECONDARY, GLYPH_NONE, g_fontS);
+        addButton(L.taskRem[slot].x, L.taskRem[slot].y, L.taskRem[slot].w,
+                  L.taskRem[slot].h, row_active ? "取消" : "移除",
+                  BTN_FILE_TASK_REMOVE_BASE + slot, BTN_V_SECONDARY,
+                  GLYPH_NONE, g_fontS);
+    }
+
+    const SDL_Rect f = L.cardFooter;
+    if (g_file_state == FT_CLIENT_ERROR ||
+        g_file_state == FT_CLIENT_DISCONNECTED) {
+        addButton(f.x + f.w - 104, f.y + 3, 92, 22, "重新连接",
+                  BTN_FILE_RECONNECT, BTN_V_SECONDARY, GLYPH_NONE, g_fontS);
+    } else if (active) {
+        addButton(f.x + f.w - 104, f.y + 3, 92, 22,
+                  g_file_task_active >= 0 ? "取消当前" : "断开连接",
+                  BTN_FILE_CANCEL, BTN_V_SECONDARY, GLYPH_NONE, g_fontS);
+    }
+}
+
 static void buildButtons()
 {
+    g_btn_target = &g_buttons;
     g_buttons.clear();
     g_modal_button_begin = 0;
 
@@ -4502,7 +6196,15 @@ static void buildButtons()
         for (int i = 0; i < HIST_VISIBLE; i++) {
             const int idx = i + g_hist_scroll;
             if (idx >= (int)g_hist.size()) break;
+            const HistEntry &e = g_hist[idx];
             SDL_Rect row = rcHistRow(i);
+            /* The name-following folder control must precede the row body:
+             * hit testing is first-match-wins and the body covers this area. */
+            std::string shownName;
+            SDL_Rect folder;
+            histNameLayout(e, row, shownName, folder);
+            addButton(folder.x, folder.y, folder.w, folder.h, "",
+                      BTN_HIST_BASE + idx * 10 + 5, BTN_V_GHOST);
             /* body click area stops short of the trailing buttons */
             addButton(row.x, row.y, HIST_BTN_X - 8 - row.x, row.h, "",
                       BTN_HIST_BASE + idx * 10, BTN_V_GHOST);
@@ -4599,6 +6301,11 @@ static void buildButtons()
         break;
     }
 
+    case SCR_FILES: {
+        buildFileButtons();
+        break;
+    }
+
     case SCR_SETTINGS: {
         static const char *kTab[3] = {"常规", "画质与编码", "接收与安全"};
         for (int i = 0; i < 3; i++)
@@ -4647,10 +6354,12 @@ static void buildButtons()
             addButton(SET_RC_X, SET_TOGGLE_Y0, SET_COL_W - SET_PAD * 2, 32, "",
                       BTN_SET_HW, BTN_V_GHOST);
         } else if (g_set_tab == 0) {
-            const int startup[4] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART,
+            const int startup[6] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART,
                                     BTN_SET_FILEDROP_ACCEPT,
-                                    BTN_SET_FILEDROP_SEND};
-            for (int i = 0; i < 4; i++)
+                                    BTN_SET_FILEDROP_SEND,
+                                    BTN_SET_FILEXFER_ACCEPT,
+                                    BTN_SET_FILEXFER_DETACH};
+            for (int i = 0; i < 6; i++)
                 addButton(SET_LC_X, SET_TOGGLE_Y0 + i * 40, SET_LC_W, 32, "",
                           startup[i], BTN_V_GHOST);
             const int diagnostics[3] = {BTN_SET_CONSOLE, BTN_SET_LOGWIN,
@@ -4889,9 +6598,11 @@ static void drawAuthDialogs(SDL_Renderer *ren)
         drawText(ren, g_auth_ask.ip.empty() ? "地址未知" : g_auth_ask.ip, x,
                  AUTH_DLG_Y + 90, THEME.textDim, g_fontS);
         drawText(ren,
-                 g_auth_ask.req == "stitch"
-                     ? "请求：拼接控制（键盘与鼠标）"
-                     : "请求：视频连接（投屏或扩展）",
+                 g_auth_ask.req == "files"
+                     ? "请求：文件传输（浏览、上传和下载）"
+                     : g_auth_ask.req == "stitch"
+                           ? "请求：拼接控制（键盘与鼠标）"
+                           : "请求：视频连接（投屏或扩展）",
                  x, AUTH_DLG_Y + 116, THEME.textDim, g_fontS);
         const long leftMs = (long)g_auth_ask.deadline - (long)SDL_GetTicks();
         const int secs = leftMs > 0 ? (int)(leftMs / 1000) + 1 : 0;
@@ -5014,6 +6725,399 @@ static void drawNav()
     drawHairline(g_ren, NAV_W - 1, HEADER_H, 1, WIN_H - HEADER_H, THEME.border);
 }
 
+/* ── file page drawing ───────────────────────────────────────────────────── */
+static SDL_Color fileStateColor()
+{
+    if (g_file_state == FT_CLIENT_READY) return THEME.success;
+    if (g_file_state == FT_CLIENT_ERROR) return THEME.danger;
+    if (g_file_state == FT_CLIENT_DISCONNECTED) return THEME.textDim;
+    return THEME.primary;
+}
+
+static SDL_Color fileTaskColor(const FileTask &t)
+{
+    switch (t.state) {
+    case FTS_DONE:      return THEME.success;
+    case FTS_FAILED:    return THEME.danger;
+    case FTS_ACTIVE:    return THEME.primary;
+    case FTS_CANCELLED: return THEME.textDim;
+    default:            return g_file_queue_paused ? THEME.warning
+                                                   : THEME.textDim;
+    }
+}
+
+static void fileDrawCheck(SDL_Renderer *ren, const SDL_Rect &r, bool on,
+                          bool hot)
+{
+    drawRoundRect(ren, r, 4, on ? THEME.primary : THEME.surface,
+                  on ? (hot ? THEME.primaryHover : THEME.primary)
+                     : (hot ? THEME.primary : THEME.border));
+    if (on) drawTextIn(ren, "✓", r, THEME.onPrimary, g_fontS, ALIGN_CENTER);
+}
+
+static int fileDrawChip(SDL_Renderer *ren, int x, int y, const char *text,
+                        SDL_Color fill, SDL_Color ink)
+{
+    const SDL_Rect r{x, y, 36, 18};
+    fillRoundRect(ren, r, 9, fill);
+    drawTextIn(ren, text, r, ink, g_fontS, ALIGN_CENTER);
+    return r.w;
+}
+
+struct FileCols {
+    int name_x, name_w, date_x, date_w, type_x, type_w, size_x, size_w;
+};
+static FileCols fileCols(const SDL_Rect &p)
+{
+    FileCols c{};
+    /* Attached panes are ~342 px wide: a full date and 文件夹 would ellipsize
+     * and squeeze the name column, so compact panes use MM/DD HH:MM + 目录. */
+    const bool compact = p.w < 380;
+    /* Measured at 14 px: "MM/DD HH:MM" ~77 px, "YYYY/MM/DD HH:MM" ~115 px;
+     * at a 125% display the font is rasterised at 18 px (105/157 px) while the
+     * layout rounds to uiPx. 88/130 are the smallest widths that still fit at
+     * every quarter-step scale up to 300% (see the review measurements). */
+    const int date_w = compact ? 88 : 130;
+    const int type_w = compact ? 38 : 50;
+    const int size_w = 54, pad = 8;
+    c.name_x = p.x + 44;
+    c.name_w = p.w - 44 - date_w - type_w - size_w - pad;
+    if (c.name_w < 40) c.name_w = 40;
+    c.date_x = c.name_x + c.name_w;
+    c.date_w = date_w;
+    c.type_x = c.date_x + c.date_w;
+    c.type_w = type_w;
+    c.size_x = p.x + p.w - pad - size_w;
+    c.size_w = size_w;
+    return c;
+}
+
+struct FileTaskCols {
+    int name_x, name_w, status_x, status_w, size_x, size_w;
+    int from_x, from_w, to_x, to_w, ops_x, ops_w;
+};
+static FileTaskCols fileTaskCols(const SDL_Rect &cols)
+{
+    FileTaskCols c{};
+    const int w = cols.w;
+    c.name_x = cols.x;
+    c.name_w = w * 22 / 100;
+    c.status_x = c.name_x + c.name_w;
+    c.status_w = w * 14 / 100;
+    c.size_x = c.status_x + c.status_w;
+    c.size_w = w * 9 / 100;
+    c.from_x = c.size_x + c.size_w;
+    c.from_w = w * 20 / 100;
+    c.to_x = c.from_x + c.from_w;
+    c.to_w = w * 20 / 100;
+    c.ops_x = c.to_x + c.to_w;
+    c.ops_w = cols.x + cols.w - c.ops_x;
+    return c;
+}
+
+static void fileDrawToolbar(SDL_Renderer *ren, const FileLayout &L, int side)
+{
+    const SDL_Rect box = L.pathBox[side];
+    const bool editing = g_file_edit_side == side;
+    drawRoundRect(ren, box, THEME.radius - 3,
+                  editing ? THEME.inputBg : THEME.surfaceAlt,
+                  editing ? THEME.primary : THEME.border);
+    const FtListing &list = side == 0 ? g_file_local : g_file_remote;
+    const std::string text =
+        editing ? g_file_edit_text
+                : (list.path.empty() ? (side == 0 ? "此电脑" : "对端位置")
+                                     : list.path);
+    const int maxW = box.w - 12;
+    const int textY = box.y + (box.h - 14) / 2;
+    if (editing) {
+        const std::string shown = tailFitText(text, g_fontS, maxW);
+        int tw = 0, th = 0;
+        TTF_SizeUTF8(g_fontS, shown.c_str(), &tw, &th);
+        if (g_file_edit_select_all && !shown.empty()) {
+            const int w = std::min(maxW, uiCoord(tw));
+            fillRoundRect(ren, SDL_Rect{box.x + 5, box.y + 3, w + 2,
+                                        box.h - 6},
+                          THEME.radius - 4, THEME.primaryTint);
+        }
+        drawText(ren, shown, box.x + 6, textY, THEME.text, g_fontS);
+        if (((SDL_GetTicks() - g_file_edit_blink) / 500) % 2 == 0) {
+            int cx = box.x + 6 + uiCoord(tw) + 1;
+            if (cx > box.x + box.w - 6) cx = box.x + box.w - 6;
+            fillRoundRect(ren, SDL_Rect{cx, box.y + 4, 1, box.h - 8}, 0,
+                          THEME.text);
+        }
+    } else {
+        drawText(ren, fitText(text, g_fontS, maxW), box.x + 6, textY,
+                 list.path.empty() ? THEME.textDim : THEME.text, g_fontS);
+    }
+}
+
+static void fileDrawListing(SDL_Renderer *ren, const FileLayout &L, int side,
+                            int hot, int press)
+{
+    const bool remote = side != 0;
+    const bool compact = L.panes[side].w < 380;
+    const FtListing &list = fileListing(remote);
+    const FileCols c = fileCols(L.panes[side]);
+    const SDL_Rect hdr = L.colHdr[side];
+    const std::vector<int> vis = fileVisibleIndices(remote);
+    const std::set<std::string> &marks = fileMarks(remote);
+    const int scroll = fileScroll(remote);
+
+    bool all = !vis.empty();
+    for (int i : vis) {
+        if (!marks.count(list.entries[(size_t)i].name)) {
+            all = false;
+            break;
+        }
+    }
+    const int check_all_id = remote ? BTN_FILE_REMOTE_CHECKALL
+                                    : BTN_FILE_LOCAL_CHECKALL;
+    fileDrawCheck(ren, L.checkAll[side], all,
+                  hot == check_all_id || press == check_all_id);
+    drawTextV(ren, "名称", c.name_x, hdr.y + hdr.h / 2, THEME.textDim,
+              g_fontS, ALIGN_LEFT);
+    drawTextV(ren, "修改日期", c.date_x, hdr.y + hdr.h / 2, THEME.textDim,
+              g_fontS, ALIGN_LEFT);
+    drawTextV(ren, "类型", c.type_x, hdr.y + hdr.h / 2, THEME.textDim,
+              g_fontS, ALIGN_LEFT);
+    drawTextV(ren, "大小", L.panes[side].x + L.panes[side].w - 8,
+              hdr.y + hdr.h / 2, THEME.textDim, g_fontS, ALIGN_RIGHT);
+
+    for (int slot = 0; slot < FILE_VISIBLE; ++slot) {
+        const int idx = fileEntryAtSlot(remote, slot, scroll);
+        if (idx < 0) break;
+        const FtEntry &e = list.entries[(size_t)idx];
+        const SDL_Rect row = L.rows[side][slot];
+        const int row_id = (remote ? BTN_FILE_REMOTE_ROW_BASE
+                                   : BTN_FILE_LOCAL_ROW_BASE) + slot;
+        const int check_id = (remote ? BTN_FILE_REMOTE_CHECK_BASE
+                                     : BTN_FILE_LOCAL_CHECK_BASE) + slot;
+        if (idx == fileSel(remote))
+            fillRoundRect(ren, row, THEME.radius - 3, THEME.primaryTint);
+        else if (hot == row_id || press == row_id)
+            fillRoundRect(ren, row, THEME.radius - 3,
+                          press == row_id ? THEME.press : THEME.hover);
+        fileDrawCheck(ren, L.checks[side][slot], marks.count(e.name) != 0,
+                      hot == check_id || press == check_id);
+        if (e.directory) {
+            drawGlyph(ren, GLYPH_FOLDER, row.x + 32, row.y + row.h / 2, 14,
+                      THEME.primary);
+        } else {
+            drawRoundRect(ren, SDL_Rect{row.x + 26, row.y + 7, 12, 16}, 2,
+                          THEME.surfaceAlt, THEME.border);
+        }
+        drawText(ren, fitText(e.name, g_fontS, c.name_w - 6), c.name_x,
+                 row.y + 7, THEME.text, g_fontS);
+        drawText(ren,
+                 fitText(fileDateText(e.mtime, compact), g_fontS, c.date_w - 4),
+                 c.date_x, row.y + 7, THEME.textDim, g_fontS);
+        /* If an extension cannot fit, show 文件/目录 instead of an ellipsized
+         * fragment; a clipped 文件夹 must never read as a plain file. */
+        std::string type = fileTypeText(e, compact);
+        if (fitText(type, g_fontS, c.type_w - 4) != type)
+            type = e.directory ? "目录" : "文件";
+        drawText(ren, fitText(type, g_fontS, c.type_w - 4),
+                 c.type_x, row.y + 7, THEME.textDim, g_fontS);
+        drawTextV(ren,
+                  fitText(e.directory ? "—" : fileSizeText(e.size), g_fontS,
+                          c.size_w),
+                  c.size_x + c.size_w, row.y + row.h / 2, THEME.textDim,
+                  g_fontS, ALIGN_RIGHT);
+    }
+    if (vis.empty()) {
+        const char *empty =
+            remote && !fileRemoteReady()
+                ? "连接后浏览对端文件"
+                : ((remote ? g_file_remote_show_hidden
+                           : g_file_local_show_hidden)
+                       ? "此目录为空"
+                       : "此目录没有可见项（隐藏项已隐藏）");
+        drawTextIn(ren, empty,
+                   SDL_Rect{L.panes[side].x + 12, L.panes[side].y + 100,
+                            L.panes[side].w - 24, 40},
+                   THEME.textDim, g_fontS, ALIGN_CENTER);
+    }
+
+    std::string foot;
+    const int total = (int)vis.size();
+    if (total > FILE_VISIBLE) {
+        foot = std::to_string(scroll + 1) + "–" +
+               std::to_string(std::min(total, scroll + FILE_VISIBLE)) + " / " +
+               std::to_string(total) + " · 滚轮翻页";
+    }
+    if (list.truncated)
+        foot += (foot.empty() ? "" : " · ") + std::string("仅显示前 1000 项");
+    if (!(remote ? g_file_remote_show_hidden : g_file_local_show_hidden))
+        foot += (foot.empty() ? "" : " · ") + std::string("隐藏项已隐藏");
+    if (!foot.empty())
+        drawText(ren, fitText(foot, g_fontS, L.foot[side].w),
+                 L.foot[side].x, L.foot[side].y, THEME.textDim, g_fontS);
+}
+
+/* Device names are identity, so drop to the 15 px bold face when the 22 px one
+ * cannot fit the whole hostname. Truncating "DESKTOP-…" hides exactly the part
+ * that identifies the machine. */
+static TTF_Font *fileDeviceFont(const std::string &text, int maxW)
+{
+    int w = 0, h = 0;
+    TTF_SizeUTF8(g_fontB, text.c_str(), &w, &h);
+    return uiCoord(w) <= maxW ? g_fontB : g_fontBS;
+}
+
+static void fileDrawDeviceRow(SDL_Renderer *ren, const FileLayout &L)
+{
+    const int cy = L.dev.y + L.dev.h / 2;
+    const int local_max = L.panes[0].w - 80 - 8 - 36 - 12;
+    const std::string local_raw =
+        g_file_local_name.empty() ? "本机" : g_file_local_name;
+    TTF_Font *local_font = fileDeviceFont(local_raw, local_max);
+    const std::string local = fitText(local_raw, local_font, local_max);
+    int lw = 0, lh = 0;
+    TTF_SizeUTF8(local_font, local.c_str(), &lw, &lh);
+    drawTextV(ren, local, L.dev.x, cy, THEME.text, local_font, ALIGN_LEFT);
+    fileDrawChip(ren, L.dev.x + uiCoord(lw) + 8, L.dev.y + 7, "本机",
+                 THEME.surfaceAlt, THEME.textDim);
+
+    const int selected = fileSelectedCount();
+    const int count_w = selected ? 56 : 0;
+    const int remote_max = std::max(
+        60, L.dev.x + L.dev.w -
+                (L.send[1].x + 80 + 8 + count_w + (count_w ? 8 : 0) + 36 + 8));
+    const std::string remote_raw =
+        g_file_remote_name.empty()
+            ? (g_file_name.empty() ? "对端" : g_file_name)
+            : g_file_remote_name;
+    TTF_Font *remote_font = fileDeviceFont(remote_raw, remote_max);
+    const std::string remote = fitText(remote_raw, remote_font, remote_max);
+    int rw = 0, rh = 0;
+    TTF_SizeUTF8(remote_font, remote.c_str(), &rw, &rh);
+    const int name_x = L.dev.x + L.dev.w - uiCoord(rw);
+    const int chip_x = name_x - 8 - 36;
+    fileDrawChip(ren, chip_x, L.dev.y + 7, "远程", THEME.successTint,
+                 THEME.onSuccessTint);
+    drawTextV(ren, remote, name_x, cy, THEME.text, remote_font, ALIGN_LEFT);
+    if (selected) {
+        const std::string count = "已选 " + std::to_string(selected);
+        drawTextV(ren, count, chip_x - 10, cy, THEME.primary, g_fontS,
+                  ALIGN_RIGHT);
+    }
+}
+
+static void fileDrawTasks(SDL_Renderer *ren, const FileLayout &L, int hot)
+{
+    drawCard(ren, L.card, CARD_R);
+    drawText(ren, "传输列表", L.card.x + 14, L.card.y + 7, THEME.text,
+             g_fontBS);
+    int tw = 0, th = 0;
+    TTF_SizeUTF8(g_fontBS, "传输列表", &tw, &th);
+    drawText(ren, "已传输 " + std::to_string(g_file_done_count) + " 个文件",
+             L.card.x + 14 + uiCoord(tw) + 14, L.card.y + 9, THEME.textDim,
+             g_fontS);
+
+    const FileTaskCols c = fileTaskCols(L.cardCols);
+    const int hy = L.cardCols.y + L.cardCols.h / 2;
+    drawTextV(ren, "名称", c.name_x + 20, hy, THEME.textDim, g_fontS,
+              ALIGN_LEFT);
+    drawTextV(ren, "状态", c.status_x, hy, THEME.textDim, g_fontS, ALIGN_LEFT);
+    drawTextV(ren, "大小", c.size_x + c.size_w - 6, hy, THEME.textDim,
+              g_fontS, ALIGN_RIGHT);
+    drawTextV(ren, "发送路径", c.from_x, hy, THEME.textDim, g_fontS,
+              ALIGN_LEFT);
+    drawTextV(ren, "接收路径", c.to_x, hy, THEME.textDim, g_fontS, ALIGN_LEFT);
+    drawTextV(ren, "操作", c.ops_x, hy, THEME.textDim, g_fontS, ALIGN_LEFT);
+
+    for (int slot = 0; slot < L.task_visible; ++slot) {
+        const int idx = g_file_task_scroll + slot;
+        if (idx < 0 || idx >= (int)g_file_tasks.size()) break;
+        const FileTask &t = g_file_tasks[(size_t)idx];
+        const SDL_Rect row = L.taskRows[slot];
+        if (idx == g_file_task_active)
+            fillRoundRect(ren, row, THEME.radius - 3, THEME.primaryTint);
+        drawRoundRect(ren, SDL_Rect{row.x + 2, row.y + 7, 12, 16}, 2,
+                      THEME.surfaceAlt, THEME.border);
+        drawText(ren, fitText(t.name, g_fontS, c.name_w - 24),
+                 c.name_x + 20, row.y + 7, THEME.text, g_fontS);
+        drawText(ren, fitText(fileTaskStatusText(t), g_fontS, c.status_w - 4),
+                 c.status_x, row.y + 7, fileTaskColor(t), g_fontS);
+        drawTextV(ren, fitText(fileSizeText(t.size), g_fontS, c.size_w - 6),
+                  c.size_x + c.size_w - 6, row.y + row.h / 2, THEME.textDim,
+                  g_fontS, ALIGN_RIGHT);
+        const bool from_remote = !t.upload;
+        const bool to_remote = t.upload;
+        int px = c.from_x;
+        fileDrawChip(ren, px, row.y + 4, from_remote ? "远程" : "本机",
+                     from_remote ? THEME.successTint : THEME.surfaceAlt,
+                     from_remote ? THEME.onSuccessTint : THEME.textDim);
+        px += 36 + 4;
+        drawText(ren,
+                 fitText(t.source_dir.empty() ? "全部位置" : t.source_dir,
+                         g_fontS, c.from_w - 44),
+                 px, row.y + 7, THEME.textDim, g_fontS);
+        px = c.to_x;
+        fileDrawChip(ren, px, row.y + 4, to_remote ? "远程" : "本机",
+                     to_remote ? THEME.successTint : THEME.surfaceAlt,
+                     to_remote ? THEME.onSuccessTint : THEME.textDim);
+        px += 36 + 4;
+        drawText(ren,
+                 fitText(t.dest_dir.empty() ? "全部位置" : t.dest_dir,
+                         g_fontS, c.to_w - 44),
+                 px, row.y + 7, THEME.textDim, g_fontS);
+    }
+
+    const SDL_Rect f = L.cardFooter;
+    const int msgW = f.w - 150;
+    if (g_file_task_active >= 0 &&
+        g_file_task_active < (int)g_file_tasks.size()) {
+        const FileTask &t = g_file_tasks[(size_t)g_file_task_active];
+        const int pct = t.total
+            ? (int)std::min<uint64_t>(100, t.bytes * 100 / t.total) : 0;
+        std::string line = (t.upload ? "发送 " : "接收 ") + t.name + " · " +
+                           std::to_string(pct) + "% · " +
+                           fileSizeText(t.bytes);
+        if (t.total) line += " / " + fileSizeText(t.total);
+        drawText(ren, fitText(line, g_fontS, msgW), f.x + 14, f.y + 3,
+                 THEME.text, g_fontS);
+        const SDL_Rect bar{f.x + 14, f.y + 21, msgW, 3};
+        fillRoundRect(ren, bar, 2, THEME.surfaceAlt);
+        if (pct > 0) {
+            const SDL_Rect fill{bar.x, bar.y, bar.w * pct / 100, bar.h};
+            fillRoundRect(ren, fill, 2, THEME.primary);
+        }
+    } else {
+        const std::string line = g_file_message.empty()
+            ? "选择文件后点顶部的发送按钮"
+            : g_file_message;
+        drawText(ren, fitText(line, g_fontS, msgW), f.x + 14, f.y + 7,
+                 g_file_state == FT_CLIENT_ERROR ? THEME.danger
+                                                 : THEME.textDim,
+                 g_fontS);
+    }
+}
+
+static void drawFilePage(SDL_Renderer *ren, const FileLayout &L, int hot,
+                         int press, bool detached)
+{
+    drawTextV(ren, "文件传输", L.title.x, L.title.y + L.title.h / 2,
+              THEME.text, g_fontB, ALIGN_LEFT);
+    int tw = 0, th = 0;
+    TTF_SizeUTF8(g_fontB, "文件传输", &tw, &th);
+    const int dot_x = L.title.x + uiCoord(tw) + 18;
+    const int cy = L.title.y + L.title.h / 2;
+    setColor(ren, fileStateColor());
+    fillCircle(ren, dot_x, cy, 4);
+    drawTextV(ren, fitText(fileStateText(), g_fontS, detached ? 150 : 220),
+              dot_x + 10, cy, fileStateColor(), g_fontS, ALIGN_LEFT);
+
+    fileDrawDeviceRow(ren, L);
+    for (int side = 0; side < 2; ++side) {
+        drawCard(ren, L.panes[side], CARD_R);
+        fileDrawToolbar(ren, L, side);
+        fileDrawListing(ren, L, side, hot, press);
+    }
+    fileDrawTasks(ren, L, hot);
+}
+
 static void renderScreen(int mousex, int mousey)
 {
     (void)mousex; (void)mousey;
@@ -5126,16 +7230,24 @@ static void renderScreen(int mousex, int mousey)
                     const HistEntry &e = g_hist[idx];
                     const SDL_Rect row = rcHistRow(i);
                     if (g_hot >= BTN_HIST_BASE + idx * 10 &&
-                        g_hot < BTN_HIST_BASE + idx * 10 + 5)
+                        g_hot < BTN_HIST_BASE + idx * 10 + 6)
                         fillRoundRect(g_ren, row, THEME.radius, THEME.hover);
                     if (idx + 1 < (int)g_hist.size())
                         drawHairline(g_ren, row.x, row.y + row.h, row.w, 1,
                                      THEME.border);
 
-                    std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 14);
-                    drawText(g_ren, fitText(nm, g_fontS, HIST_TEXT_W),
-                             row.x + 12, row.y + 5,
+                    std::string nm;
+                    SDL_Rect folder;
+                    histNameLayout(e, row, nm, folder);
+                    drawText(g_ren, nm, row.x + 12, row.y + 5,
                              THEME.text, g_fontS);
+                    const int folderId = BTN_HIST_BASE + idx * 10 + 5;
+                    if (g_hot == folderId || g_press == folderId)
+                        fillRoundRect(g_ren, folder, THEME.radius - 3,
+                                      g_press == folderId ? THEME.press : THEME.hover);
+                    drawGlyph(g_ren, GLYPH_FOLDER, folder.x + folder.w / 2,
+                              folder.y + folder.h / 2, 15,
+                              g_hot == folderId ? THEME.primary : THEME.textDim);
                     std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
                                       sendModeLabel(sendModeFromKey(e.mode)) + " · " +
                                       relTime(e.last_used_unix) + " · " +
@@ -5195,7 +7307,8 @@ static void renderScreen(int mousex, int mousey)
                 svcText("计算", rv.services.gpu) + " · " +
                 svcText("端口", rv.services.ports) + " · " +
                 svcText("拼接", rv.services.kvm) + " · " +
-                svcText("文件投放", rv.services.drop) + " · 发现 UDP 1900";
+                svcText("文件投放", rv.services.drop) + " · " +
+                svcText("文件传输", rv.services.files) + " · 发现 UDP 1900";
             drawText(g_ren, fitText(svcLine, g_fontS, card.w - 40), lx,
                      376, THEME.textDim, g_fontS);
             const std::string issue = recvServicesIssue(rv.services);
@@ -5334,6 +7447,12 @@ static void renderScreen(int mousex, int mousey)
         break;
     }
 
+    case SCR_FILES: {
+        drawFilePage(g_ren, fileLayout(fileCanvas(false)), g_hot, g_press,
+                     false);
+        break;
+    }
+
     case SCR_SETTINGS: {
         drawText(g_ren, "设置", BODY_X, TITLE_Y, THEME.text, g_fontB);
         int noteX = BODY_X + 64;
@@ -5352,17 +7471,22 @@ static void renderScreen(int mousex, int mousey)
                 drawCard(g_ren, card, CARD_R);
                 drawText(g_ren, "启动", SET_LC_X, card.y + 20,
                          THEME.textDim, g_fontBS);
-                static const char *labels[4] = {
+                static const char *labels[6] = {
                     "启动软件时自动开启接收", "开机自启动",
-                    "允许对端发送文件", "拖拽到边缘发送文件"};
-                const bool on[4] = {g_cfg_edit.auto_receive != 0,
+                    "允许对端发送文件", "拖拽到边缘发送文件",
+                    "允许文件传输", "文件传输窗口默认分离"};
+                const bool on[6] = {g_cfg_edit.auto_receive != 0,
                                     g_cfg_edit.auto_start != 0,
                                     g_cfg_edit.file_drop_accept != 0,
-                                    g_cfg_edit.file_drop_send != 0};
-                const int ids[4] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART,
+                                    g_cfg_edit.file_drop_send != 0,
+                                    g_cfg_edit.file_transfer_accept != 0,
+                                    g_cfg_edit.file_transfer_detach != 0};
+                const int ids[6] = {BTN_SET_AUTORECV, BTN_SET_AUTOSTART,
                                     BTN_SET_FILEDROP_ACCEPT,
-                                    BTN_SET_FILEDROP_SEND};
-                for (int i = 0; i < 4; i++) {
+                                    BTN_SET_FILEDROP_SEND,
+                                    BTN_SET_FILEXFER_ACCEPT,
+                                    BTN_SET_FILEXFER_DETACH};
+                for (int i = 0; i < 6; i++) {
                     const int y = SET_TOGGLE_Y0 + i * 40;
                     const SDL_Rect row{SET_LC_X, y, SET_LC_W, 32};
                     if (g_hot == ids[i] || g_press == ids[i])
@@ -5372,15 +7496,15 @@ static void renderScreen(int mousex, int mousey)
                     drawToggle(g_ren, SDL_Rect{row.x + row.w - 44, y + 4, 44, 24}, on[i]);
                 }
                 drawText(g_ren, "自动接收只影响下次启动。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 168, THEME.textDim, g_fontS);
+                         SET_LC_X, SET_TOGGLE_Y0 + 242, THEME.textDim, g_fontS);
                 drawText(g_ren, "开机自启动只负责启动程序。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 192, THEME.textDim, g_fontS);
+                         SET_LC_X, SET_TOGGLE_Y0 + 266, THEME.textDim, g_fontS);
                 drawText(g_ren, "本次接收开关位于「接收与安全」。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 216, THEME.textDim, g_fontS);
-                drawText(g_ren, "文件投放只复制，不移动或删除源文件；",
-                         SET_LC_X, SET_TOGGLE_Y0 + 248, THEME.warning, g_fontS);
-                drawText(g_ren, "两端都需开启，且仅 Windows 拼接会话可用。",
-                         SET_LC_X, SET_TOGGLE_Y0 + 272, THEME.warning, g_fontS);
+                         SET_LC_X, SET_TOGGLE_Y0 + 290, THEME.textDim, g_fontS);
+                drawText(g_ren, "文件投放仅用于拼接；文件传输支持双向复制。",
+                         SET_LC_X, SET_TOGGLE_Y0 + 326, THEME.warning, g_fontS);
+                drawText(g_ren, "文件传输默认关闭，仍需通过连接授权。",
+                         SET_LC_X, SET_TOGGLE_Y0 + 350, THEME.warning, g_fontS);
             }
             {
                 const SDL_Rect card{SET_COL_R, SET_CARD_Y, SET_COL_W, SET_R_H};
@@ -5618,11 +7742,12 @@ static void startInstall()
     }
 }
 
-static void onButton(int id)
+static void onButton(int id, bool file_window = false)
 {
     /* Exactly one modal owns the input — the same one buildButtons() rendered
-     * and renderScreen() painted. A lower dialog stays open but inert. */
-    switch (topModal()) {
+     * and renderScreen() painted. A lower dialog stays open but inert. The
+     * detached file window has no main-window dialogs of its own. */
+    if (!file_window) switch (topModal()) {
     case MODAL_AUTH:
         if (id == BTN_AUTH_ALLOW)      answerAuthAsk(true);
         else if (id == BTN_AUTH_DENY)  answerAuthAsk(false);
@@ -5715,6 +7840,9 @@ static void onButton(int id)
 
     switch (id) {
     case BTN_NAV_HOME:
+        /* A detached page owns its own window; navigating the main window must
+         * not end that session. */
+        if (g_file_open && !g_file_detached) closeFileTransfer();
         if (g_screen == SCR_SETTINGS) requestLeaveSettings(true);
         else                          setScreen(SCR_HOME);
         break;
@@ -5723,6 +7851,7 @@ static void onButton(int id)
         else                          g_screen = resolveHomeScreen();
         break;
     case BTN_NAV_SETTINGS:
+        if (g_file_open && !g_file_detached) closeFileTransfer();
         /* Only re-snapshot when arriving from another screen. openSettings()
          * does g_cfg_edit = g_cfg, so re-clicking the tab that is already open
          * used to throw away every pending edit with no visible cause — the
@@ -5899,6 +8028,16 @@ static void onButton(int id)
     case BTN_SET_FILEDROP_SEND:
         g_cfg_edit.file_drop_send = !g_cfg_edit.file_drop_send;
         g_status_note = "拖拽文件到屏幕边缘即可复制到对端；默认关闭";
+        break;
+    case BTN_SET_FILEXFER_ACCEPT:
+        g_cfg_edit.file_transfer_accept = !g_cfg_edit.file_transfer_accept;
+        g_status_note = "允许已授权设备浏览、上传和下载文件；默认关闭";
+        break;
+    case BTN_SET_FILEXFER_DETACH:
+        g_cfg_edit.file_transfer_detach = !g_cfg_edit.file_transfer_detach;
+        g_status_note = g_cfg_edit.file_transfer_detach
+                            ? "下次打开文件传输页时使用独立窗口"
+                            : "下次打开文件传输页时嵌入主窗口";
         break;
     case BTN_SET_TAB_BASE:
     case BTN_SET_TAB_BASE + 1:
@@ -6115,6 +8254,98 @@ static void onButton(int id)
         g_status_tone = StatusTone::Info;
         break;
 
+    case BTN_FILE_BACK:
+        closeFileTransfer();
+        break;
+    case BTN_FILE_DETACH:
+        fileToggleDetached();
+        break;
+    case BTN_FILE_RECONNECT:
+        reconnectFileTransfer();
+        break;
+    case BTN_FILE_CANCEL:
+        if (g_file_task_active >= 0) {
+            g_file_queue_paused = true;
+            ftClientCancelOperation();
+            g_file_message = "正在取消当前传输…";
+        } else {
+            ftClientCancel();
+            g_file_message = "正在断开文件连接…";
+        }
+        break;
+    case BTN_FILE_PAUSE:
+        filePauseQueue();
+        break;
+    case BTN_FILE_RESUME:
+        fileResumeQueue();
+        break;
+    case BTN_FILE_CANCEL_ALL:
+        fileCancelAll();
+        break;
+    case BTN_FILE_CLEAR_DONE:
+        fileClearFinished();
+        break;
+    case BTN_FILE_LOCAL_HOME:
+        fileLocalHome();
+        break;
+    case BTN_FILE_LOCAL_BACK:
+        fileLocalBack();
+        break;
+    case BTN_FILE_LOCAL_UP:
+        fileLocalUp();
+        break;
+    case BTN_FILE_LOCAL_REFRESH:
+        fileLoadLocal(g_file_local.path, false);
+        break;
+    case BTN_FILE_LOCAL_NEWDIR:
+        fileNewFolder(false);
+        break;
+    case BTN_FILE_LOCAL_HIDDEN:
+        g_file_local_show_hidden = !g_file_local_show_hidden;
+        g_file_local_marks.clear();
+        g_file_local_sel = -1;
+        g_file_local_scroll = 0;
+        break;
+    case BTN_FILE_LOCAL_ROOTS:
+        fileLocalRoots();
+        break;
+    case BTN_FILE_LOCAL_PATH:
+        fileStartEdit(0);
+        break;
+    case BTN_FILE_REMOTE_HOME:
+        fileRemoteHome();
+        break;
+    case BTN_FILE_REMOTE_BACK:
+        fileRemoteBack();
+        break;
+    case BTN_FILE_REMOTE_UP:
+        fileRemoteUp();
+        break;
+    case BTN_FILE_REMOTE_REFRESH:
+        fileRemoteRefresh();
+        break;
+    case BTN_FILE_REMOTE_NEWDIR:
+        fileNewFolder(true);
+        break;
+    case BTN_FILE_REMOTE_HIDDEN:
+        g_file_remote_show_hidden = !g_file_remote_show_hidden;
+        g_file_remote_marks.clear();
+        g_file_remote_sel = -1;
+        g_file_remote_scroll = 0;
+        break;
+    case BTN_FILE_REMOTE_ROOTS:
+        fileRemoteRoots();
+        break;
+    case BTN_FILE_REMOTE_PATH:
+        fileStartEdit(1);
+        break;
+    case BTN_FILE_UPLOAD:
+        fileSendSelection(false);
+        break;
+    case BTN_FILE_DOWNLOAD:
+        fileSendSelection(true);
+        break;
+
     case BTN_HIST_CLEAR:
         historyClear();
         g_hist.clear();
@@ -6122,6 +8353,44 @@ static void onButton(int id)
         break;
 
     default:
+        if (id >= BTN_FILE_LOCAL_ROW_BASE &&
+            id < BTN_FILE_LOCAL_ROW_BASE + FILE_VISIBLE) {
+            fileActivateRow(false, id - BTN_FILE_LOCAL_ROW_BASE);
+            break;
+        }
+        if (id >= BTN_FILE_REMOTE_ROW_BASE &&
+            id < BTN_FILE_REMOTE_ROW_BASE + FILE_VISIBLE) {
+            fileActivateRow(true, id - BTN_FILE_REMOTE_ROW_BASE);
+            break;
+        }
+        if (id >= BTN_FILE_LOCAL_CHECK_BASE &&
+            id < BTN_FILE_LOCAL_CHECK_BASE + FILE_VISIBLE) {
+            fileToggleMark(false, id - BTN_FILE_LOCAL_CHECK_BASE);
+            break;
+        }
+        if (id >= BTN_FILE_REMOTE_CHECK_BASE &&
+            id < BTN_FILE_REMOTE_CHECK_BASE + FILE_VISIBLE) {
+            fileToggleMark(true, id - BTN_FILE_REMOTE_CHECK_BASE);
+            break;
+        }
+        if (id == BTN_FILE_LOCAL_CHECKALL) {
+            fileToggleMarkAll(false);
+            break;
+        }
+        if (id == BTN_FILE_REMOTE_CHECKALL) {
+            fileToggleMarkAll(true);
+            break;
+        }
+        if (id >= BTN_FILE_TASK_LOCATE_BASE &&
+            id < BTN_FILE_TASK_LOCATE_BASE + FILE_TASK_VISIBLE_MAX) {
+            fileLocateTask(id - BTN_FILE_TASK_LOCATE_BASE);
+            break;
+        }
+        if (id >= BTN_FILE_TASK_REMOVE_BASE &&
+            id < BTN_FILE_TASK_REMOVE_BASE + FILE_TASK_VISIBLE_MAX) {
+            fileRemoveTask(id - BTN_FILE_TASK_REMOVE_BASE);
+            break;
+        }
         /* device rows: BTN_DEV_BASE + idx*10 + 1(投屏) / +2(扩展) / +3(拼接) */
         if (id >= BTN_DEV_BASE && id < BTN_HIST_BASE) {
             int rel = id - BTN_DEV_BASE;
@@ -6137,7 +8406,7 @@ static void onButton(int id)
                               kind - 1, devs[idx].name);
             break;
         }
-        /* history rows: BTN_HIST_BASE + idx*10 + 0(row) / 1 / 2 / 3 / 4(删除) */
+        /* history rows: +0(row) / +1 投屏 / +2 扩展 / +3 拼接 / +4 删除 / +5 文件 */
         if (id >= BTN_HIST_BASE && id < BTN_HIST_CLEAR) {
             int rel = id - BTN_HIST_BASE;
             int idx = rel / 10;
@@ -6152,6 +8421,8 @@ static void onButton(int id)
                     const int maxScroll =
                         std::max(0, (int)g_hist.size() - HIST_VISIBLE);
                     if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
+                } else if (kind == 5) {
+                    openFileTransfer(e.ip, e.name);
                 } else if (kind >= 1 && kind <= 3) {
                     startSendMode(e.ip, e.port, kind - 1, e.name);
                 } else {
@@ -6173,6 +8444,9 @@ int main(int argc, char *argv[])
         std::cerr << "SDL_Init: " << SDL_GetError() << "\n";
         return 1;
     }
+    /* Auxiliary windows (log, detached file page) may be the last one closed
+     * while the main window is hidden to the tray; that must not quit. */
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     if (TTF_Init() < 0) {
         std::cerr << "TTF_Init: " << TTF_GetError() << "\n";
         SDL_Quit();
@@ -6324,10 +8598,38 @@ int main(int argc, char *argv[])
                      ev.window.event == SDL_WINDOWEVENT_CLOSE) {
                 if (g_log_win && ev.window.windowID == SDL_GetWindowID(g_log_win))
                     closeLogWindow();
+                else if (g_file_win &&
+                         ev.window.windowID == SDL_GetWindowID(g_file_win))
+                    closeFileTransfer();
                 else if (g_tray_ok)
                     hideToTray();
                 else
                     running = false;
+            }
+            else if (ev.type == SDL_WINDOWEVENT &&
+                     ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                if (g_file_win &&
+                    ev.window.windowID == SDL_GetWindowID(g_file_win)) {
+                    /* A path edit belongs to whichever window had focus; do
+                     * not leave SDL text input enabled for a hidden field. */
+                    if (g_file_edit_side >= 0) fileStopEdit(false);
+                    g_file_press = BTN_NONE;
+                } else if (ev.window.windowID == SDL_GetWindowID(g_win)) {
+                    g_press = BTN_NONE;
+                }
+            }
+            else if (ev.type == SDL_WINDOWEVENT &&
+                     ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                /* SDL text input is application-global; another owner may have
+                 * turned it off while this window was inactive. */
+                if (g_file_win &&
+                    ev.window.windowID == SDL_GetWindowID(g_file_win)) {
+                    if (g_file_edit_side >= 0) SDL_StartTextInput();
+                } else if (ev.window.windowID == SDL_GetWindowID(g_win)) {
+                    if (g_screen == SCR_MANUAL_IP || g_pw_ask.open ||
+                        g_set_pw.open)
+                        SDL_StartTextInput();
+                }
             }
             else if (ev.type == SDL_MOUSEWHEEL) {
                 if (g_log_win && ev.wheel.windowID == SDL_GetWindowID(g_log_win)) {
@@ -6335,6 +8637,22 @@ int main(int argc, char *argv[])
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dir = -dir;
                     g_log_scroll -= dir * 3;
                     if (g_log_scroll < 0) g_log_scroll = 0;
+                } else if (g_file_win &&
+                           ev.wheel.windowID == SDL_GetWindowID(g_file_win)) {
+                    if (topModal() != MODAL_NONE) continue;
+                    int dir = ev.wheel.y;
+                    if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dir = -dir;
+                    /* SDL_MouseWheelEvent.mouseX/Y only exists since 2.0.18;
+                     * the focused window's mouse state is portable. */
+                    int fmx = 0, fmy = 0;
+                    SDL_GetMouseState(&fmx, &fmy);
+                    fileScrollWheel(dir, uiCoord(fmx), uiCoord(fmy), true);
+                } else if (g_screen == SCR_FILES && topModal() == MODAL_NONE) {
+                    int dir = ev.wheel.y;
+                    if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dir = -dir;
+                    int mx = 0, my = 0;
+                    SDL_GetMouseState(&mx, &my);
+                    fileScrollWheel(dir, uiCoord(mx), uiCoord(my), false);
                 } else if (g_screen == SCR_HOME && !g_hist.empty()) {
                     int dir = ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dir = -dir;
@@ -6348,9 +8666,37 @@ int main(int argc, char *argv[])
                      ev.button.button == SDL_BUTTON_LEFT) {
                 if (g_log_win && ev.button.windowID == SDL_GetWindowID(g_log_win)) {
                     handleLogClick(uiCoord(ev.button.x), uiCoord(ev.button.y));
+                } else if (g_file_win &&
+                           ev.button.windowID == SDL_GetWindowID(g_file_win)) {
+                    if (topModal() != MODAL_NONE) {
+                        /* The main window owns the modal; keep focus there. */
+                        SDL_RestoreWindow(g_win);
+                        SDL_RaiseWindow(g_win);
+                        SDL_SetWindowInputFocus(g_win);
+                        continue;
+                    }
+                    g_file_press = BTN_NONE;
+                    SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
+                    if (g_file_edit_side >= 0) {
+                        const FileLayout L = fileLayout(fileCanvas(true));
+                        if (!SDL_PointInRect(&p, &L.pathBox[g_file_edit_side]))
+                            fileStopEdit(false);
+                    }
+                    for (const Button &b : g_file_buttons) {
+                        if (!b.enabled) continue;
+                        if (SDL_PointInRect(&p, &b.rect)) {
+                            g_file_press = b.id;
+                            break;
+                        }
+                    }
                 } else if (ev.button.windowID == SDL_GetWindowID(g_win)) {
                     g_press = BTN_NONE;
                     SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
+                    if (g_screen == SCR_FILES && g_file_edit_side >= 0) {
+                        const FileLayout L = fileLayout(fileCanvas(false));
+                        if (!SDL_PointInRect(&p, &L.pathBox[g_file_edit_side]))
+                            fileStopEdit(false);
+                    }
                     const bool modal = (topModal() != MODAL_NONE);
                     for (size_t i = 0; i < g_buttons.size(); i++) {
                         const Button &b = g_buttons[i];
@@ -6361,7 +8707,24 @@ int main(int argc, char *argv[])
             }
             else if (ev.type == SDL_MOUSEBUTTONUP &&
                      ev.button.button == SDL_BUTTON_LEFT) {
-                if (ev.button.windowID == SDL_GetWindowID(g_win)) {
+                if (g_file_win &&
+                    ev.button.windowID == SDL_GetWindowID(g_file_win)) {
+                    if (topModal() != MODAL_NONE) {
+                        g_file_press = BTN_NONE;
+                        continue;
+                    }
+                    SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
+                    int hit = BTN_NONE;
+                    for (const Button &b : g_file_buttons) {
+                        if (!b.enabled) continue;
+                        if (SDL_PointInRect(&p, &b.rect)) { hit = b.id; break; }
+                    }
+                    g_mouse_clicks = ev.button.clicks;
+                    if (g_file_press != BTN_NONE && hit == g_file_press)
+                        onButton(g_file_press, true);
+                    g_mouse_clicks = 0;
+                    g_file_press = BTN_NONE;
+                } else if (ev.button.windowID == SDL_GetWindowID(g_win)) {
                     SDL_Point p{uiCoord(ev.button.x), uiCoord(ev.button.y)};
                     int hit = BTN_NONE;
                     const bool modal = (topModal() != MODAL_NONE);
@@ -6370,11 +8733,24 @@ int main(int argc, char *argv[])
                         if (!b.enabled || (modal && i < g_modal_button_begin)) continue;
                         if (SDL_PointInRect(&p, &b.rect)) { hit = b.id; break; }
                     }
+                    g_mouse_clicks = ev.button.clicks;
                     if (g_press != BTN_NONE && hit == g_press) onButton(g_press);
+                    g_mouse_clicks = 0;
                     g_press = BTN_NONE;
                 }
             }
             else if (ev.type == SDL_TEXTINPUT) {
+                if (g_file_win &&
+                    ev.text.windowID == SDL_GetWindowID(g_file_win)) {
+                    if (topModal() != MODAL_NONE) {
+                        SDL_RestoreWindow(g_win);
+                        SDL_RaiseWindow(g_win);
+                        SDL_SetWindowInputFocus(g_win);
+                        continue;
+                    }
+                    if (g_file_edit_side >= 0) fileEditAppend(ev.text.text);
+                    continue;
+                }
                 /* Text goes to the TOP modal only; a lower dialog keeps its
                  * contents but does not receive keystrokes. */
                 if (topModal() == MODAL_SETPW) {
@@ -6382,6 +8758,9 @@ int main(int argc, char *argv[])
                 } else if (topModal() == MODAL_PW) {
                     appendPasswordInput(g_pw_ask.text, ev.text.text,
                                         g_pw_ask.error);
+                } else if (topModal() == MODAL_NONE &&
+                           g_screen == SCR_FILES && g_file_edit_side >= 0) {
+                    fileEditAppend(ev.text.text);
                 } else if (topModal() == MODAL_NONE &&
                            g_screen == SCR_MANUAL_IP) {
                     g_manual_field_error = false;
@@ -6395,6 +8774,60 @@ int main(int argc, char *argv[])
             }
             else if (ev.type == SDL_KEYDOWN) {
                 const Modal modal = topModal();
+                if (g_file_win &&
+                    ev.key.windowID == SDL_GetWindowID(g_file_win)) {
+                    if (topModal() != MODAL_NONE) {
+                        SDL_RestoreWindow(g_win);
+                        SDL_RaiseWindow(g_win);
+                        SDL_SetWindowInputFocus(g_win);
+                        continue;
+                    }
+                    const SDL_Keycode sym = ev.key.keysym.sym;
+                    const bool ctrl = (ev.key.keysym.mod & KMOD_CTRL) != 0;
+                    if (g_file_edit_side >= 0) {
+                        if (sym == SDLK_ESCAPE) {
+                            fileStopEdit(false);
+                        } else if (sym == SDLK_RETURN ||
+                                   sym == SDLK_KP_ENTER) {
+                            fileStopEdit(true);
+                        } else if (sym == SDLK_BACKSPACE) {
+                            fileEditBackspace();
+                        } else if (ctrl && sym == SDLK_a) {
+                            g_file_edit_select_all = true;
+                        } else if (ctrl && sym == SDLK_v) {
+                            char *clip = SDL_GetClipboardText();
+                            if (clip) {
+                                fileEditAppend(clip);
+                                SDL_free(clip);
+                            }
+                        }
+                    } else if (sym == SDLK_ESCAPE) {
+                        closeFileTransfer();
+                    }
+                    continue;
+                }
+                if (g_screen == SCR_FILES && g_file_edit_side >= 0 &&
+                    modal == MODAL_NONE) {
+                    const SDL_Keycode sym = ev.key.keysym.sym;
+                    const bool ctrl = (ev.key.keysym.mod & KMOD_CTRL) != 0;
+                    if (sym == SDLK_ESCAPE) {
+                        fileStopEdit(false);
+                    } else if (sym == SDLK_RETURN ||
+                               sym == SDLK_KP_ENTER) {
+                        fileStopEdit(true);
+                    } else if (sym == SDLK_BACKSPACE) {
+                        fileEditBackspace();
+                    } else if (ctrl && sym == SDLK_a) {
+                        g_file_edit_select_all = true;
+                    } else if (ctrl && sym == SDLK_v) {
+                        char *clip = SDL_GetClipboardText();
+                        if (clip) {
+                            fileEditAppend(clip);
+                            SDL_free(clip);
+                        }
+                    }
+                    continue;
+                }
                 if (modal == MODAL_SETPW) {
                     if (ev.key.keysym.sym == SDLK_ESCAPE) {
                         closeSetPwAsk();
@@ -6460,6 +8893,9 @@ int main(int argc, char *argv[])
                         setScreen(SCR_HOME);
                     } else if (g_screen == SCR_SETTINGS) {
                         requestLeaveSettings(false);
+                    } else if (g_screen == SCR_FILES) {
+                        closeFileTransfer();
+                        setScreen(SCR_HOME);
                     } else if (g_screen != SCR_HOME) {
                         /* Session screens return to Home without stopping the
                          * child; stopping stays an explicit button action. */
@@ -6481,6 +8917,8 @@ int main(int argc, char *argv[])
 
         processSearchUpdates();
         drainChildStats();          /* STAT lines from the reader threads */
+        drainFileEvents();          /* structured file-client worker events */
+        filePump();                 /* start the next queued transfer when idle */
         tickAuthDialogs();
         tickRecvState();            /* STARTING must not last forever */
 
@@ -6495,7 +8933,7 @@ int main(int argc, char *argv[])
                          * go; a live session is the one thing that defers it */
                         if (g_upd_auto_install) {
                             g_upd_auto_install = false;
-                            if (g_sender.active || g_receiver.active)
+                            if (g_sender.active || g_receiver.active || g_file_open)
                                 logPush("[gui] 会话进行中：更新已就绪，结束会话后点右上角安装");
                             else
                                 startInstall();
@@ -6546,6 +8984,10 @@ int main(int argc, char *argv[])
             if (g_sender_stop_requested) err.clear();
             g_send_phase = err.empty() ? SP_IDLE : SP_FAILED;
             g_auth_wait_note.clear();
+            g_pw_sender_pending = false;
+            g_pw_sender_error.clear();
+            if (g_pw_ask.open && !g_pw_file_transfer)
+                closePasswordAsk(false);
             if (!err.empty()) {
                 g_status_note = (g_screen == SCR_STREAMING)
                                     ? senderErrorText(err)
@@ -6613,6 +9055,13 @@ int main(int argc, char *argv[])
          * what the user aimed at), but a hover computed from it would be a frame
          * stale whenever the screen changed inside the loop. */
         buildButtons();
+        if (g_file_detached) {
+            g_file_buttons.clear();
+            std::vector<Button> *saved_target = g_btn_target;
+            g_btn_target = &g_file_buttons;
+            buildFileButtons();
+            g_btn_target = saved_target;
+        }
         int mx = -1, my = -1;
         if (SDL_GetMouseFocus() == g_win) {
             SDL_GetMouseState(&mx, &my);
@@ -6630,11 +9079,28 @@ int main(int argc, char *argv[])
                 break;
             }
         }
+        g_file_hot = BTN_NONE;
+        if (g_file_detached && g_file_win &&
+            SDL_GetMouseFocus() == g_file_win) {
+            int fmx = 0, fmy = 0;
+            SDL_GetMouseState(&fmx, &fmy);
+            fmx = uiCoord(fmx);
+            fmy = uiCoord(fmy);
+            for (const Button &b : g_file_buttons) {
+                if (!b.enabled) continue;
+                if (fmx >= b.rect.x && fmx < b.rect.x + b.rect.w &&
+                    fmy >= b.rect.y && fmy < b.rect.y + b.rect.h) {
+                    g_file_hot = b.id;
+                    break;
+                }
+            }
+        }
         /* Re-resolve "follow system" before painting; the call rate-limits
          * itself, and it is a no-op unless the mode is System. */
         themeTick(SDL_GetTicks());
         renderScreen(mx, my);
         if (g_log_open) renderLogWindow();
+        renderFileWindow();
     }
 
     if (g_search_thread.joinable()) {
@@ -6643,6 +9109,7 @@ int main(int argc, char *argv[])
         g_search_thread.join();
     }
     updateJoin();               /* abort + join any in-flight check/download */
+    closeFileTransfer();        /* close 8086, release password wait, join worker */
     stopChild(g_sender, g_child_extend);
     stopChild(g_receiver);
     trayShutdown();             /* remove the icon before the window goes away */

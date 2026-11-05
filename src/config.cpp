@@ -173,6 +173,10 @@ void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
         cfg.file_drop_send = (val == "1") ? 1 : 0;
     } else if (key == "file_drop_accept") {
         cfg.file_drop_accept = (val == "1") ? 1 : 0;
+    } else if (key == "file_transfer_accept") {
+        cfg.file_transfer_accept = (val == "1") ? 1 : 0;
+    } else if (key == "file_transfer_detach") {
+        cfg.file_transfer_detach = (val == "1") ? 1 : 0;
     } else if (key == "auth_mode") {
         /* An unknown/corrupt value falls back to manual (fail closed); it can
          * never become "open" by accident. */
@@ -293,6 +297,8 @@ bool configSave(const AppConfig &cfg)
     fprintf(f, "stitch_side=%s\n", cfg.stitch_side.c_str());
     fprintf(f, "file_drop_send=%d\n", cfg.file_drop_send ? 1 : 0);
     fprintf(f, "file_drop_accept=%d\n", cfg.file_drop_accept ? 1 : 0);
+    fprintf(f, "file_transfer_accept=%d\n", cfg.file_transfer_accept ? 1 : 0);
+    fprintf(f, "file_transfer_detach=%d\n", cfg.file_transfer_detach ? 1 : 0);
     /* ── 接收与安全 ────────────────────────────────────────────────────────
      * Only the policy spelling and the KDF record are written; the password
      * itself is never persisted (see auth.h). */

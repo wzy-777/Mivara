@@ -69,8 +69,13 @@ ifeq ($(UNAME_S),Linux)
         SDL_LIBS   := -lSDL2 -lSDL2_ttf
     endif
 
-    CXXFLAGS += -D_REENTRANT
+    CXXFLAGS += -D_REENTRANT -D_FILE_OFFSET_BITS=64
     NET_LIBS := -lpthread
+    # GCC 6/7/8 keep std::filesystem in a separate library.
+    GCC_MAJOR := $(shell $(CXX) -dumpversion | cut -d. -f1)
+    ifneq ($(filter 6 7 8,$(GCC_MAJOR)),)
+        NET_LIBS += -lstdc++fs
+    endif
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lX11
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
@@ -89,6 +94,7 @@ ifeq ($(UNAME_S),Darwin)
     SDL_CFLAGS := -I$(BREW_PREFIX)/include/SDL2
     SDL_LIBS   := -L$(BREW_PREFIX)/lib -lSDL2 -lSDL2_ttf
 
+    CXXFLAGS += -D_FILE_OFFSET_BITS=64
     NET_LIBS := -lpthread
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -framework CoreGraphics -framework CoreFoundation
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
@@ -188,6 +194,7 @@ OBJ_AUTH     := $(BUILDDIR)/auth.o
 OBJ_TRAY     := $(BUILDDIR)/tray.o
 OBJ_DROP     := $(BUILDDIR)/drop.o
 OBJ_DROPSHELL := $(BUILDDIR)/dropshell.o
+OBJ_FILEXFER := $(BUILDDIR)/filexfer.o
 OBJ_STITCHCAP := $(BUILDDIR)/stitchcap.o
 
 # ============================================================================
@@ -247,9 +254,10 @@ $(OBJ_AUTH): $(SRCDIR)/auth.h
 $(OBJ_TRAY): $(SRCDIR)/tray.h
 $(OBJ_DROP): $(SRCDIR)/drop.h $(SRCDIR)/auth.h $(SRCDIR)/dropshell.h
 $(OBJ_DROPSHELL): $(SRCDIR)/drop.h $(SRCDIR)/dropshell.h
+$(OBJ_FILEXFER): $(SRCDIR)/filexfer.h $(SRCDIR)/auth.h $(SRCDIR)/proto.h
 $(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
-$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h $(SRCDIR)/logo_icon.h
+$(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/filexfer.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/filexfer.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h $(SRCDIR)/logo_icon.h
 
 # ============================================================================
 # TARGET LINKING
@@ -259,7 +267,7 @@ $(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) 
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
-$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_CONFIG) | $(BINDIR)
+$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_FILEXFER) $(OBJ_CONFIG) | $(BINDIR)
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
@@ -271,7 +279,7 @@ $(STITCHCAP_BIN): $(OBJ_STITCHCAP) | $(BINDIR)
 	@echo "Built $(STITCHCAP_BIN)"
 endif
 
-$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(OBJ_AUTH) $(OBJ_TRAY) $(RES_ADMIN) | $(BINDIR)
+$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(OBJ_AUTH) $(OBJ_TRAY) $(OBJ_FILEXFER) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
 	@echo "Built $(APP_BIN)"
 
@@ -349,7 +357,7 @@ check:
                gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
                kvm.cpp kvm.h \
-               drop.cpp drop.h dropshell.cpp dropshell.h stitchcap.cpp \
+               drop.cpp drop.h dropshell.cpp dropshell.h stitchcap.cpp filexfer.cpp filexfer.h \
                config.cpp config.h history.cpp history.h \
 	               update.cpp update.h version.h theme.cpp theme.h \
                auth.cpp auth.h tray.cpp tray.h logo_icon.h; do \

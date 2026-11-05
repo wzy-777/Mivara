@@ -59,6 +59,7 @@
 #include "config.h"
 #include "discover.h"
 #include "drop.h"
+#include "filexfer.h"
 #include "gpu_accelerate.h"
 #include "kvm.h"
 #include "ports.h"
@@ -397,6 +398,7 @@ struct RxPolicy
     uint32_t iter = 0;
     bool     record_ok = false;   /* password mode: record present + valid */
     bool     accept_files = false;/* stitch: offer the 8085 file-drop channel */
+    bool     accept_file_transfer = false; /* 8086: browse/upload/download */
     std::string why;              /* diagnostic when !record_ok */
 };
 
@@ -406,7 +408,10 @@ static bool kvmPolicyHook(MivaraAuthMode *mode, uint8_t salt[16],
                           bool *record_ok, void *ctx);
 static KvmApprovalResult kvmApproveHook(const char *ip, const char *device,
                                         intptr_t client, void *ctx);
+static FtApprovalResult ftApproveHook(const char *ip, const char *device,
+                                      intptr_t client, void *ctx);
 static KvmTargetAuth g_kvm_auth = {kvmPolicyHook, kvmApproveHook, 0, nullptr};
+static FtTargetAuth g_ft_auth = {kvmPolicyHook, ftApproveHook, 0, nullptr};
 
 static std::mutex g_policy_mtx;
 static RxPolicy g_policy;
@@ -475,7 +480,7 @@ struct Approval
     uint32_t id = 0;
     std::string ip;
     std::string device;
-    std::string purpose;       /* "video" (8081) | "stitch" (8084) */
+    std::string purpose;       /* "video" (8081) | "stitch" (8084) | "files" (8086) */
     int waiters = 1;
     /* 0 open, 1 allow, -1 deny, -2 timeout, -3 receiver shutting down,
      * -4 peer hung up / sent before approval. */
@@ -492,8 +497,8 @@ static std::vector<std::unique_ptr<Approval>> g_apprs;
 static std::atomic<uint32_t> g_next_appr_id{1};
 
 /* Password failures are counted by the process-wide throttle in auth.cpp: the
- * 8081 and 8084 handshakes share one connection password, so alternating ports
- * must not grant two independent budgets (issue 14). */
+ * 8081, 8084 and 8086 handshakes share one connection password, so alternating
+ * ports must not grant independent budgets (issue 14). */
 
 /* GUI mode: stdout/stdin are pipes owned by the launcher (app). */
 static bool g_gui_mode = false;
@@ -593,6 +598,7 @@ static RxPolicy loadPolicyFromConfig()
     p.mode = mode;
     p.iter = (uint32_t)cfg.auth_iter;
     p.accept_files = cfg.file_drop_accept != 0;
+    p.accept_file_transfer = cfg.file_transfer_accept != 0;
 
     if (mode == MIVARA_AUTH_PASSWORD) {
         uint8_t salt[16] = {}, hash[32] = {};
@@ -632,6 +638,8 @@ static void applyPolicy(const RxPolicy &p, bool announce_error = true)
     }
     g_kvm_auth.accept_files.store(p.accept_files ? 1 : 0,
                                   std::memory_order_relaxed);
+    g_ft_auth.enabled.store(p.accept_file_transfer ? 1 : 0,
+                            std::memory_order_relaxed);
     emitRxStat("policy", std::string("mode=") + policyKey(p) +
                              (p.mode == MIVARA_AUTH_PASSWORD
                                   ? (p.record_ok ? "|record=ok" : "|record=bad")
@@ -695,6 +703,7 @@ static ApprovalResult nativeManualPrompt(const std::string &ip,
                                          const char *purpose = "video")
 {
     const bool stitch = purpose && std::strcmp(purpose, "stitch") == 0;
+    const bool files = purpose && std::strcmp(purpose, "files") == 0;
     if (g_native_prompt_open.exchange(true)) return APPROVAL_BUSY;
     struct PromptGuard {
         ~PromptGuard() { g_native_prompt_open = false; }
@@ -715,8 +724,9 @@ static ApprovalResult nativeManualPrompt(const std::string &ip,
     std::wstring wdev(device.begin(), device.end());
     std::wstring wip(ip.begin(), ip.end());
     std::wstring msg = L"设备「" + wdev + L"」(" + wip + L") 请求" +
-                       (stitch ? L"拼接控制（键盘与鼠标）"
-                               : L"投屏 / 扩展连接") +
+                       (files ? L"文件传输（浏览、上传和下载文件）"
+                              : stitch ? L"拼接控制（键盘与鼠标）"
+                                       : L"投屏 / 扩展连接") +
                        L"到此电脑。\n\n"
                        L"仅在你信任这台设备时选择「是」。30 秒内未选择将自动拒绝。";
     const DWORD owner_tid = GetCurrentThreadId();
@@ -786,7 +796,8 @@ static ApprovalResult nativeManualPrompt(const std::string &ip,
     std::fprintf(stderr,
                  "\nMivara: 设备「%s」(%s) 请求%s。允许? [y/N] (30 秒后自动拒绝) ",
                  device.c_str(), ip.c_str(),
-                 stitch ? "拼接控制（键盘与鼠标）" : "投屏 / 扩展连接");
+                 files ? "文件传输（浏览、上传和下载文件）"
+                       : stitch ? "拼接控制（键盘与鼠标）" : "投屏 / 扩展连接");
     std::fflush(stderr);
 
     fd_set rd;
@@ -1064,6 +1075,30 @@ static KvmApprovalResult kvmApproveHook(const char *ip, const char *device,
     case APPROVAL_CANCELLED: return KVM_APPROVAL_CANCELLED;
     case APPROVAL_BUSY:      return KVM_APPROVAL_BUSY;
     default:                 return KVM_APPROVAL_FAILED;
+    }
+}
+
+/* 8086 uses the same policy and serialized approval queue, but identifies the
+ * request as file access so the consent text never disguises it as video/KVM. */
+static FtApprovalResult ftApproveHook(const char *ip, const char *device,
+                                      intptr_t client, void *ctx)
+{
+    (void)ctx;
+    const std::string peer_ip = ip ? ip : "";
+    const std::string peer_dev =
+        (device && *device) ? std::string(device) : peer_ip;
+    const ApprovalResult ar =
+        g_gui_mode ? waitManualApproval(peer_ip, peer_dev,
+                                        (plat_sock_t)client, "files")
+                   : nativeManualPrompt(peer_ip, peer_dev,
+                                        (plat_sock_t)client, "files");
+    switch (ar) {
+    case APPROVAL_ALLOW:     return FT_APPROVAL_ALLOW;
+    case APPROVAL_DENY:      return FT_APPROVAL_DENY;
+    case APPROVAL_TIMEOUT:   return FT_APPROVAL_TIMEOUT;
+    case APPROVAL_CANCELLED: return FT_APPROVAL_CANCELLED;
+    case APPROVAL_BUSY:      return FT_APPROVAL_BUSY;
+    default:                 return FT_APPROVAL_FAILED;
     }
 }
 
@@ -2435,15 +2470,22 @@ int main(int argc, char* argv[])
     sa.sa_handler = sigHandler;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    /* Darwin has no MSG_NOSIGNAL; a peer that disconnects mid-send must not
+     * terminate a standalone receiver. */
+    signal(SIGPIPE, SIG_IGN);
 #endif
 
     int cli_accept_files = -1;
+    int cli_accept_file_transfer = -1;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--gui") == 0)
             g_gui_mode = true;
         else if (std::strcmp(argv[i], "--accept-files") == 0 &&
                  i + 1 < argc)
             cli_accept_files = (std::atoi(argv[++i]) != 0) ? 1 : 0;
+        else if (std::strcmp(argv[i], "--accept-file-transfer") == 0 &&
+                 i + 1 < argc)
+            cli_accept_file_transfer = (std::atoi(argv[++i]) != 0) ? 1 : 0;
     }
 
     queryMyDisplaySize();
@@ -2458,6 +2500,7 @@ int main(int argc, char* argv[])
               << "  Compute TCP: " << GPU_ACCEL_PORT << "\n"
               << "  Ports TCP  : " << PORTS_SERVICE_PORT << "\n"
               << "  Stitch TCP : " << KVM_PORT << "\n"
+              << "  Files TCP  : " << FILEXFER_PORT << "\n"
               << "  SSDP UDP   : " << SSDP_ADDR << ":" << SSDP_PORT << "\n"
               << "  GPU Stats  : " << GPU_STATS_FILE << "\n"
               << "  Modes      : extend | mirror | stitch (TCP " << KVM_PORT << ")\n"
@@ -2469,7 +2512,11 @@ int main(int argc, char* argv[])
     if (cli_accept_files >= 0)
         g_kvm_auth.accept_files.store(cli_accept_files,
                                       std::memory_order_relaxed);
+    if (cli_accept_file_transfer >= 0)
+        g_ft_auth.enabled.store(cli_accept_file_transfer,
+                                std::memory_order_relaxed);
     dropSetStatSink(dropStatSink);
+    ftSetStatSink(dropStatSink);
 
     if (!initSockets())
     {
@@ -2493,6 +2540,7 @@ int main(int argc, char* argv[])
      * 8084 session, so it can idle here for the whole process lifetime. Start
      * it first so a session that connects immediately sees it listening. */
     std::thread drop_thread(dropServiceRun, std::ref(g_running));
+    std::thread ft_thread(ftServiceRun, std::ref(g_running), &g_ft_auth);
     std::thread kvm_thread(kvmServiceRun, std::ref(g_running), &g_kvm_auth);
 
     /* TCP stream server */
@@ -2509,6 +2557,7 @@ int main(int argc, char* argv[])
         stats_thread.join();
         kvm_thread.join();
         drop_thread.join();
+        ft_thread.join();
         cleanupSockets();
         return 1;
     }
@@ -2537,6 +2586,7 @@ int main(int argc, char* argv[])
         stats_thread.join();
         kvm_thread.join();
         drop_thread.join();
+        ft_thread.join();
         cleanupSockets();
         return 1;
     }
@@ -2549,14 +2599,17 @@ int main(int argc, char* argv[])
         ports_startup_status ports_st = {};
         KvmStartupStatus kvm_st = {};
         DropStartupStatus drop_st = {};
+        FtStartupStatus ft_st = {};
         const int64_t svc_deadline = steadyMs() + 1500;
         for (;;) {
             gpu_st = gpu_service_status();
             ports_st = ports_service_status();
             kvm_st = kvmServiceStatus();
             drop_st = dropServiceStatus();
+            ft_st = ftServiceStatus();
             const bool settled = gpu_st.state != 0 && ports_st.state != 0 &&
-                                 kvm_st.state != 0 && drop_st.state != 0;
+                                 kvm_st.state != 0 && drop_st.state != 0 &&
+                                 ft_st.state != 0;
             if (settled || steadyMs() >= svc_deadline)
                 break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2569,6 +2622,8 @@ int main(int argc, char* argv[])
                           kvm_st.stage, kvm_st.error_code);
         emitServiceStatus("drop", DROP_PORT, drop_st.state,
                           drop_st.stage, drop_st.error_code);
+        emitServiceStatus("files", FILEXFER_PORT, ft_st.state,
+                          ft_st.stage, ft_st.error_code);
     }
 
     std::cout << "Waiting for sender on TCP " << TCP_STREAM_PORT << " ...\n";
@@ -2662,6 +2717,7 @@ int main(int argc, char* argv[])
     stats_thread.join();
     kvm_thread.join();
     drop_thread.join();
+    ft_thread.join();
     cleanupSockets();
 
     // Final stats write + forced one-line summary
