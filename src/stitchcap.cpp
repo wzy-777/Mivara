@@ -194,13 +194,7 @@ public:
                                    DWORD *effect) override
     {
         if (effect) *effect = DROPEFFECT_NONE;
-        /* Deliberately no NODRAG here: OLE calls Drop for every normal
-         * release over the strip (DragEnter/DragOver advertise COPY), and the
-         * controller's posted drop work may run after this callback. Sending
-         * NODRAG would clear the captured paths before the transfer starts.
-         * A cancelled drag still sends NODRAG from DragLeave, and the
-         * controller also discards the list on its next left-button down, so
-         * nothing leaks into the next gesture. */
+        sendLine("DROPPED\n");
         return S_OK;
     }
 };

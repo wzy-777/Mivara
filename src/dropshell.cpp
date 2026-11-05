@@ -596,6 +596,7 @@ struct HelperState {
      * release handler consults this so an Esc-cancelled drag is not turned
      * into a copy. Written by helperReader, read from the hook thread. */
     std::atomic<bool> drag_live{false};
+    std::atomic<bool> drop_called{false};
     /* True from the helper's DragEnter ("DRAG") until the next left-button
      * down. Lets a release inside the capture grace window tell a real file
      * drag (wait for FILES_END) from an ordinary click (complete it now),
@@ -607,6 +608,8 @@ struct HelperState {
      * press un-armed while this is set (bounded by a hard cap). Cleared by
      * FILES_END, NODRAG, discard and stop. */
     std::atomic<bool> drag_pending{false};
+    std::atomic<uint64_t> drag_generation{0};
+    std::atomic<uint64_t> dropped_generation{0};
     std::vector<std::string> files;
     uint64_t files_tick = 0;
     std::string pipe_name;
@@ -904,8 +907,13 @@ void helperReader()
         while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
             msg.pop_back();
         if (msg == "DRAG") {
+            g_helper.drag_generation.fetch_add(1);
             g_helper.drag_seen = true;
             g_helper.drag_pending = true;
+            g_helper.drop_called = false;
+        } else if (msg == "DROPPED") {
+            g_helper.dropped_generation = g_helper.drag_generation.load();
+            g_helper.drop_called = true;
         } else if (msg.rfind("READY\t", 0) == 0) {
             const int il = (int)strtol(msg.c_str() + 6, nullptr, 0);
             g_helper.il = il;
@@ -936,12 +944,17 @@ void helperReader()
             g_helper.drag_seen = true;
             g_helper.drag_pending = false;
         } else if (msg == "NODRAG") {
+            if (g_helper.drop_called.load() &&
+                g_helper.dropped_generation.load() ==
+                    g_helper.drag_generation.load()) continue;
             {
                 std::lock_guard<std::mutex> lk(g_helper.m);
                 g_helper.files.clear();
                 pending.clear();
             }
             g_helper.drag_live = false;
+            g_helper.drop_called = false;
+            g_helper.dropped_generation = 0;
             g_helper.drag_pending = false;
         } else if (msg == "BYE" || msg == "QUIT") {
             break;
@@ -1071,6 +1084,9 @@ void dropHelperStop()
     }
     g_helper.ready = false;
     g_helper.drag_live = false;
+    g_helper.drop_called = false;
+    g_helper.drag_generation = 0;
+    g_helper.dropped_generation = 0;
     g_helper.drag_seen = false;
     g_helper.drag_pending = false;
     std::lock_guard<std::mutex> lk(g_helper.m);
@@ -1098,6 +1114,9 @@ void dropHelperDiscard()
         g_helper.files.clear();
     }
     g_helper.drag_live = false;
+    g_helper.drop_called = false;
+    g_helper.drag_generation.fetch_add(1);
+    g_helper.dropped_generation = 0;
     g_helper.drag_seen = false;
     g_helper.drag_pending = false;
 }

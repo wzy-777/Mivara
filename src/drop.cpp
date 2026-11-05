@@ -1077,6 +1077,8 @@ void dropWorker(drop_sock_t s, const std::string &peer,
     const int drop_x = (int)(int32_t)ntohl((uint32_t)hello.x);
     const int drop_y = (int)(int32_t)ntohl((uint32_t)hello.y);
     if (!dropResolveFolder(drop_x, drop_y, dest, why)) {
+        dropStat("event=drop|state=resolve_error|x=" + std::to_string(drop_x) +
+                 "|y=" + std::to_string(drop_y) + "|msg=" + statSafe(why));
         if (!dropDefaultRecvDir(dest)) {
             sendResult(s, DROP_ERR_NO_TARGET, 0, 0, false, why);
             closesocket(s);
@@ -1085,6 +1087,9 @@ void dropWorker(drop_sock_t s, const std::string &peer,
         }
         fallback = true;
     }
+    dropStat(std::string("event=drop|state=target|fallback=") +
+             (fallback ? "1" : "0") + "|x=" + std::to_string(drop_x) +
+             "|y=" + std::to_string(drop_y));
 
     const std::wstring staging = dropStagingRoot(ntohl(hello.transfer_id));
     if (staging.empty()) {
@@ -1284,16 +1289,19 @@ void dropServiceRun(std::atomic<bool> &running)
         }
         if (ntohl(hello.magic) != DROP_MAGIC ||
             ntohl(hello.version) != DROP_VERSION) {
+            dropStat("event=drop|state=reject|stage=version");
             sendStatus(c, DROP_ERR_VERSION);
             closesocket(c);
             continue;
         }
         if (!dropGateCheck(hello.token)) {
+            dropStat("event=drop|state=reject|stage=auth");
             sendStatus(c, DROP_ERR_AUTH);
             closesocket(c);
             continue;
         }
         if (active.exchange(true)) {
+            dropStat("event=drop|state=reject|stage=busy");
             sendStatus(c, DROP_ERR_BUSY);
             closesocket(c);
             continue;

@@ -292,6 +292,7 @@ bool g_key_down[256] = {};
 DWORD g_key_scan[256] = {};
 bool g_key_ext[256] = {};
 bool g_btn_down[8] = {};
+bool g_drag_returning = false;
 
 /* Whether the matching DOWN was actually delivered to the local desktop.
  * Control can cross while a key or button is still held: the press reached
@@ -331,6 +332,7 @@ std::thread g_drop_thread;
  * syncHeldInput() arms it then. */
 bool      g_btn_arm_pending = false;
 ULONGLONG g_btn_arm_tick = 0;
+std::vector<POINT> g_pending_drag_moves;
 /* 200 ms covers the normal DragEnter -> pipe latency. A slow CF_HDROP render
  * (cloud/virtual files, a huge selection) can take longer; while the helper
  * has announced a drag but not finished the list, keep waiting up to this
@@ -483,6 +485,7 @@ static void pollPendingDrag()
     if (g_drop_ready && dropHelperDragLive() &&
         dropHelperTakeFiles(files) && !files.empty()) {
         g_btn_arm_pending = false;
+        g_pending_drag_moves.clear();
         g_file_drag = true;
         g_drag_files.swap(files);
         emitStat("event=drop|state=ready|items=" +
@@ -509,6 +512,9 @@ static void pollPendingDrag()
     /* A still-held ordinary drag: arm its button now. */
     g_btn_arm_pending = false;
     armHeldButton(1);
+    for (const POINT &p : g_pending_drag_moves)
+        g_queue.pushMove((uint32_t)p.x, (uint32_t)p.y);
+    g_pending_drag_moves.clear();
 }
 
 static void enterRemote()
@@ -583,6 +589,7 @@ static void enterRemote()
         if (may_be_file_drag) {
             g_btn_arm_pending = true;
             g_btn_arm_tick = GetTickCount64();
+            g_pending_drag_moves.clear();
         }
     }
     emitStitchState("remote");
@@ -602,6 +609,7 @@ static void leaveRemote(bool warpCursor, bool keepCapturedDrag = false)
         g_drag_files.clear();
     }
     g_btn_arm_pending = false;
+    g_pending_drag_moves.clear();
 
     KvmEvent e = {};
     e.type = KVM_EV_RELEASE_ALL;
@@ -653,7 +661,12 @@ static void moveRemote(int dx, int dy)
     ny = clampInt(ny, 0, (int)g_tgt_h - 1);
     g_remote_x = nx;
     g_remote_y = ny;
-    g_queue.pushMove((uint32_t)nx, (uint32_t)ny);
+    if (g_btn_arm_pending) {
+        if (g_pending_drag_moves.size() < 4096)
+            g_pending_drag_moves.push_back({nx, ny});
+    } else {
+        g_queue.pushMove((uint32_t)nx, (uint32_t)ny);
+    }
 }
 
 /* Applies a queued side change on the message-loop thread. Returning control
@@ -720,9 +733,18 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
          * runs in the message loop (nothing blocking in a hook). */
         if (btn == 1 && down) {
             g_discard_drag = true;
+            g_drag_returning = false;
             /* A new gesture: a deferred file drag from the previous one can
              * never be completed now. The message loop discards the capture. */
             g_btn_arm_pending = false;
+        }
+        if (btn == 1 && !down && g_drag_returning) {
+            g_drag_returning = false;
+            g_btn_local[1] = false;
+            g_drop_rel_x = g_tgt_x0 + g_remote_x;
+            g_drop_rel_y = g_tgt_y0 + g_remote_y;
+            if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
+            return CallNextHookEx(nullptr, code, wp, lp);
         }
     }
 
@@ -732,6 +754,10 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
     /* Synthetic clicks (automation / remote-control tools) are not ours to
      * forward, matching the keyboard hook. */
     if (ms->flags & LLMHF_INJECTED)
+        return CallNextHookEx(nullptr, code, wp, lp);
+
+    if (wp == WM_MOUSEMOVE && g_drop_ready && g_btn_down[1] &&
+        g_btn_local[1])
         return CallNextHookEx(nullptr, code, wp, lp);
 
     switch (wp) {
@@ -929,6 +955,7 @@ static void startFileDrop(int screen_x, int screen_y)
         line += "|items=" + std::to_string(r.committed);
         line += "|failed=" + std::to_string(r.failed);
         line += "|fallback=" + std::string(r.fallback ? "1" : "0");
+        line += "|code=" + std::to_string(r.status);
         if (!r.message.empty()) line += "|msg=" + r.message;
         emitStat(line);
         g_drop_active = false;
@@ -980,6 +1007,7 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * A cancelled gesture must never start a transfer. A normal OLE Drop
          * deliberately sends no NODRAG, so this only rejects a cancellation. */
         if (g_file_drag && !dropHelperDragLive()) {
+            emitStat("event=drop|state=cancelled|stage=local_release");
             g_file_drag = false;
             g_drag_files.clear();
             g_btn_arm_pending = false;
@@ -998,6 +1026,7 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 dropHelperTakeFiles(files) && !files.empty()) {
                 g_file_drag = true;
                 g_drag_files.swap(files);
+                g_pending_drag_moves.clear();
             } else {
                 /* The absence of a capture is ambiguous this early (the
                  * DragEnter notification is itself in flight), so never
@@ -1007,6 +1036,9 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (age < DRAG_CAPTURE_GRACE_MS) return 0;
                 if (dropHelperDragPending() && age < DRAG_CAPTURE_HARD_MS)
                     return 0;
+                emitStat(std::string("event=drop|state=error|stage=capture|seen=") +
+                         (dropHelperDragSeen() ? "1" : "0") +
+                         "|pending=" + (dropHelperDragPending() ? "1" : "0"));
                 g_btn_arm_pending = false;
                 /* No capture and none still in flight. If the helper ever
                  * announced a drag this was a cancelled/failed file drag and
@@ -1014,12 +1046,24 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                  * that was never armed on the peer. */
                 if (!dropHelperDragSeen() && !g_btn_down[1]) {
                     queueButton(1, true);
+                    for (const POINT &p : g_pending_drag_moves)
+                        g_queue.pushMove((uint32_t)p.x, (uint32_t)p.y);
                     queueButton(1, false);
                 }
+                if (g_btn_down[1]) {
+                    armHeldButton(1);
+                    for (const POINT &p : g_pending_drag_moves)
+                        g_queue.pushMove((uint32_t)p.x, (uint32_t)p.y);
+                }
+                g_pending_drag_moves.clear();
                 return 0;
             }
         }
         g_file_drag = false;
+        emitStat("event=drop|state=release|x=" +
+                 std::to_string(g_drop_rel_x) + "|y=" +
+                 std::to_string(g_drop_rel_y) + "|items=" +
+                 std::to_string(g_drag_files.size()));
         startFileDrop(g_drop_rel_x, g_drop_rel_y);
         leaveRemote(true);
         return 0;
@@ -1378,6 +1422,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     g_file_drag = false;
     g_drag_files.clear();
     g_btn_arm_pending = false;
+    g_pending_drag_moves.clear();
     g_drop_cancel = false;
     g_drop_active = false;
     g_drop_port = (uint16_t)DROP_PORT;
@@ -1730,6 +1775,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     g_file_drag = false;
     g_drag_files.clear();
     g_btn_arm_pending = false;
+    g_pending_drag_moves.clear();
     if (g_drop_thread.joinable()) g_drop_thread.join();
     g_drop_active = false;
     mivaraSecureZero(g_drop_token, sizeof(g_drop_token));
