@@ -22,13 +22,18 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "drop.h"
 
 namespace {
 
@@ -48,12 +53,56 @@ const UINT WM_CAP_SIDE = WM_APP + 1;
 
 int g_ref = 1;
 
+/* Optional file trace for field debugging of the OLE capture path. Enabled by
+ * setting MIVARA_STITCHCAP_TRACE=1 in the helper's environment; writes
+ * %TEMP%\mivara-stitchcap-trace.log. Off (and free) by default. */
+bool traceEnabled()
+{
+    static const bool enabled = [] {
+        return GetEnvironmentVariableW(L"MIVARA_STITCHCAP_TRACE", nullptr, 0) > 0;
+    }();
+    return enabled;
+}
+
+void trace(const std::string &msg)
+{
+    if (!traceEnabled()) return;
+    wchar_t tmp[MAX_PATH] = {};
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    static HANDLE file = CreateFileW(
+        (std::wstring(tmp) + L"mivara-stitchcap-trace.log").c_str(),
+        GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(file, 0, nullptr, FILE_END);
+    char line[1200];
+    const int n = std::snprintf(line, sizeof(line), "[%llu pid=%lu] %s\n",
+                                (unsigned long long)GetTickCount64(),
+                                GetCurrentProcessId(), msg.c_str());
+    if (n <= 0) return;
+    DWORD wrote = 0;
+    WriteFile(file, line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1,
+              &wrote, nullptr);
+}
+
 void sendLine(const std::string &line)
 {
     std::lock_guard<std::mutex> lk(g_pipe_mtx);
     if (g_tx == INVALID_HANDLE_VALUE) return;
+    trace("tx> " + line);
     DWORD wrote = 0;
-    WriteFile(g_tx, line.data(), (DWORD)line.size(), &wrote, nullptr);
+    if (!WriteFile(g_tx, line.data(), (DWORD)line.size(), &wrote, nullptr))
+        trace("tx failed err=" + std::to_string(GetLastError()));
+}
+
+/* Image chunks are large; never copy them into the trace log. */
+void sendLineQuiet(const std::string &line)
+{
+    std::lock_guard<std::mutex> lk(g_pipe_mtx);
+    if (g_tx == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    if (!WriteFile(g_tx, line.data(), (DWORD)line.size(), &wrote, nullptr))
+        trace("tx image failed err=" + std::to_string(GetLastError()));
 }
 
 std::string wideToUtf8(const std::wstring &w)
@@ -111,6 +160,231 @@ void sendFiles(const std::vector<std::wstring> &paths)
     sendLine("FILES_END\n");
 }
 
+/* Feasibility probe for the source's real drag image (trace builds only):
+ * enumerate the formats Explorer exposes and try the two known names for the
+ * SHDRAGIMAGE blob. The HBITMAP inside is process-local; the trace tells us
+ * whether OLE actually marshals it across to this helper. */
+std::string clipboardFormatName(CLIPFORMAT cf)
+{
+    wchar_t name[256] = {};
+    const int n = GetClipboardFormatNameW(cf, name, 256);
+    if (n > 0) return wideToUtf8(std::wstring(name, (size_t)n));
+    return "cf=" + std::to_string((unsigned)cf);
+}
+
+void probeDragImage(IDataObject *data)
+{
+    if (!traceEnabled() || !data) return;
+
+    IEnumFORMATETC *en = nullptr;
+    if (SUCCEEDED(data->EnumFormatEtc(DATADIR_GET, &en)) && en) {
+        FORMATETC fe = {};
+        ULONG got = 0;
+        while (en->Next(1, &fe, &got) == S_OK && got == 1) {
+            trace("fmt " + clipboardFormatName(fe.cfFormat) +
+                  " tymed=" + std::to_string((unsigned)fe.tymed));
+            fe = {};
+        }
+        en->Release();
+    }
+
+    const wchar_t *names[] = {L"DragImageBits", L"ShellGetDragImage"};
+    for (const wchar_t *name : names) {
+        const CLIPFORMAT cf = (CLIPFORMAT)RegisterClipboardFormatW(name);
+        FORMATETC fmt = {cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM stg = {};
+        const HRESULT hr = data->GetData(&fmt, &stg);
+        trace(std::string("dragimage ") + wideToUtf8(name) +
+              " hr=" + std::to_string((long)hr));
+        if (SUCCEEDED(hr)) {
+            if (stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
+                const SIZE_T sz = GlobalSize(stg.hGlobal);
+                void *p = GlobalLock(stg.hGlobal);
+                trace("  hglobal=" + std::to_string((unsigned long long)sz) +
+                      " lock=" + (p ? "ok" : "null"));
+                if (p && sz >= sizeof(SHDRAGIMAGE)) {
+                    SHDRAGIMAGE sdi = {};
+                    std::memcpy(&sdi, p, sizeof(sdi));
+                    char head[3 * 40 + 1] = {};
+                    const unsigned char *hb = (const unsigned char *)p;
+                    for (int i = 0; i < 40 && (SIZE_T)(i + 1) <= sz; i++)
+                        std::snprintf(head + i * 3, 4, "%02X ", hb[i]);
+                    trace(std::string("  head=") + head);
+                    /* The test source draws a green/red 64x64 square; its
+                     * first pixel is 00 DC 00 FF in BGRA. Finding it tells us
+                     * where the packed pixels start in the marshaled blob. */
+                    for (int off = 0; off + 4 <= 128 &&
+                                      (SIZE_T)(off + 4) <= sz; off++) {
+                        if (std::memcmp(hb + off, "\x00\xDC\x00\xFF", 4) == 0)
+                            trace("  testpixel@" + std::to_string(off));
+                    }
+                    trace("  size=" +
+                          std::to_string((long)sdi.sizeDragImage.cx) + "x" +
+                          std::to_string((long)sdi.sizeDragImage.cy) +
+                          " off=" + std::to_string((long)sdi.ptOffset.x) +
+                          "," + std::to_string((long)sdi.ptOffset.y) +
+                          " hbmp=" +
+                          std::to_string((unsigned long long)(uintptr_t)
+                                             sdi.hbmpDragImage) +
+                          " key=" +
+                          std::to_string((unsigned long)sdi.crColorKey));
+                    BITMAP bm = {};
+                    if (sdi.hbmpDragImage &&
+                        GetObjectW(sdi.hbmpDragImage, sizeof(bm), &bm)) {
+                        trace("  bitmap=" + std::to_string(bm.bmWidth) + "x" +
+                              std::to_string(bm.bmHeight) + " bpp=" +
+                              std::to_string(bm.bmBitsPixel));
+                    } else {
+                        trace("  bitmap invalid err=" +
+                              std::to_string(GetLastError()));
+                    }
+                }
+                GlobalUnlock(stg.hGlobal);
+            } else {
+                trace("  tymed=" + std::to_string((unsigned)stg.tymed));
+            }
+            ReleaseStgMedium(&stg);
+        }
+    }
+}
+
+/* Downscale a packed premultiplied BGRA image to the protocol cap. Averaging
+ * premultiplied channels is linear and keeps alpha edges correct. */
+bool fitDragImage(std::vector<uint8_t> &px, int &w, int &h, int &ox, int &oy)
+{
+    if (w <= 0 || h <= 0) return false;
+    const int64_t maxpx = (int64_t)DROP_DRAG_IMAGE_MAX_PIXELS;
+    if ((int64_t)w * h <= maxpx) return true;
+    const double scale = std::sqrt((double)maxpx / ((double)w * h));
+    int nw = (int)(w * scale);
+    int nh = (int)(h * scale);
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    while ((int64_t)nw * nh > maxpx) {
+        if (nw >= nh) nw--;
+        else nh--;
+    }
+    if (nw < 1 || nh < 1) return false;
+    std::vector<uint8_t> out((size_t)nw * nh * 4, 0);
+    for (int y = 0; y < nh; y++) {
+        const int y0 = (int)((long long)y * h / nh);
+        int y1 = (int)((long long)(y + 1) * h / nh);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (int x = 0; x < nw; x++) {
+            const int x0 = (int)((long long)x * w / nw);
+            int x1 = (int)((long long)(x + 1) * w / nw);
+            if (x1 <= x0) x1 = x0 + 1;
+            unsigned long long a = 0, r = 0, g = 0, b = 0;
+            unsigned n = 0;
+            for (int sy = y0; sy < y1; sy++) {
+                const uint8_t *row = &px[((size_t)sy * w + x0) * 4];
+                for (int sx = x0; sx < x1; sx++, row += 4) {
+                    b += row[0];
+                    g += row[1];
+                    r += row[2];
+                    a += row[3];
+                    n++;
+                }
+            }
+            uint8_t *d = &out[((size_t)y * nw + x) * 4];
+            d[0] = (uint8_t)(b / n);
+            d[1] = (uint8_t)(g / n);
+            d[2] = (uint8_t)(r / n);
+            d[3] = (uint8_t)(a / n);
+        }
+    }
+    ox = (int)std::lround((double)ox * nw / w);
+    oy = (int)std::lround((double)oy * nh / h);
+    px.swap(out);
+    w = nw;
+    h = nh;
+    return true;
+}
+
+/* Send the real Explorer drag image over the pipe as hex chunks. The blob is
+ * already premultiplied BGRA; the controller/target blit it as-is. */
+void sendDragImage(const std::vector<uint8_t> &px, int w, int h, int ox,
+                   int oy)
+{
+    sendLine("IMG_BEGIN\t" + std::to_string(w) + "\t" + std::to_string(h) +
+             "\t" + std::to_string(ox) + "\t" + std::to_string(oy) + "\n");
+    static const char hex[] = "0123456789ABCDEF";
+    const size_t chunk = 12000;   /* 24 KB of hex per pipe write */
+    for (size_t off = 0; off < px.size(); off += chunk) {
+        const size_t n = std::min(chunk, px.size() - off);
+        std::string line = "IMG_CHUNK\t";
+        line.reserve(10 + n * 2 + 1);
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t v = px[off + i];
+            line.push_back(hex[v >> 4]);
+            line.push_back(hex[v & 0x0F]);
+        }
+        line.push_back('\n');
+        sendLineQuiet(line);
+    }
+    sendLine("IMG_END\n");
+}
+
+/* Recover the source Explorer drag image from the marshaled DragImageBits
+ * blob. OLE replaces the process-local HBITMAP with the packed pixels after a
+ * 16-byte {w,h,offset} header and a 4/8-byte handle slot. */
+void captureDragImage(IDataObject *data)
+{
+    static const CLIPFORMAT cf =
+        (CLIPFORMAT)RegisterClipboardFormatW(L"DragImageBits");
+    if (!cf) return;
+    FORMATETC fmt = {cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM stg = {};
+    if (FAILED(data->GetData(&fmt, &stg))) return;
+    if (stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
+        const SIZE_T sz = GlobalSize(stg.hGlobal);
+        const uint8_t *p = (const uint8_t *)GlobalLock(stg.hGlobal);
+        if (p && sz >= 16) {
+            int w = 0, h = 0, ox = 0, oy = 0;
+            std::memcpy(&w, p, 4);
+            std::memcpy(&h, p + 4, 4);
+            std::memcpy(&ox, p + 8, 4);
+            std::memcpy(&oy, p + 12, 4);
+            const int64_t pixels = (int64_t)w * h;
+            /* Allow up to 4x the wire cap so a high-DPI image can be
+             * downscaled; anything larger is left to the icon fallback. */
+            if (w > 0 && h > 0 && pixels > 0 &&
+                pixels <= 4 * (int64_t)DROP_DRAG_IMAGE_MAX_PIXELS) {
+                const size_t bytes = (size_t)pixels * 4;
+                const size_t header = sz >= bytes ? sz - bytes : 0;
+                /* 16 bytes of {w,h,off} + a 4/8-byte HBITMAP slot is the
+                 * layout we verified; accept a little slack for a color key
+                 * or alignment padding and keep the pixel tail. */
+                if (header >= 16 && header <= 64) {
+                    std::vector<uint8_t> px(p + (sz - bytes), p + sz);
+                    /* The marshaled DIB keeps the bitmap's bottom-up row
+                     * order (verified with an asymmetric source: the first
+                     * row of the blob is the source's bottom row). Convert to
+                     * top-down once, before the wire, so the peer can blit
+                     * the bytes directly. Swap whole rows only — reversing
+                     * the buffer would also mirror every row and produce a
+                     * 180-degree rotation. */
+                    const size_t stride = (size_t)w * 4;
+                    for (int y = 0; y < h / 2; y++) {
+                        std::swap_ranges(
+                            px.begin() + (size_t)y * stride,
+                            px.begin() + (size_t)(y + 1) * stride,
+                            px.begin() + (size_t)(h - 1 - y) * stride);
+                    }
+                    if (fitDragImage(px, w, h, ox, oy)) {
+                        trace("dragimage captured " + std::to_string(w) + "x" +
+                              std::to_string(h) + " off=" +
+                              std::to_string(ox) + "," + std::to_string(oy));
+                        sendDragImage(px, w, h, ox, oy);
+                    }
+                }
+            }
+        }
+        GlobalUnlock(stg.hGlobal);
+    }
+    ReleaseStgMedium(&stg);
+}
+
 class DropTarget : public IDropTarget {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override
@@ -144,14 +418,23 @@ public:
          * returns NONE, so nothing is ever copied locally. */
         if (effect) *effect = DROPEFFECT_COPY;
         if (!data) return S_OK;
+        trace("DragEnter");
         /* Announce the gesture before the (potentially slower) path
          * extraction, so the controller can tell a file drag from an ordinary
          * click even when FILES_END is still in flight at release. */
         sendLine("DRAG\n");
+        probeDragImage(data);
         FORMATETC fmt = {(CLIPFORMAT)CF_HDROP, nullptr, DVASPECT_CONTENT, -1,
                          TYMED_HGLOBAL};
         STGMEDIUM stg = {};
-        if (FAILED(data->GetData(&fmt, &stg))) return S_OK;
+        const HRESULT get_hr = data->GetData(&fmt, &stg);
+        trace("GetData hr=" + std::to_string((long)get_hr));
+        if (FAILED(get_hr)) {
+            /* DRAG already announced a gesture: never leave the controller
+             * waiting out its 2 s hard cap for a list that will not come. */
+            sendLine("NODRAG\n");
+            return S_OK;
+        }
         std::vector<std::wstring> paths;
         if (stg.tymed == TYMED_HGLOBAL && stg.hGlobal) {
             HDROP drop = (HDROP)GlobalLock(stg.hGlobal);
@@ -167,12 +450,16 @@ public:
             }
         }
         ReleaseStgMedium(&stg);
+        trace("DragEnter paths=" + std::to_string(paths.size()));
         if (paths.empty()) {
             /* Not an HDROP drag (text, an image, a failed render): no list is
              * coming, so clear the controller's "capture in flight" state at
              * once instead of making it wait for the hard cap. */
             sendLine("NODRAG\n");
         } else {
+            /* The image must precede FILES_END: the controller takes both as
+             * soon as the file list is published. */
+            captureDragImage(data);
             sendFiles(paths);
         }
         return S_OK;
@@ -182,19 +469,24 @@ public:
     {
         /* Must stay non-NONE or OLE turns the release into DragLeave instead
          * of Drop (see DragEnter). */
+        static bool first = true;
+        if (first) { first = false; trace("DragOver"); }
         if (effect) *effect = DROPEFFECT_COPY;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DragLeave() override
     {
+        trace("DragLeave");
         sendLine("NODRAG\n");
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Drop(IDataObject *, DWORD, POINTL,
                                    DWORD *effect) override
     {
+        trace("Drop");
         if (effect) *effect = DROPEFFECT_NONE;
         sendLine("DROPPED\n");
+        trace("Drop done");
         return S_OK;
     }
 };

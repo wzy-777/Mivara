@@ -28,7 +28,17 @@
 #include <string>
 #include <vector>
 
-#define DROP_PORT              8085u
+#ifndef DROP_PORT
+#  define DROP_PORT            8085u
+#endif
+/* Reverse-direction (target → controller) listener. It must NOT share 8085:
+ * a receiver.exe running on the same machine (the usual "always receiving"
+ * setup) already owns 8085, so the controller's own listener could never bind
+ * and every reverse transfer was refused with DROP_ERR_AUTH. The controller
+ * advertises this port in KvmHello.reserved[1] bits 16..31. */
+#ifndef DROP_REVERSE_PORT
+#  define DROP_REVERSE_PORT    8087u
+#endif
 #define DROP_MAGIC             0x4D564431u   /* 'MVD1' */
 #define DROP_VERSION           1u
 #define DROP_TOKEN_BYTES       32
@@ -41,6 +51,34 @@
 #define DROP_MAX_FILE_BYTES    (2ull * 1024ull * 1024ull * 1024ull)
 #define DROP_MAX_PATH_BYTES    1024u
 #define DROP_MAX_DEPTH         64u
+
+/* Source-side real drag image captured from the OLE data object
+ * ("DragImageBits"). The marshaled HGLOBAL is:
+ *   u32 width, u32 height, i32 offset_x, i32 offset_y,
+ *   <HBITMAP handle: 4 or 8 process-local bytes>, then width*height
+ *   premultiplied BGRA pixels as the LAST w*h*4 bytes. Those rows keep the
+ *   DIB's BOTTOM-UP order; stitchcap swaps whole rows to top-down before
+ *   sending, and DropDragImage.px is top-down.
+ * The HBITMAP handle is invalid after OLE marshals it, but the packed pixels
+ * survive; the helper reconstructs the image from the tail and sends it over
+ * the pipe. The controller downsizes anything above this cap. */
+#define DROP_DRAG_IMAGE_MAX_PIXELS 36864u
+struct DropDragImage {
+    int w = 0, h = 0;
+    int ox = 0, oy = 0;          /* cursor hotspot within the image */
+    std::vector<uint8_t> px;     /* premultiplied BGRA, top-down */
+    bool valid() const
+    {
+        return w > 0 && h > 0 && w <= 2048 && h <= 2048 &&
+               (uint64_t)w * (uint64_t)h <= DROP_DRAG_IMAGE_MAX_PIXELS &&
+               px.size() == (size_t)w * (size_t)h * 4;
+    }
+};
+
+/* DropHello.flags bit 0: the transfer is a REVERSE drag copy (target →
+ * controller). The receiving controller resolves the destination from its own
+ * current cursor position (its desktop edge), ignoring hello.x/y. */
+#define DROP_FLAG_REVERSE      1u
 
 enum DropStatus : uint32_t {
     DROP_OK             = 0,
@@ -67,10 +105,13 @@ struct DropStartupStatus {
 };
 DropStartupStatus dropServiceStatus();
 
-/** Target (receiver): listen on DROP_PORT until *running clears. The token
- *  gate is installed by the 8084 session thread; without a gate every
- *  connection is refused (DROP_ERR_AUTH). */
-void dropServiceRun(std::atomic<bool> &running);
+/** Target (receiver): listen until *running clears. The token gate is
+ *  installed by the 8084 session thread; without a gate every connection is
+ *  refused (DROP_ERR_AUTH). `port` defaults to DROP_PORT; the stitch
+ *  controller uses DROP_REVERSE_PORT for its own reverse listener so it never
+ *  collides with a local receiver.exe that already owns 8085. */
+void dropServiceRun(std::atomic<bool> &running,
+                    uint16_t port = (uint16_t)DROP_PORT);
 
 /** Target: install/clear the per-session token. `epoch` is the 8084 session
  *  lease epoch so an ending session cannot clear a newer one. */
@@ -88,6 +129,7 @@ struct DropOptions {
     int         x = 0;             /* release point, target screen pixels */
     int         y = 0;
     uint32_t    transfer_id = 0;
+    uint32_t    flags = 0;         /* DROP_FLAG_REVERSE for target→controller */
     uint64_t    max_bytes = DROP_MAX_TOTAL_BYTES;
     uint32_t    max_items = DROP_MAX_ITEMS;
 };
@@ -137,6 +179,20 @@ bool dropHelperDragSeen();
 /** True after the helper announced a drag but before FILES_END/NODRAG: the
  *  path list is still being produced (slow CF_HDROP render). */
 bool dropHelperDragPending();
+/** Peek the captured selection without consuming it: item count, the first
+ *  item's file name (UTF-8, basename) for the reverse drag ghost, and its full
+ *  path for extracting the item's shell image. */
+size_t dropHelperFileCount();
+bool dropHelperFirstFileName(std::string &out);
+bool dropHelperFirstFilePath(std::string &out);
+/** Take the source Explorer drag image captured with the current gesture
+ *  (premultiplied BGRA). Clears it. False when the source did not provide one
+ *  or the blob was malformed/oversized. */
+bool dropHelperTakeDragImage(DropDragImage &out);
+/** True after the helper's OLE Drop fired for the CURRENT drag generation
+ *  (DROPPED received, not yet discarded). Reverse direction: the target uses
+ *  this to start the transfer to the controller. */
+bool dropHelperDropped();
 /** Drop a stale captured selection (called on a new local button-down). */
 void dropHelperDiscard();
 /** Move the helper's 1-pixel strip to another edge. */

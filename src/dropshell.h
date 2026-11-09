@@ -30,6 +30,14 @@ bool dropCommitItems(const std::wstring &staging_root,
                      uint32_t &committed, uint32_t &failed,
                      std::string &message);
 
+/** Best-effort: place the icons of `names` in the Explorer/desktop view of
+ *  `dest_folder` at the release point (screen pixels), stacking any extra
+ *  items downwards. Ignored when the view cannot be found or the folder has
+ *  "auto arrange icons" enabled (Explorer then re-snaps them to its grid).
+ *  Must run on an STA thread; never fails the copy. */
+bool dropPlaceIcons(const std::wstring &dest_folder, int screen_x, int screen_y,
+                    const std::vector<std::wstring> &names);
+
 /** %LOCALAPPDATA%\\Mivara\\Drop (created on demand). */
 std::wstring dropStagingBase();
 /** %LOCALAPPDATA%\\Mivara\\Drop\\<transfer>-<tick>-<seq> (created). */

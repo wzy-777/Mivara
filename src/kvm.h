@@ -85,6 +85,18 @@
 #define KVM_MAGIC   0x4D564B31u   /* 'MVK1' on the wire */
 #define KVM_VERSION 2u
 #define KVM_FEATURE_HEARTBEAT 1u  /* KvmHello.reserved[1] / KvmReply.reserved */
+/* Reverse (target -> controller) drag copy. The controller advertises it when
+ * its own file_drop_accept=1 (it can RECEIVE); the target echoes it when its
+ * own file_drop_send=1 (it can SEND) and the 8085 listener is up. */
+#define KVM_FEATURE_REVERSE_DROP 4u
+/* Drag-ghost icon payload, visual only. Both peers understand the icon frames
+ * below; the bit is echoed in KvmReply so neither side sends them to a build
+ * that would disconnect on an unknown event type. Never security-relevant. */
+#define KVM_FEATURE_DRAG_ICON    8u
+/* Source Explorer's real drag image ("DragImageBits"), visual only. A peer
+ * that understands KVM_EV_DRAG_IMAGE_* echoes this bit; it supersedes the
+ * reconstructed icon card on the receiving screen. */
+#define KVM_FEATURE_DRAG_IMAGE   16u
 
 /* KvmReply.status */
 enum KvmStatus : uint32_t {
@@ -109,7 +121,47 @@ enum KvmEventType : uint32_t {
      * eight frames whose b holds one 32-bit token word. The controller reads
      * this fixed sequence before it starts drainLoop(), so no variable-length
      * frame ever enters the 16-byte event stream. */
-    KVM_EV_DROP_INFO   = 8
+    KVM_EV_DROP_INFO   = 8,
+    /* Target → controller, only with KVM_FEATURE_REVERSE_DROP: the target's
+     * edge helper announced (a=1) or cancelled (a=0) a reverse file drag.
+     * The controller suppresses back-crossing while a=1 so the target's OLE
+     * drag can finish on release, then hands control back. */
+    KVM_EV_RDRAG       = 9,
+    /* Controller → target, visual only. The name frames need no negotiation
+     * (an older target ignores unknown types); the optional icon frames below
+     * are gated by KVM_FEATURE_DRAG_ICON. Shows a small drag ghost on the
+     * target screen while a file drag is being carried over:
+     *   DRAG_INFO a=1 (begin, b=item count, c=DRAG_TEXT frames that follow)
+     *   DRAG_INFO a=0 (end)
+     *   DRAG_TEXT carries 12 raw UTF-8 bytes per frame in a/b/c (byte order
+     *   round-trips untouched through htonl/ntohl). */
+    KVM_EV_DRAG_INFO   = 10,
+    KVM_EV_DRAG_TEXT   = 11,
+    /* Drag-ghost image, visual only and only when KVM_FEATURE_DRAG_ICON was
+     * negotiated. Sent in the same direction as DRAG_INFO/TEXT (controller →
+     * target for a forward drag, target → controller while carrying a reverse
+     * drag back):
+     *   DRAG_ICON_INFO a = width, b = height, c = number of DATA frames
+     *   DRAG_ICON_DATA 12 raw bytes per frame in a/b/c, exactly like DRAG_TEXT
+     * Pixels are tightly packed, top-down, non-premultiplied BGRA (the same
+     * order as a Windows 32bpp DIB). The receiver accepts at most 2,048 per
+     * dimension and 36,864 pixels (a cap shared with the real drag image) and
+     * ignores an incomplete sequence; the ghost then keeps the page glyph.
+     * Older peers never set the feature bit, so they never see these frames. */
+    KVM_EV_DRAG_ICON_INFO = 12,
+    KVM_EV_DRAG_ICON_DATA = 13,
+    /* The SOURCE's real shell drag image, only when KVM_FEATURE_DRAG_IMAGE is
+     * negotiated. Same direction and frame convention as the icon frames:
+     *   DRAG_IMAGE_INFO a = width | (offset_x << 16),
+     *                   b = height | (offset_y << 16), c = DATA frames
+     *   DRAG_IMAGE_DATA 12 raw premultiplied BGRA bytes per frame
+     * The image is top-down; the receiver draws its top-left at
+     * (cursor - offset), exactly like IDropTargetHelper. The source caps it at
+     * DROP_DRAG_IMAGE_MAX_PIXELS and downsizes larger images first. A complete
+     * image replaces the reconstructed icon card; an incomplete one is
+     * ignored (the card stays). */
+    KVM_EV_DRAG_IMAGE_INFO = 14,
+    KVM_EV_DRAG_IMAGE_DATA = 15
 };
 
 /* Where the peer sits relative to the controller. KVM_SIDE_RIGHT is the
@@ -187,6 +239,9 @@ struct KvmTargetAuth {
     /* Written by the receiver's stdin/policy thread (RX|reload) and read by
      * the 8084 session thread. */
     std::atomic<int> accept_files{0};
+    /** 1 = this machine may SEND files to the controller (reverse drag copy,
+     *  from --file-drop / file_drop_send). Independent of accept_files. */
+    std::atomic<int> file_send{0};
     void *ctx = nullptr;
 };
 
@@ -213,6 +268,10 @@ struct KvmClientAuth {
     /** 1 = capture dragged files at the shared edge and offer the 8085 file
      *  drop to the target. The sender sets this from --file-drop. */
     int file_drop = 0;
+    /** 1 = accept REVERSE drag copies (target -> this machine): advertise
+     *  KVM_FEATURE_REVERSE_DROP and run the 8085 listener locally.
+     *  The sender sets this from --accept-files / file_drop_accept. */
+    int accept_files = 0;
     void *ctx = nullptr;
 };
 

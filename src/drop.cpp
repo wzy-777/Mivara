@@ -351,6 +351,7 @@ void gateRelease(const uint8_t token[DROP_TOKEN_BYTES], uint64_t bytes)
 std::atomic<int> g_drop_start_state{0};
 std::atomic<int> g_drop_start_stage{0};
 std::atomic<int> g_drop_start_error{0};
+std::atomic<uint16_t> g_drop_start_port{(uint16_t)DROP_PORT};
 
 void reportStartup(int state, int stage, int error)
 {
@@ -1076,9 +1077,19 @@ void dropWorker(drop_sock_t s, const std::string &peer,
     } run_guard;
     const int drop_x = (int)(int32_t)ntohl((uint32_t)hello.x);
     const int drop_y = (int)(int32_t)ntohl((uint32_t)hello.y);
-    if (!dropResolveFolder(drop_x, drop_y, dest, why)) {
-        dropStat("event=drop|state=resolve_error|x=" + std::to_string(drop_x) +
-                 "|y=" + std::to_string(drop_y) + "|msg=" + statSafe(why));
+    int resolve_x = drop_x, resolve_y = drop_y;
+    if ((ntohl(hello.flags) & DROP_FLAG_REVERSE) != 0) {
+        /* Reverse drag copy (target → controller): the user released over the
+         * target's edge while watching the TARGET's monitor, so hello.x/y is
+         * a target coordinate, not ours. Resolve from THIS machine's cursor —
+         * after leaveRemote it is parked on this desktop's edge, which
+         * resolves to the controller's desktop (or the Explorer window there). */
+        POINT cp = {};
+        if (GetCursorPos(&cp)) { resolve_x = cp.x; resolve_y = cp.y; }
+    }
+    if (!dropResolveFolder(resolve_x, resolve_y, dest, why)) {
+        dropStat("event=drop|state=resolve_error|x=" + std::to_string(resolve_x) +
+                 "|y=" + std::to_string(resolve_y) + "|msg=" + statSafe(why));
         if (!dropDefaultRecvDir(dest)) {
             sendResult(s, DROP_ERR_NO_TARGET, 0, 0, false, why);
             closesocket(s);
@@ -1088,8 +1099,8 @@ void dropWorker(drop_sock_t s, const std::string &peer,
         fallback = true;
     }
     dropStat(std::string("event=drop|state=target|fallback=") +
-             (fallback ? "1" : "0") + "|x=" + std::to_string(drop_x) +
-             "|y=" + std::to_string(drop_y));
+             (fallback ? "1" : "0") + "|x=" + std::to_string(resolve_x) +
+             "|y=" + std::to_string(resolve_y));
 
     const std::wstring staging = dropStagingRoot(ntohl(hello.transfer_id));
     if (staging.empty()) {
@@ -1159,6 +1170,10 @@ void dropWorker(drop_sock_t s, const std::string &peer,
     uint32_t committed = 0, failed = 0;
     std::string msg;
     dropCommitItems(staging, dest, roots, committed, failed, msg);
+    /* Place the copied icons at the release point (best effort; an
+     * auto-arranged folder or a non-visible view simply skips this). */
+    if (committed > 0)
+        dropPlaceIcons(dest, resolve_x, resolve_y, roots);
     /* A partial commit is not "done": at least one top-level item failed, so
      * report an error while still carrying the per-item counts. */
     const uint32_t status =
@@ -1185,7 +1200,7 @@ DropStartupStatus dropServiceStatus()
     st.state = g_drop_start_state.load();
     st.stage = g_drop_start_stage.load();
     st.error_code = g_drop_start_error.load();
-    st.port = (uint16_t)DROP_PORT;
+    st.port = g_drop_start_port.load();
     return st;
 }
 
@@ -1215,12 +1230,29 @@ bool dropGateCheck(const uint8_t token[DROP_TOKEN_BYTES])
 {
     if (!token) return false;
     std::lock_guard<std::mutex> lk(g_gate_m);
-    return g_gate_active && mivaraConstEq(g_gate_token, token, DROP_TOKEN_BYTES);
+    const bool ok = g_gate_active &&
+                    mivaraConstEq(g_gate_token, token, DROP_TOKEN_BYTES);
+    if (!ok) {
+        /* Diagnose auth refusals in the field: an inactive gate means the
+         * session never installed one HERE (e.g. the listener belongs to
+         * another process/port); active means the token itself differed. The
+         * token bytes themselves are never logged. */
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "event=drop|state=gate_reject|port=%u|active=%d|"
+                      "epoch=%llu",
+                      (unsigned)g_drop_start_port.load(),
+                      g_gate_active ? 1 : 0,
+                      (unsigned long long)g_gate_epoch);
+        dropStat(buf);
+    }
+    return ok;
 }
 
-void dropServiceRun(std::atomic<bool> &running)
+void dropServiceRun(std::atomic<bool> &running, uint16_t port)
 {
     reportStartup(0, 0, 0);
+    g_drop_start_port.store(port ? port : (uint16_t)DROP_PORT);
     cleanupStaging();
     drop_sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == DROP_INVALID) {
@@ -1234,11 +1266,11 @@ void dropServiceRun(std::atomic<bool> &running)
                (const char *)&exclusive, sizeof(exclusive));
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)DROP_PORT);
+    addr.sin_port = htons((u_short)g_drop_start_port.load());
     addr.sin_addr.s_addr = INADDR_ANY;
     if (bind(srv, (sockaddr *)&addr, sizeof(addr)) < 0) {
         reportStartup(-1, 3, WSAGetLastError());
-        std::cout << "[drop] bind failed on " << DROP_PORT
+        std::cout << "[drop] bind failed on " << g_drop_start_port.load()
                   << "; file drop disabled\n" << std::flush;
         closesocket(srv);
         return;
@@ -1249,7 +1281,8 @@ void dropServiceRun(std::atomic<bool> &running)
         return;
     }
     reportStartup(1, 4, 0);
-    std::cout << "[drop] file-drop listener on TCP " << DROP_PORT << "\n"
+    std::cout << "[drop] file-drop listener on TCP "
+              << g_drop_start_port.load() << "\n"
               << std::flush;
 
     std::atomic<bool> active{false};
@@ -1362,6 +1395,7 @@ DropResult dropSendFiles(const DropOptions &opt,
     hello.y = (int32_t)htonl((uint32_t)opt.y);
     hello.item_count = htonl((uint32_t)st.entries.size());
     hello.total_bytes = hton64(st.total);
+    hello.flags = htonl(opt.flags);
     if (!sendAll(s, &hello, sizeof(hello))) {
         closesocket(s);
         res.status = DROP_ERR_IO;
@@ -1552,7 +1586,7 @@ DropStartupStatus dropServiceStatus()
     return st;
 }
 
-void dropServiceRun(std::atomic<bool> &) {}
+void dropServiceRun(std::atomic<bool> &, uint16_t) {}
 bool dropGateInstall(const uint8_t *, uint64_t) { return false; }
 void dropGateClear(uint64_t) {}
 bool dropGateCheck(const uint8_t *) { return false; }

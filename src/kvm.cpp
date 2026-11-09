@@ -44,9 +44,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -60,6 +62,8 @@
 #  include <ws2tcpip.h>
 #  include <mstcpip.h>
 #  include <windows.h>
+#  include <objbase.h>
+#  include <shobjidl.h>
 #else
 #  include <unistd.h>
 #endif
@@ -193,7 +197,10 @@ namespace {
  * write, tearing a coordinate pair). */
 class EventQueue {
 public:
-    static const unsigned CAP = 4096;
+    /* Large enough for one real drag image (DROP_DRAG_IMAGE_MAX_PIXELS * 4 /
+     * 12 frames) plus input headroom. The batch drain below sends it in one
+     * pass, so this is capacity, not a latency cost. */
+    static const unsigned CAP = 16384;
 
     bool push(const KvmEvent &e)
     {
@@ -225,6 +232,24 @@ public:
         return true;
     }
 
+    /* Free ring slots. The producer is a single thread, so a caller that
+     * checks this and then pushes the same number of events cannot be raced
+     * by another producer. Used to keep a burst of visual-only icon frames
+     * from crowding out a key/button event. */
+    unsigned freeSlots() const
+    {
+        const unsigned h = head.load(std::memory_order_relaxed);
+        const unsigned t = tail.load(std::memory_order_acquire);
+        return CAP - (h - t);
+    }
+
+    /* Conservative snapshot used to skip the select() wait before a drain. */
+    bool empty() const
+    {
+        return head.load(std::memory_order_acquire) ==
+               tail.load(std::memory_order_relaxed);
+    }
+
     bool pop(KvmEvent &e)
     {
         unsigned t = tail.load(std::memory_order_relaxed);
@@ -250,9 +275,457 @@ private:
     std::atomic<unsigned> tail{0};
 };
 
+/* ── drag-ghost icon payload ───────────────────────────────────────────────
+ * The dragged item's own shell image travels as fixed 16-byte KvmEvents: an
+ * INFO header (w/h/frame count) followed by DATA frames carrying 12 raw BGRA
+ * bytes each. 48x48 is the largest image the source produces (768 frames,
+ * ~12 KiB) and the receiver accepts at most 64x64, so a malformed or hostile
+ * sequence cannot make it allocate without bound. This is display-only data
+ * and is never trusted for anything but drawing. */
+#define DRAG_ICON_CHUNK     12
+#define DRAG_ICON_MAX_DIM   2048
+#define DRAG_ICON_MAX_PIXELS DROP_DRAG_IMAGE_MAX_PIXELS
+#define DRAG_ICON_MAX_FRAMES 12288
+
+struct DragIconData {
+    int w = 0, h = 0;
+    std::vector<uint8_t> px;      /* BGRA, top-down; premultiplied for the
+                                   * real drag image, straight for icons */
+
+    bool valid() const
+    {
+        return w > 0 && h > 0 && w <= DRAG_ICON_MAX_DIM &&
+               h <= DRAG_ICON_MAX_DIM &&
+               (uint64_t)w * (uint64_t)h <= DRAG_ICON_MAX_PIXELS &&
+               px.size() == (size_t)w * (size_t)h * 4;
+    }
+    void clear()
+    {
+        w = h = 0;
+        px.clear();
+    }
+};
+
+/* Receiver-side reassembly. Not thread-safe by itself: the forward path uses
+ * it on the target's session thread and the reverse path under g_rev_mtx. */
+struct DragIconAccum {
+    int    w = 0, h = 0;
+    size_t need = 0;
+    int    frames_left = 0;
+    std::vector<uint8_t> buf;
+
+    void reset()
+    {
+        w = h = 0;
+        need = 0;
+        frames_left = 0;
+        buf.clear();
+    }
+
+    bool begin(uint32_t width, uint32_t height, uint32_t frames)
+    {
+        reset();
+        if (width < 1 || height < 1 || width > DRAG_ICON_MAX_DIM ||
+            height > DRAG_ICON_MAX_DIM ||
+            (uint64_t)width * (uint64_t)height > DRAG_ICON_MAX_PIXELS)
+            return false;
+        const size_t bytes = (size_t)width * height * 4;
+        const uint32_t max_frames =
+            (uint32_t)((bytes + DRAG_ICON_CHUNK - 1) / DRAG_ICON_CHUNK);
+        if (frames < 1 || frames > max_frames ||
+            frames > DRAG_ICON_MAX_FRAMES)
+            return false;
+        w = (int)width;
+        h = (int)height;
+        need = bytes;
+        frames_left = (int)frames;
+        return true;
+    }
+
+    /* Feed one 12-byte frame; true when this frame completed the image. */
+    bool feed(const uint8_t chunk[DRAG_ICON_CHUNK])
+    {
+        if (frames_left <= 0) return false;
+        const size_t room = need - buf.size();
+        if (room)
+            buf.insert(buf.end(), chunk,
+                       chunk + std::min(room, (size_t)DRAG_ICON_CHUNK));
+        if (--frames_left == 0) return buf.size() == need;
+        return false;
+    }
+
+    bool take(DragIconData &out)
+    {
+        if (buf.size() != need || w <= 0 || h <= 0) return false;
+        out.w = w;
+        out.h = h;
+        out.px.swap(buf);
+        reset();
+        return true;
+    }
+};
+
+/* Raw bytes in a/b/c, matching the DRAG_TEXT convention in each direction:
+ * queued controller events are htonl'ed field by field by drainLoop, while
+ * the reverse watcher writes payload bytes untouched. */
+static void dragIconPack(KvmEvent &e, const uint8_t chunk[DRAG_ICON_CHUNK])
+{
+    e.a = e.b = e.c = 0;
+    std::memcpy(&e.a, chunk, 4);
+    std::memcpy(&e.b, chunk + 4, 4);
+    std::memcpy(&e.c, chunk + 8, 4);
+}
+
+/* DRAG_IMAGE_INFO packs a dimension and the signed cursor hotspot into one
+ * 32-bit word: low 16 bits = dimension, high 16 = int16 offset. */
+static uint32_t dragImageDimOff(int dim, int off)
+{
+    if (dim < 0) dim = 0;
+    if (dim > 0xFFFF) dim = 0xFFFF;
+    return ((uint32_t)dim & 0xFFFFu) |
+           ((uint32_t)(uint16_t)(int16_t)off << 16);
+}
+
+static void dragImageUnpackDimOff(uint32_t v, int &dim, int &off)
+{
+    dim = (int)(v & 0xFFFFu);
+    off = (int)(int16_t)(v >> 16);
+}
+
+static bool dragIconHeaderOk(uint32_t w, uint32_t h, uint32_t frames)
+{
+    if (w < 1 || h < 1 || w > DRAG_ICON_MAX_DIM || h > DRAG_ICON_MAX_DIM ||
+        (uint64_t)w * h > DRAG_ICON_MAX_PIXELS)
+        return false;
+    const uint64_t bytes = (uint64_t)w * h * 4;
+    const uint64_t max_frames = (bytes + DRAG_ICON_CHUNK - 1) /
+                                DRAG_ICON_CHUNK;
+    return frames >= 1 && frames <= max_frames &&
+           frames <= DRAG_ICON_MAX_FRAMES;
+}
+
+/* 48 px is what the ghost card displays; asking for more only inflates the
+ * payload. The shell may still return a larger bitmap (BIGGERSIZEOK), so this
+ * box-filter downscale keeps alpha edges clean. */
+static void dragIconFit(std::vector<uint8_t> &px, int &w, int &h, int max_dim)
+{
+    if (w <= max_dim && h <= max_dim) return;
+    const double scale = std::min((double)max_dim / w, (double)max_dim / h);
+    int nw = (int)(w * scale + 0.5);
+    int nh = (int)(h * scale + 0.5);
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    std::vector<uint8_t> out((size_t)nw * nh * 4, 0);
+    for (int y = 0; y < nh; y++) {
+        const int y0 = (int)((long long)y * h / nh);
+        int y1 = (int)((long long)(y + 1) * h / nh);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (int x = 0; x < nw; x++) {
+            const int x0 = (int)((long long)x * w / nw);
+            int x1 = (int)((long long)(x + 1) * w / nw);
+            if (x1 <= x0) x1 = x0 + 1;
+            unsigned long long alpha = 0, red = 0, green = 0, blue = 0;
+            unsigned count = 0;
+            for (int sy = y0; sy < y1; sy++) {
+                const uint8_t *row = &px[((size_t)sy * w + x0) * 4];
+                for (int sx = x0; sx < x1; sx++, row += 4) {
+                    const unsigned sa = row[3];
+                    alpha += sa;
+                    blue += row[0] * sa;
+                    green += row[1] * sa;
+                    red += row[2] * sa;
+                    count++;
+                }
+            }
+            uint8_t *d = &out[((size_t)y * nw + x) * 4];
+            if (!count || !alpha) continue;
+            d[0] = (uint8_t)(blue / alpha);
+            d[1] = (uint8_t)(green / alpha);
+            d[2] = (uint8_t)(red / alpha);
+            d[3] = (uint8_t)(alpha / count);
+        }
+    }
+    px.swap(out);
+    w = nw;
+    h = nh;
+}
+
+static bool dragIconFromBitmap(HBITMAP hbm, DragIconData &out)
+{
+    out.clear();
+    BITMAP bm = {};
+    if (!hbm || !GetObjectW(hbm, sizeof(bm), &bm)) return false;
+    int w = bm.bmWidth, h = bm.bmHeight;
+    if (w < 1 || h < 1 || w > 1024 || h > 1024) return false;
+
+    std::vector<uint8_t> px((size_t)w * h * 4, 0);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;          /* top-down */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return false;
+    HDC mem = CreateCompatibleDC(screen);
+    bool ok = false;
+    if (mem) {
+        ok = GetDIBits(mem, hbm, 0, (UINT)h, px.data(), &bi,
+                       DIB_RGB_COLORS) == h;
+        DeleteDC(mem);
+    }
+    ReleaseDC(nullptr, screen);
+    if (!ok) return false;
+
+    /* Most shell images carry a real alpha channel. A device-dependent
+     * bitmap (some legacy icon handlers) leaves alpha at 0 everywhere; treat
+     * that as opaque instead of rendering an invisible ghost. */
+    bool any_alpha = false;
+    for (size_t i = 3; i < px.size(); i += 4)
+        if (px[i]) { any_alpha = true; break; }
+    if (!any_alpha)
+        for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;
+
+    dragIconFit(px, w, h, 48);
+    out.w = w;
+    out.h = h;
+    out.px.swap(px);
+    return out.valid();
+}
+
+/* Ask the shell for exactly what Explorer would show for the item: its
+ * thumbnail when a provider exists, otherwise its icon. Shell providers can
+ * take a while (network/cloud items), so every caller runs this off the input
+ * loop. Returns false without touching `out` on any failure. */
+static bool dragIconExtract(const std::string &path, DragIconData &out)
+{
+    out.clear();
+    if (path.empty()) return false;
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                                      (int)path.size(), nullptr, 0);
+    if (n <= 0) return false;
+    std::wstring wpath((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), (int)path.size(),
+                        &wpath[0], n);
+
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    /* RPC_E_CHANGED_MODE means this thread already has COM in another mode;
+     * the shell factory still works, but we must not uninitialise it. */
+    const bool uninit = SUCCEEDED(com);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) return false;
+
+    bool ok = false;
+    IShellItem *item = nullptr;
+    HRESULT hr = SHCreateItemFromParsingName(wpath.c_str(), nullptr,
+                                             IID_IShellItem,
+                                             (void **)&item);
+    if (SUCCEEDED(hr) && item) {
+        IShellItemImageFactory *factory = nullptr;
+        hr = item->QueryInterface(IID_IShellItemImageFactory,
+                                  (void **)&factory);
+        if (SUCCEEDED(hr) && factory) {
+            SIZE req = {48, 48};
+            HBITMAP hbm = nullptr;
+            hr = factory->GetImage(req, SIIGBF_BIGGERSIZEOK, &hbm);
+            if (FAILED(hr) || !hbm)
+                hr = factory->GetImage(req, SIIGBF_ICONONLY, &hbm);
+            if (SUCCEEDED(hr) && hbm) {
+                ok = dragIconFromBitmap(hbm, out);
+                DeleteObject(hbm);
+            }
+            factory->Release();
+        }
+        item->Release();
+    }
+    if (uninit) CoUninitialize();
+    if (!ok) out.clear();
+    return ok;
+}
+
+/* Bounded variant for callers that must never wait on a shell provider
+ * forever (the reverse watcher, and the worker's join at session teardown).
+ * The extraction runs on a short-lived thread with its own COM apartment. On
+ * timeout the thread is detached; its shared context keeps the result alive
+ * and nothing in the caller is referenced after the return. */
+static bool dragIconExtractTimed(const std::string &path, DragIconData &out,
+                                 int timeout_ms)
+{
+    struct Task {
+        std::mutex m;
+        std::condition_variable cv;
+        DragIconData icon;
+        bool done = false;
+        bool ok = false;
+    };
+    auto task = std::make_shared<Task>();
+    std::thread worker([task, path] {
+        DragIconData icon;
+        const bool ok = dragIconExtract(path, icon);
+        {
+            std::lock_guard<std::mutex> lk(task->m);
+            task->icon = std::move(icon);
+            task->ok = ok;
+            task->done = true;
+        }
+        task->cv.notify_one();
+    });
+    bool finished = false;
+    {
+        std::unique_lock<std::mutex> lk(task->m);
+        finished = task->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                                     [&] { return task->done; });
+        if (finished && task->ok) out = std::move(task->icon);
+    }
+    if (finished) worker.join();
+    else worker.detach();
+    return finished && out.valid();
+}
+
 enum class ControlState { Local, Remote };
 
 EventQueue              g_queue;
+
+/* Queue an icon for the forward (controller → target) direction. Called only
+ * on the message-loop thread, the ring's single producer. If the ring has no
+ * room for the whole sequence plus the same headroom pushMove keeps for input
+ * events, skip the icon: a visual payload must never push out a button-up. */
+static bool dragIconQueue(const DragIconData &icon)
+{
+    if (!icon.valid()) return false;
+    const size_t bytes = icon.px.size();
+    const uint32_t frames =
+        (uint32_t)((bytes + DRAG_ICON_CHUNK - 1) / DRAG_ICON_CHUNK);
+    if (!dragIconHeaderOk((uint32_t)icon.w, (uint32_t)icon.h, frames))
+        return false;
+    if (g_queue.freeSlots() < frames + 1 + 1024) return false;
+
+    KvmEvent info = {};
+    info.type = KVM_EV_DRAG_ICON_INFO;
+    info.a = (uint32_t)icon.w;
+    info.b = (uint32_t)icon.h;
+    info.c = frames;
+    if (!g_queue.push(info)) return false;
+    for (uint32_t i = 0; i < frames; i++) {
+        uint8_t chunk[DRAG_ICON_CHUNK] = {};
+        const size_t off = (size_t)i * DRAG_ICON_CHUNK;
+        if (off < bytes)
+            std::memcpy(chunk, icon.px.data() + off,
+                        std::min((size_t)DRAG_ICON_CHUNK, bytes - off));
+        KvmEvent e = {};
+        e.type = KVM_EV_DRAG_ICON_DATA;
+        dragIconPack(e, chunk);
+        if (!g_queue.push(e)) return false;
+    }
+    return true;
+}
+
+/* Direct socket variant used by the target's reverse watcher. Only `type`,
+ * and the INFO dimensions, are byte-swapped: DRAG_TEXT payloads on this
+ * direction travel untouched, and the controller's drainLoop reads them the
+ * same way. tx serialises these writes with PONG. */
+static bool dragIconSendDirect(kvm_sock_t s, const DragIconData &icon,
+                               std::mutex &tx)
+{
+    if (!icon.valid()) return false;
+    const size_t bytes = icon.px.size();
+    const uint32_t frames =
+        (uint32_t)((bytes + DRAG_ICON_CHUNK - 1) / DRAG_ICON_CHUNK);
+    if (!dragIconHeaderOk((uint32_t)icon.w, (uint32_t)icon.h, frames))
+        return false;
+
+    KvmEvent info = {};
+    info.type = htonl(KVM_EV_DRAG_ICON_INFO);
+    info.a = htonl((uint32_t)icon.w);
+    info.b = htonl((uint32_t)icon.h);
+    info.c = htonl(frames);
+    {
+        std::lock_guard<std::mutex> lk(tx);
+        if (!kvmSendAll(s, &info, sizeof(info))) return false;
+    }
+    for (uint32_t i = 0; i < frames; i++) {
+        uint8_t chunk[DRAG_ICON_CHUNK] = {};
+        const size_t off = (size_t)i * DRAG_ICON_CHUNK;
+        if (off < bytes)
+            std::memcpy(chunk, icon.px.data() + off,
+                        std::min((size_t)DRAG_ICON_CHUNK, bytes - off));
+        KvmEvent e = {};
+        e.type = htonl(KVM_EV_DRAG_ICON_DATA);
+        dragIconPack(e, chunk);
+        std::lock_guard<std::mutex> lk(tx);
+        if (!kvmSendAll(s, &e, sizeof(e))) return false;
+    }
+    return true;
+}
+
+/* Forward (controller → target) real drag image: same queue/framing as the
+ * icon, but the payload is already premultiplied and the INFO word carries the
+ * cursor hotspot. */
+static bool dragImageQueue(const DropDragImage &img)
+{
+    if (!img.valid()) return false;
+    const size_t bytes = img.px.size();
+    const uint32_t frames =
+        (uint32_t)((bytes + DRAG_ICON_CHUNK - 1) / DRAG_ICON_CHUNK);
+    if (!dragIconHeaderOk((uint32_t)img.w, (uint32_t)img.h, frames))
+        return false;
+    if (g_queue.freeSlots() < frames + 1 + 1024) return false;
+    KvmEvent info = {};
+    info.type = KVM_EV_DRAG_IMAGE_INFO;
+    info.a = dragImageDimOff(img.w, img.ox);
+    info.b = dragImageDimOff(img.h, img.oy);
+    info.c = frames;
+    if (!g_queue.push(info)) return false;
+    for (uint32_t i = 0; i < frames; i++) {
+        uint8_t chunk[DRAG_ICON_CHUNK] = {};
+        const size_t off = (size_t)i * DRAG_ICON_CHUNK;
+        if (off < bytes)
+            std::memcpy(chunk, img.px.data() + off,
+                        std::min((size_t)DRAG_ICON_CHUNK, bytes - off));
+        KvmEvent e = {};
+        e.type = KVM_EV_DRAG_IMAGE_DATA;
+        dragIconPack(e, chunk);
+        if (!g_queue.push(e)) return false;
+    }
+    return true;
+}
+
+/* Reverse (target → controller) real drag image, written directly like the
+ * reverse icon frames: only INFO words are byte-swapped. */
+static bool dragImageSendDirect(kvm_sock_t s, const DropDragImage &img,
+                                std::mutex &tx)
+{
+    if (!img.valid()) return false;
+    const size_t bytes = img.px.size();
+    const uint32_t frames =
+        (uint32_t)((bytes + DRAG_ICON_CHUNK - 1) / DRAG_ICON_CHUNK);
+    if (!dragIconHeaderOk((uint32_t)img.w, (uint32_t)img.h, frames))
+        return false;
+    KvmEvent info = {};
+    info.type = htonl(KVM_EV_DRAG_IMAGE_INFO);
+    info.a = htonl(dragImageDimOff(img.w, img.ox));
+    info.b = htonl(dragImageDimOff(img.h, img.oy));
+    info.c = htonl(frames);
+    {
+        std::lock_guard<std::mutex> lk(tx);
+        if (!kvmSendAll(s, &info, sizeof(info))) return false;
+    }
+    for (uint32_t i = 0; i < frames; i++) {
+        uint8_t chunk[DRAG_ICON_CHUNK] = {};
+        const size_t off = (size_t)i * DRAG_ICON_CHUNK;
+        if (off < bytes)
+            std::memcpy(chunk, img.px.data() + off,
+                        std::min((size_t)DRAG_ICON_CHUNK, bytes - off));
+        KvmEvent e = {};
+        e.type = htonl(KVM_EV_DRAG_IMAGE_DATA);
+        dragIconPack(e, chunk);
+        std::lock_guard<std::mutex> lk(tx);
+        if (!kvmSendAll(s, &e, sizeof(e))) return false;
+    }
+    return true;
+}
+
 std::atomic<bool>       g_netOK{true};
 std::atomic<bool>       g_heartbeat{false};
 const std::atomic<bool> *g_running = nullptr;   /* true = keep the session */
@@ -277,6 +750,13 @@ int      g_remote_y = 0;
 int      g_drop_rel_x = 0;
 int      g_drop_rel_y = 0;
 int      g_edge_overshoot = 0;
+/* File-drag return hysteresis: entering the peer puts the cursor at the
+ * edge (x=0 on a right-side peer), so the plain "nx < 0" check hands control
+ * straight back on ANY leftward motion and the drop is cancelled before the
+ * user can aim. While a file gesture is active, returning instead requires a
+ * deliberate pushback of this many target pixels (accumulated). */
+int      g_back_overshoot = 0;
+#define  KVM_BACK_DRAG_HYSTERESIS 24
 DWORD    g_leave_tick = 0;
 bool     g_cursor_hidden = false;
 
@@ -307,6 +787,7 @@ bool g_btn_local[8] = {};
 #define KVM_WM_DISCONNECT (WM_APP + 1)
 #define KVM_WM_PANIC      (WM_APP + 2)
 #define KVM_WM_DROP       (WM_APP + 3)
+#define KVM_WM_DRAG_ICON  (WM_APP + 4)
 #define KVM_TIMER_ID      1
 
 /* File-drop capability negotiated after KvmReply. The token is per session and
@@ -317,10 +798,60 @@ uint8_t g_drop_token[DROP_TOKEN_BYTES] = {};
 uint16_t g_drop_port = (uint16_t)DROP_PORT;
 std::string g_peer_ip;
 std::vector<std::string> g_drag_files;
-std::atomic<bool> g_drop_cancel{false};
+/* Drag-ghost icon: both directions require the peer's KVM_FEATURE_DRAG_ICON
+ * echo. g_drag_gen invalidates an extraction that finishes after its drag
+ * ended (or after a new drag began); both are read by the extractor thread. */
+std::atomic<bool>     g_drag_icon{false};
+std::atomic<bool>     g_drag_image{false};   /* real source drag image */
+std::atomic<uint64_t> g_drag_gen{0};
+/* true = the 8085 transfer may keep running. dropSendFiles takes a
+ * running flag (true = continue), so this must NOT be the inverse "cancel"
+ * flag: startFileDrop sets it before every transfer, and panic/disconnect/
+ * teardown clear it to abort the copy. */
+std::atomic<bool> g_drop_run{false};
 std::atomic<bool> g_drop_active{false};
 std::atomic<bool> g_discard_drag{false};
 std::thread g_drop_thread;
+
+/* Reverse (target → controller) drag copy, negotiated per session. The
+ * target's edge helper announces KVM_EV_RDRAG; while it is set we suppress
+ * back-crossing so the target's OLE drag can finish on release, then our own
+ * 8085 listener receives the files (token is the same 8084 session token). */
+bool g_reverse_ok = false;
+std::atomic<bool> g_reverse_drag{false};
+std::atomic<bool> g_drop_service_run{false};
+std::thread g_drop_service;
+
+/* Reverse drag ghost, drawn on THIS desktop (the controller) while the target
+ * carries a drag back to us. The target sends the name in DRAG_INFO/TEXT
+ * frames; the message loop renders it next to the local cursor. The ghost
+ * helpers live in the target half of this file (same unnamed namespace). */
+static void ghostShow(int x, int y, int count);
+static void ghostMove(int x, int y);
+static void ghostHide();
+static void ghostSetText(const std::string &name, int count);
+static void ghostSetIcon(const DragIconData &icon);
+static void ghostSetRealImage(const DragIconData &image, int ox, int oy);
+static void ghostEnd();
+std::mutex  g_rev_mtx;
+std::string g_rev_name;
+int         g_rev_count = 0;
+int         g_rev_frames = 0;
+bool        g_rev_ready = false;
+bool        g_rev_visible = false;
+/* Reverse icon frames arrive after the name, so keep the raster and a version
+ * the 50 ms ghost tick can notice while the card is already visible. */
+DragIconAccum g_rev_icon_acc;      /* guarded by g_rev_mtx */
+DragIconData  g_rev_icon;          /* guarded by g_rev_mtx */
+uint64_t      g_rev_icon_ver = 0;  /* guarded by g_rev_mtx */
+uint64_t      g_rev_icon_applied = 0; /* message loop only */
+/* Real source drag image for a reverse drag, same lifetime rules. */
+DragIconAccum g_rev_image_acc;     /* guarded by g_rev_mtx */
+DragIconData  g_rev_image;         /* guarded by g_rev_mtx */
+int           g_rev_img_ox = 0;    /* guarded by g_rev_mtx */
+int           g_rev_img_oy = 0;    /* guarded by g_rev_mtx */
+uint64_t      g_rev_image_ver = 0; /* guarded by g_rev_mtx */
+uint64_t      g_rev_image_applied = 0; /* message loop only */
 
 /* The helper's DragEnter is delivered by Explorer's OLE drag loop and travels
  * back over a named pipe, so it can arrive a few milliseconds *after* the raw
@@ -476,6 +1007,177 @@ static void syncHeldInput(bool arm_left = true)
     }
 }
 
+/* Shell image extraction is potentially slow (thumbnail providers, network
+ * paths), so it never runs on the hook/message thread. The worker extracts
+ * off-thread and posts the finished raster back; the message loop is still
+ * the only producer of KVM events, so the SPSC ring stays single-producer. */
+struct DragIconPost {
+    uint64_t    gen;
+    DragIconData icon;
+};
+
+class DragIconWorker {
+public:
+    void start()
+    {
+        stop();
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            run_ = true;
+            has_ = false;
+            path_.clear();
+        }
+        th_ = std::thread([this] { run(); });
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (!run_) return;
+            run_ = false;
+        }
+        cv_.notify_all();
+        if (th_.joinable()) th_.join();
+    }
+
+    void request(const std::string &path, uint64_t gen)
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (!run_) return;
+            path_ = path;
+            gen_ = gen;
+            has_ = true;
+        }
+        cv_.notify_one();
+    }
+
+    void cancel()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        has_ = false;
+        path_.clear();
+    }
+
+private:
+    void run()
+    {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        for (;;) {
+            std::string path;
+            uint64_t gen = 0;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [this] { return !run_ || has_; });
+                if (!run_) break;
+                path.swap(path_);
+                gen = gen_;
+                has_ = false;
+            }
+            DragIconData icon;
+            /* Bounded so session teardown can join this thread even when a
+             * network/cloud thumbnail provider hangs. */
+            if (!dragIconExtractTimed(path, icon, 800)) continue;
+            if (!g_drag_icon ||
+                gen != g_drag_gen.load(std::memory_order_relaxed))
+                continue;
+            DragIconPost *post = new DragIconPost{gen, std::move(icon)};
+            if (!g_hwnd ||
+                !PostMessageW(g_hwnd, KVM_WM_DRAG_ICON, 0, (LPARAM)post))
+                delete post;
+        }
+        if (SUCCEEDED(com)) CoUninitialize();
+    }
+
+    std::mutex              m_;
+    std::condition_variable cv_;
+    std::thread             th_;
+    bool                    run_ = false;
+    bool                    has_ = false;
+    std::string             path_;
+    uint64_t                gen_ = 0;
+};
+static DragIconWorker g_drag_icon_worker;
+
+/* ── drag ghost (visual only, controller → target) ─────────────────────────
+ * The local Explorer drag image stays on THIS machine's edge (the cursor is
+ * clamped there), so the person watching the peer's monitor sees a bare
+ * cursor. Tell the target what is being dragged and let it draw a small ghost
+ * next to the injected cursor. Unknown event types are ignored by older
+ * targets, so no capability bit is needed. */
+static std::string ghostBaseName(const std::string &path)
+{
+    size_t end = path.size();
+    while (end > 0 && (path[end - 1] == '/' || path[end - 1] == '\\')) end--;
+    const size_t sep = path.find_last_of("/\\", end ? end - 1 : 0);
+    std::string name = path.substr(sep == std::string::npos ? 0 : sep + 1,
+                                   end - (sep == std::string::npos ? 0
+                                                                  : sep + 1));
+    /* Keep whole UTF-8 characters when truncating to what the frames hold. */
+    const size_t max_bytes = 4 * 12;
+    if (name.size() > max_bytes) {
+        size_t cut = max_bytes;
+        while (cut > 0 && ((unsigned char)name[cut] & 0xC0) == 0x80) cut--;
+        name.resize(cut);
+    }
+    return name;
+}
+
+static void sendDragGhost(bool begin)
+{
+    KvmEvent info = {};
+    info.type = KVM_EV_DRAG_INFO;
+    info.a = begin ? 1u : 0u;
+    info.b = (uint32_t)g_drag_files.size();
+    info.c = 0;
+    std::string name;
+    if (begin && !g_drag_files.empty()) {
+        name = ghostBaseName(g_drag_files.front());
+        info.c = 4;                      /* fixed number of text frames */
+    }
+    if (!begin) {
+        /* Invalidate an extraction still in flight for the drag that just
+         * ended: the worker drops it unless the generation still matches. */
+        ++g_drag_gen;
+        g_drag_icon_worker.cancel();
+    }
+    g_queue.push(info);
+    if (!begin) return;
+    for (int i = 0; i < 4; i++) {
+        char chunk[12] = {};
+        const size_t off = (size_t)i * 12;
+        if (off < name.size())
+            std::memcpy(chunk, name.data() + off,
+                        std::min<size_t>(12, name.size() - off));
+        KvmEvent t = {};
+        t.type = KVM_EV_DRAG_TEXT;
+        std::memcpy(&t.a, chunk, 4);
+        std::memcpy(&t.b, chunk + 4, 4);
+        std::memcpy(&t.c, chunk + 8, 4);
+        g_queue.push(t);
+    }
+    /* The name card is on its way. Prefer the SOURCE's real drag image (it
+     * already contains the icon/thumbnail, label, shadow and transparency);
+     * fall back to extracting our own icon when the source did not provide
+     * one or the queue cannot take the burst. */
+    const uint64_t gen = ++g_drag_gen;
+    DropDragImage real;
+    const bool have_real =
+        g_drag_image && dropHelperTakeDragImage(real) && real.valid();
+    if (!g_drag_image) {
+        DropDragImage ignored;
+        dropHelperTakeDragImage(ignored);   /* clear stale state */
+    }
+    if (have_real && dragImageQueue(real)) {
+        g_drag_icon_worker.cancel();
+    } else if (g_drag_icon && !g_drag_files.empty()) {
+        g_drag_icon_worker.request(g_drag_files.front(), gen);
+    } else {
+        g_drag_icon_worker.cancel();
+    }
+}
+
 /* Resolves the short post-crossing grace window (see g_btn_arm_pending). Runs
  * on the message-loop thread from WM_INPUT / WM_TIMER, never in a hook. */
 static void pollPendingDrag()
@@ -488,6 +1190,7 @@ static void pollPendingDrag()
         g_pending_drag_moves.clear();
         g_file_drag = true;
         g_drag_files.swap(files);
+        sendDragGhost(true);
         emitStat("event=drop|state=ready|items=" +
                  std::to_string(g_drag_files.size()));
         /* The physical release can land while the captured list is still in
@@ -520,6 +1223,7 @@ static void pollPendingDrag()
 static void enterRemote()
 {
     if (g_state == ControlState::Remote) return;
+    g_back_overshoot = 0;
 
     /* A file drag is the one gesture where re-arming the held left button is
      * wrong: the target never received its DOWN, and the local Explorer drag
@@ -552,6 +1256,7 @@ static void enterRemote()
             !files.empty()) {
             g_file_drag = true;
             g_drag_files.swap(files);
+            sendDragGhost(true);
             emitStat("event=drop|state=ready|items=" +
                      std::to_string(g_drag_files.size()));
         } else {
@@ -595,7 +1300,8 @@ static void enterRemote()
     emitStitchState("remote");
 }
 
-static void leaveRemote(bool warpCursor, bool keepCapturedDrag = false)
+static void leaveRemote(bool warpCursor, bool keepCapturedDrag = false,
+                        bool keepHeldInput = false)
 {
     if (g_state != ControlState::Remote) return;
     g_state = ControlState::Local;
@@ -608,12 +1314,24 @@ static void leaveRemote(bool warpCursor, bool keepCapturedDrag = false)
         g_file_drag = false;
         g_drag_files.clear();
     }
+    /* A plain return invalidates any reverse-drag state: a late RDRAG(1) (or
+     * a missed RDRAG(0) on a cancelled drag) must never keep the cursor
+     * trapped on the peer. `keepHeldInput` is the exception — the target's
+     * OLE drag is still live there and must survive until our release. */
+    if (!keepHeldInput) g_reverse_drag = false;
+    /* Back-crossing with a live capture arms the "returning" release path in
+     * mouseProc: releasing after the return must still complete the copy
+     * (KVM_WM_DROP), not be swallowed as an ordinary local click. */
+    g_drag_returning = keepCapturedDrag && g_btn_down[1] && g_file_drag &&
+                       !g_drag_files.empty();
     g_btn_arm_pending = false;
     g_pending_drag_moves.clear();
 
-    KvmEvent e = {};
-    e.type = KVM_EV_RELEASE_ALL;
-    g_queue.push(e);
+    if (!keepHeldInput) {
+        KvmEvent e = {};
+        e.type = KVM_EV_RELEASE_ALL;
+        g_queue.push(e);
+    }
 
     if (warpCursor) {
         /* Park the pointer on the local edge the peer is attached to, so it
@@ -636,7 +1354,92 @@ static void leaveRemote(bool warpCursor, bool keepCapturedDrag = false)
     setCursorVisible(true);
     g_leave_tick = GetTickCount();
     g_edge_overshoot = 0;
+    g_back_overshoot = 0;
     emitStitchState("local");
+}
+
+/* Keeps the reverse-drag ghost on the local cursor while a target drag is
+ * being carried back, and drops it the moment the gesture ends. Runs on the
+ * message loop (WM_TIMER); the ghost itself is created lazily on first show. */
+static void reverseGhostTick()
+{
+    const bool armed = g_reverse_drag.load() && g_btn_down[1] &&
+                       g_state == ControlState::Local;
+    if (!armed) {
+        if (g_rev_visible) {
+            ghostHide();
+            g_rev_visible = false;
+        }
+        return;
+    }
+    POINT p = {};
+    if (!GetCursorPos(&p)) return;
+    if (!g_rev_visible) {
+        bool ready = false;
+        std::string name;
+        int count = 0;
+        DragIconData icon, real;
+        int real_ox = 0, real_oy = 0;
+        uint64_t ver = 0, image_ver = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_rev_mtx);
+            ready = g_rev_ready;
+            name = g_rev_name;
+            count = g_rev_count;
+            ver = g_rev_icon_ver;
+            image_ver = g_rev_image_ver;
+            if (g_rev_icon.valid()) icon = g_rev_icon;
+            if (g_rev_image.valid()) {
+                real = g_rev_image;
+                real_ox = g_rev_img_ox;
+                real_oy = g_rev_img_oy;
+            }
+        }
+        if (!ready) return;         /* name frames still in flight */
+        ghostSetText(name, count);
+        ghostSetIcon(icon);
+        ghostSetRealImage(real, real_ox, real_oy);
+        ghostShow(p.x, p.y, count);
+        g_rev_icon_applied = ver;
+        g_rev_image_applied = image_ver;
+        g_rev_visible = true;
+    } else {
+        /* The raster normally lands after the card is already visible. A new
+         * reverse drag can also begin before a tick hid the previous card, so
+         * refresh the name too whenever the frames have completed. */
+        DragIconData icon, real;
+        int real_ox = 0, real_oy = 0;
+        uint64_t ver = 0, image_ver = 0;
+        bool ready = false;
+        bool image_changed = false;
+        std::string name;
+        int count = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_rev_mtx);
+            ready = g_rev_ready;
+            name = g_rev_name;
+            count = g_rev_count;
+            ver = g_rev_icon_ver;
+            image_ver = g_rev_image_ver;
+            image_changed = (image_ver != g_rev_image_applied);
+            if (g_rev_icon.valid()) icon = g_rev_icon;
+            if (image_changed && g_rev_image.valid()) {
+                real = g_rev_image;
+                real_ox = g_rev_img_ox;
+                real_oy = g_rev_img_oy;
+            }
+        }
+        if (ready) ghostSetText(name, count);
+        if (ver != g_rev_icon_applied) {
+            ghostSetIcon(icon);
+            g_rev_icon_applied = ver;
+        }
+        if (image_changed) {
+            ghostSetRealImage(real, real_ox, real_oy);
+            g_rev_image_applied = image_ver;
+        }
+        ghostMove(p.x, p.y);
+    }
 }
 
 static void moveRemote(int dx, int dy)
@@ -644,18 +1447,41 @@ static void moveRemote(int dx, int dy)
     int nx = g_remote_x + dx;
     int ny = g_remote_y + dy;
 
-    /* Pushing back out of the edge the cursor came in from hands control to
-     * the controller: left edge for a peer on the right, and so on. */
-    bool back = false;
+    /* Distance past the edge the cursor came in from (>0 = pushing back out:
+     * left edge for a peer on the right, and so on). */
+    int out = 0;
     switch (g_side) {
-    case KVM_SIDE_LEFT:   back = (nx > (int)g_tgt_w - 1); break;
-    case KVM_SIDE_TOP:    back = (ny > (int)g_tgt_h - 1); break;
-    case KVM_SIDE_BOTTOM: back = (ny < 0);                break;
-    default:              back = (nx < 0);                break;
+    case KVM_SIDE_LEFT:   out = nx - ((int)g_tgt_w - 1); break;
+    case KVM_SIDE_TOP:    out = ny - ((int)g_tgt_h - 1); break;
+    case KVM_SIDE_BOTTOM: out = -ny; break;
+    default:              out = -nx; break;
     }
-    if (back) {
-        leaveRemote(true, /*keepCapturedDrag=*/true);
-        return;
+    const bool file_gesture =
+        g_file_drag || g_btn_arm_pending || g_btn_down[1];
+    if (out > 0) {
+        if (!file_gesture) {
+            /* A reverse drag crossing back CARRIES the file to this desktop:
+             * return control, keep the target's button held (so its OLE drag
+             * survives) and let the local release choose the drop point. */
+            if (g_reverse_drag.load() && g_btn_down[1])
+                leaveRemote(false, false, /*keepHeldInput=*/true);
+            else
+                leaveRemote(true, /*keepCapturedDrag=*/true);
+            return;
+        }
+        /* g_remote_x is clamped to the edge, so `out` is this sample's
+         * outward delta; only an accumulated, deliberate pushback returns.
+         * A natural one-pixel pullback no longer cancels the file copy. */
+        g_back_overshoot += out;
+        if (g_back_overshoot >= KVM_BACK_DRAG_HYSTERESIS) {
+            if (g_reverse_drag.load() && g_btn_down[1])
+                leaveRemote(false, false, /*keepHeldInput=*/true);
+            else
+                leaveRemote(true, /*keepCapturedDrag=*/true);
+            return;
+        }
+    } else {
+        g_back_overshoot = 0;
     }
     nx = clampInt(nx, 0, (int)g_tgt_w - 1);
     ny = clampInt(ny, 0, (int)g_tgt_h - 1);
@@ -720,6 +1546,10 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
     /* Track the physical buttons whatever the mode is — see noteButton. */
     if (btn && !(ms->flags & LLMHF_INJECTED)) {
         noteButton((uint32_t)btn, down);
+        /* A new left press always starts a fresh gesture, so a stale reverse
+         * flag can never pin the cursor at the edge. The release path keeps
+         * its own clearing below (it needs the flag to forward the UP). */
+        if (btn == 1 && down) g_reverse_drag = false;
         /* Remember whether the press actually reached the local desktop; see
          * g_btn_local. A press made in Remote stays false (it was swallowed). */
         if (g_state != ControlState::Remote) {
@@ -737,6 +1567,18 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
             /* A new gesture: a deferred file drag from the previous one can
              * never be completed now. The message loop discards the capture. */
             g_btn_arm_pending = false;
+        }
+        /* Reverse drag carried back to THIS desktop: the local release is the
+         * drop. Forward the UP so the target's OLE Drop fires (its watcher
+         * then sends the files) and swallow it — our desktop never saw the
+         * matching DOWN. The release point is wherever the local cursor is. */
+        if (btn == 1 && !down && g_state != ControlState::Remote &&
+            g_reverse_drag.load()) {
+            g_reverse_drag = false;
+            queueButton(1, false);
+            g_rev_visible = false;
+            ghostHide();
+            return 1;
         }
         if (btn == 1 && !down && g_drag_returning) {
             g_drag_returning = false;
@@ -794,6 +1636,17 @@ LRESULT CALLBACK mouseProc(int code, WPARAM wp, LPARAM lp)
         g_drop_rel_y = g_tgt_y0 + g_remote_y;
         if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DROP, 0, 0);
         return CallNextHookEx(nullptr, code, wp, lp);
+    }
+
+    if (btn == 1 && !down && g_reverse_drag.load()) {
+        /* Reverse drag release: forward the UP so the target's OLE Drop fires
+         * (its watcher then sends the files to our 8085 listener), and hand
+         * control back. Our own desktop had no OLE drag running, so the UP is
+         * swallowed here exactly like any other Remote release. */
+        g_reverse_drag = false;
+        queueButton(1, false);
+        leaveRemote(true);
+        return 1;
     }
 
     if (btn == 1 && !down && g_btn_arm_pending) {
@@ -928,7 +1781,7 @@ static void startFileDrop(int screen_x, int screen_y)
         g_drag_files.clear();
         return;
     }
-    g_drop_cancel = false;
+    g_drop_run = true;
 
     std::vector<std::string> files;
     files.swap(g_drag_files);
@@ -949,7 +1802,7 @@ static void startFileDrop(int screen_x, int screen_y)
         opt.transfer_id = (uint32_t)(GetTickCount64() ^
                                      (uint64_t)GetCurrentProcessId());
         const DropResult r = dropSendFiles(opt, files, token.data(),
-                                           g_drop_cancel);
+                                           g_drop_run);
         std::string line = "event=drop|state=";
         line += (r.status == DROP_OK) ? "done" : "error";
         line += "|items=" + std::to_string(r.committed);
@@ -989,6 +1842,8 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Also resolve the post-crossing drag grace window when the
              * pointer is held still (no WM_INPUT to drive it). */
             pollPendingDrag();
+            /* Reverse drag carried back here: keep the ghost on our cursor. */
+            reverseGhostTick();
             if (!g_running || !g_running->load()) {
                 leaveRemote(false);
                 PostQuitMessage(0);
@@ -996,7 +1851,17 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case KVM_WM_PANIC:
-        g_drop_cancel = true;
+        g_drop_run = false;
+        if (g_reverse_drag.exchange(false)) {
+            /* The target's OLE drag is still holding its injected button:
+             * release it there, or the peer keeps a stuck button. */
+            KvmEvent ra = {};
+            ra.type = KVM_EV_RELEASE_ALL;
+            g_queue.push(ra);
+            ghostHide();
+            g_rev_visible = false;
+        }
+        sendDragGhost(false);
         g_file_drag = false;
         g_drag_files.clear();
         leaveRemote(true);
@@ -1008,6 +1873,7 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * deliberately sends no NODRAG, so this only rejects a cancellation. */
         if (g_file_drag && !dropHelperDragLive()) {
             emitStat("event=drop|state=cancelled|stage=local_release");
+            sendDragGhost(false);
             g_file_drag = false;
             g_drag_files.clear();
             g_btn_arm_pending = false;
@@ -1059,6 +1925,7 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return 0;
             }
         }
+        sendDragGhost(false);
         g_file_drag = false;
         emitStat("event=drop|state=release|x=" +
                  std::to_string(g_drop_rel_x) + "|y=" +
@@ -1068,8 +1935,28 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         leaveRemote(true);
         return 0;
     }
+    case KVM_WM_DRAG_ICON: {
+        /* Finished shell image from the worker. Drop it if the drag it was
+         * extracted for has already ended (or a newer one started). */
+        DragIconPost *post = (DragIconPost *)lp;
+        if (post) {
+            if (g_drag_icon &&
+                post->gen == g_drag_gen.load(std::memory_order_relaxed))
+                dragIconQueue(post->icon);
+            delete post;
+        }
+        return 0;
+    }
     case KVM_WM_DISCONNECT:
-        g_drop_cancel = true;
+        g_drop_run = false;
+        if (g_reverse_drag.exchange(false)) {
+            KvmEvent ra = {};
+            ra.type = KVM_EV_RELEASE_ALL;
+            g_queue.push(ra);
+            ghostHide();
+            g_rev_visible = false;
+        }
+        sendDragGhost(false);
         g_file_drag = false;
         g_drag_files.clear();
         leaveRemote(true);
@@ -1100,7 +1987,10 @@ static void drainLoop()
         FD_ZERO(&ex);
         FD_SET(g_sock, &rd);
         FD_SET(g_sock, &ex);
-        timeval tv = {0, 1000};
+        /* Queued input must not wait a full tick: a drag-icon burst is up to
+         * 769 events and select(1 ms) actually costs ~15 ms on Windows when
+         * no timeBeginPeriod is active (sender.exe never calls it). */
+        timeval tv = {0, g_queue.empty() ? 1000 : 0};
         const int selected = select(0, &rd, nullptr, &ex, &tv);
         if (selected < 0) { disconnected(); break; }
         if (selected > 0) {
@@ -1125,6 +2015,96 @@ static void drainLoop()
                             disconnected();
                             break;
                         }
+                    } else if (type == KVM_EV_RDRAG && g_reverse_ok) {
+                        /* The target's edge helper announced/cancelled a
+                         * reverse drag. While set, the crossing carries the
+                         * drag back here and the local release becomes the
+                         * drop; the flag dies on the next local UP. */
+                        g_reverse_drag = (ntohl(incoming.a) != 0);
+                        if (!g_reverse_drag.load()) {
+                            std::lock_guard<std::mutex> lk(g_rev_mtx);
+                            g_rev_ready = false;
+                            g_rev_name.clear();
+                        }
+                    } else if (type == KVM_EV_DRAG_INFO && g_reverse_ok) {
+                        std::lock_guard<std::mutex> lk(g_rev_mtx);
+                        if (ntohl(incoming.a)) {
+                            g_rev_count = (int)ntohl(incoming.b);
+                            g_rev_frames = (int)ntohl(incoming.c);
+                            g_rev_name.clear();
+                            g_rev_icon_acc.reset();
+                            g_rev_icon.clear();
+                            ++g_rev_icon_ver;
+                            g_rev_image_acc.reset();
+                            g_rev_image.clear();
+                            ++g_rev_image_ver;
+                            g_rev_ready = (g_rev_frames <= 0);
+                        } else {
+                            g_rev_ready = false;
+                            g_rev_name.clear();
+                            g_rev_icon_acc.reset();
+                            g_rev_icon.clear();
+                            ++g_rev_icon_ver;
+                            g_rev_image_acc.reset();
+                            g_rev_image.clear();
+                            ++g_rev_image_ver;
+                        }
+                    } else if (type == KVM_EV_DRAG_TEXT && g_reverse_ok) {
+                        std::lock_guard<std::mutex> lk(g_rev_mtx);
+                        if (g_rev_frames > 0) {
+                            char chunk[12];
+                            std::memcpy(chunk, &incoming.a, 4);
+                            std::memcpy(chunk + 4, &incoming.b, 4);
+                            std::memcpy(chunk + 8, &incoming.c, 4);
+                            g_rev_name.append(chunk, 12);
+                            if (--g_rev_frames == 0) {
+                                while (!g_rev_name.empty() &&
+                                       g_rev_name.back() == '\0')
+                                    g_rev_name.pop_back();
+                                g_rev_ready = true;
+                            }
+                        }
+                    } else if (type == KVM_EV_DRAG_ICON_INFO && g_drag_icon) {
+                        /* Dimensions are htonl'ed; payload bytes are not. */
+                        std::lock_guard<std::mutex> lk(g_rev_mtx);
+                        if (!g_rev_icon_acc.begin(ntohl(incoming.a),
+                                                  ntohl(incoming.b),
+                                                  ntohl(incoming.c)))
+                            g_rev_icon_acc.reset();
+                    } else if (type == KVM_EV_DRAG_ICON_DATA && g_drag_icon) {
+                        std::lock_guard<std::mutex> lk(g_rev_mtx);
+                        if (g_rev_icon_acc.frames_left > 0) {
+                            uint8_t chunk[DRAG_ICON_CHUNK];
+                            std::memcpy(chunk, &incoming.a, 4);
+                            std::memcpy(chunk + 4, &incoming.b, 4);
+                            std::memcpy(chunk + 8, &incoming.c, 4);
+                            if (g_rev_icon_acc.feed(chunk) &&
+                                g_rev_icon_acc.take(g_rev_icon))
+                                ++g_rev_icon_ver; /* the ghost tick notices */
+                        }
+                    } else if (type == KVM_EV_DRAG_IMAGE_INFO && g_drag_image) {
+                        int w = 0, h = 0, ox = 0, oy = 0;
+                        dragImageUnpackDimOff(ntohl(incoming.a), w, ox);
+                        dragImageUnpackDimOff(ntohl(incoming.b), h, oy);
+                        std::lock_guard<std::mutex> lk(g_rev_mtx);
+                        if (!g_rev_image_acc.begin((uint32_t)w, (uint32_t)h,
+                                                   ntohl(incoming.c)))
+                            g_rev_image_acc.reset();
+                        else {
+                            g_rev_img_ox = ox;
+                            g_rev_img_oy = oy;
+                        }
+                    } else if (type == KVM_EV_DRAG_IMAGE_DATA && g_drag_image) {
+                        std::lock_guard<std::mutex> lk(g_rev_mtx);
+                        if (g_rev_image_acc.frames_left > 0) {
+                            uint8_t chunk[DRAG_ICON_CHUNK];
+                            std::memcpy(chunk, &incoming.a, 4);
+                            std::memcpy(chunk + 4, &incoming.b, 4);
+                            std::memcpy(chunk + 8, &incoming.c, 4);
+                            if (g_rev_image_acc.feed(chunk) &&
+                                g_rev_image_acc.take(g_rev_image))
+                                ++g_rev_image_ver;
+                        }
                     } else if (type != KVM_EV_PONG || !g_heartbeat.load()) {
                         disconnected();
                         break;
@@ -1146,17 +2126,30 @@ static void drainLoop()
                 next_beat = now + beat_ms;
             }
         }
-        KvmEvent e;
-        if (!g_queue.pop(e)) continue;
-        KvmEvent wire = {};
-        wire.type = htonl(e.type);
-        wire.a = htonl(e.a);
-        wire.b = htonl(e.b);
-        wire.c = htonl(e.c);
-        if (!kvmSendAll(g_sock, &wire, sizeof(wire))) {
-            disconnected();
-            break;
+        /* Drain everything that is queued now. Sending one event per outer
+         * iteration paced the stream at one select tick per event, so a
+         * 769-frame drag icon held every mouse move and the drop/ghost-end
+         * events behind it for seconds. The producer cannot be starved by
+         * this loop because it only frees ring slots. */
+        bool send_ok = true;
+        for (int i = 0; i < (int)EventQueue::CAP; i++) {
+            KvmEvent e;
+            if (!g_queue.pop(e)) break;
+            KvmEvent wire = {};
+            wire.type = htonl(e.type);
+            wire.a = htonl(e.a);
+            wire.b = htonl(e.b);
+            wire.c = htonl(e.c);
+            if (!kvmSendAll(g_sock, &wire, sizeof(wire))) {
+                disconnected();
+                send_ok = false;
+                break;
+            }
+            if (g_drainQuit.load() ||
+                (g_running && !g_running->load()))
+                break;
         }
+        if (!send_ok) break;
     }
 }
 
@@ -1421,10 +2414,15 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     g_drop_ready = false;
     g_file_drag = false;
     g_drag_files.clear();
+    g_drag_icon = false;
+    g_drag_image = false;
     g_btn_arm_pending = false;
     g_pending_drag_moves.clear();
-    g_drop_cancel = false;
+    g_drop_run = false;
     g_drop_active = false;
+    g_reverse_ok = false;
+    g_reverse_drag = false;
+    g_drop_service_run = false;
     g_drop_port = (uint16_t)DROP_PORT;
     memset(g_drop_token, 0, sizeof(g_drop_token));
 
@@ -1444,6 +2442,9 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             emitStat("event=drop|state=disabled|msg=" + why);
         }
     }
+    /* Reverse direction is independent of the forward helper: we only need to
+     * RECEIVE files, which requires our own 8085 listener, not stitchcap. */
+    const bool reverse_capable = auth && auth->accept_files;
 
     emitStat("event=stitch|state=waiting|mode=stitch|dst=" +
              std::string(peer_ip) + "|side=" + kvmSideKey(g_side));
@@ -1484,9 +2485,16 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
          * then falls back to the default right side. Purely informational;
          * older targets ignore it and behave like the default (right). */
         hello.reserved[0] = htonl((uint32_t)g_side + 1u);
+        /* Features live in the low 16 bits; bits 16..31 carry the port of OUR
+         * reverse-drop listener, so the target knows where to send files even
+         * when this machine also runs receiver.exe on 8085. Old peers only
+         * bit-test the low bits, so the extra word is harmless. */
         hello.reserved[1] = htonl(
-            KVM_FEATURE_HEARTBEAT |
-            (file_drop_capable ? KVM_FEATURE_FILE_DROP : 0u));
+            KVM_FEATURE_HEARTBEAT | KVM_FEATURE_DRAG_ICON |
+            KVM_FEATURE_DRAG_IMAGE |
+            (file_drop_capable ? KVM_FEATURE_FILE_DROP : 0u) |
+            (reverse_capable ? KVM_FEATURE_REVERSE_DROP : 0u) |
+            (reverse_capable ? ((uint32_t)DROP_REVERSE_PORT << 16) : 0u));
         if (!kvmSendAll(g_sock, &hello, sizeof(hello))) {
             emitStatError("拼接握手发送失败");
             kvmClose(g_sock);
@@ -1646,12 +2654,20 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     }
 
     g_heartbeat = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
+    /* The target echoes DRAG_ICON only when it understands the visual icon
+     * frames; an older target never sets it, so we never send them there. */
+    g_drag_icon = (ntohl(reply.reserved) & KVM_FEATURE_DRAG_ICON) != 0;
+    g_drag_image = (ntohl(reply.reserved) & KVM_FEATURE_DRAG_IMAGE) != 0;
 
     /* File-drop token: a fixed 1 + 8 event sequence read before drainLoop()
-     * starts, so no variable-length frame ever enters the 16-byte stream. */
+     * starts, so no variable-length frame ever enters the 16-byte stream.
+     * Read for EITHER direction: a reverse-only session (g_drop_ready = false)
+     * still needs the token for our own 8085 gate. */
     g_drop_ready = file_drop_capable &&
                    (ntohl(reply.reserved) & KVM_FEATURE_FILE_DROP) != 0;
-    if (g_drop_ready) {
+    g_reverse_ok = reverse_capable &&
+                   (ntohl(reply.reserved) & KVM_FEATURE_REVERSE_DROP) != 0;
+    if (g_drop_ready || g_reverse_ok) {
         KvmEvent ev = {};
         int rv2 = kvmRecvAllPoll(g_sock, &ev, sizeof(ev), running, 35000);
         if (rv2 != 1 || ntohl(ev.type) != KVM_EV_DROP_INFO ||
@@ -1661,6 +2677,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
             g_drop_ready = false;
+            g_reverse_ok = false;
             return 1;
         }
         for (int i = 0; i < 8; i++) {
@@ -1671,15 +2688,35 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
                 kvmClose(g_sock);
                 g_sock = KVM_INVALID_SOCK;
                 g_drop_ready = false;
+                g_reverse_ok = false;
                 return 1;
             }
             const uint32_t word = ntohl(ev.b);
             std::memcpy(g_drop_token + i * 4, &word, 4);
         }
-        emitStat("event=drop|state=ready|port=" +
-                 std::to_string((int)g_drop_port));
+        if (g_drop_ready)
+            emitStat("event=drop|state=ready|port=" +
+                     std::to_string((int)g_drop_port));
     } else if (auth && auth->file_drop) {
         emitStat("event=drop|state=disabled|msg=peer does not accept files");
+    }
+
+    /* Reverse (target → controller): if the peer also sends, run OUR 8085
+     * listener with the same session token and let its edge helper drive the
+     * crossing in the opposite direction. */
+    if (g_reverse_ok) {
+        /* Dedicated port: a local receiver.exe already owns 8085 (the usual
+         * always-receiving setup), and binding it here used to fail silently,
+         * leaving the token installed in a process that never served it —
+         * every reverse transfer then got DROP_ERR_AUTH. */
+        dropGateInstall(g_drop_token, /*epoch=*/1);
+        g_drop_service_run = true;
+        g_drop_service = std::thread([] {
+            dropServiceRun(g_drop_service_run,
+                           (uint16_t)DROP_REVERSE_PORT);
+        });
+        emitStat("event=drop|state=reverse_ready|port=" +
+                 std::to_string((int)DROP_REVERSE_PORT));
     }
 
     g_tgt_x0 = (int)(int32_t)ntohl((uint32_t)reply.screen_x);
@@ -1750,6 +2787,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         return 1;
     }
 
+    if (g_drag_icon) g_drag_icon_worker.start();
     g_drain = std::thread(drainLoop);
     SetTimer(g_hwnd, KVM_TIMER_ID, 50, nullptr);
 
@@ -1770,7 +2808,31 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     }
 
     /* ── teardown (also the Ctrl+C / disconnect path) ──────────────────── */
-    g_drop_cancel = true;
+    /* Stop the icon extractor first: it posts to g_hwnd, which is destroyed
+     * below, and join before freeing anything it can still reach. Drop the
+     * global hooks first: the message loop has exited, so keeping them
+     * installed while the bounded extraction join runs would leave system-wide
+     * input waiting on a thread that no longer pumps. */
+    UnhookWindowsHookEx(g_hMouse);
+    UnhookWindowsHookEx(g_hKey);
+    g_hMouse = g_hKey = nullptr;
+    g_drag_icon_worker.stop();
+    g_drag_icon = false;
+    g_drag_image = false;
+    {
+        MSG stale;
+        while (PeekMessageW(&stale, g_hwnd, KVM_WM_DRAG_ICON,
+                            KVM_WM_DRAG_ICON, PM_REMOVE))
+            delete (DragIconPost *)stale.lParam;
+    }
+    g_drop_run = false;
+    g_reverse_drag = false;
+    ghostEnd();          /* releases the cached layered surface too */
+    g_reverse_ok = false;
+    if (g_drop_service_run.exchange(false)) {
+        if (g_drop_service.joinable()) g_drop_service.join();
+    }
+    dropGateClear(/*epoch=*/1);
     g_drop_ready = false;
     g_file_drag = false;
     g_drag_files.clear();
@@ -1787,9 +2849,6 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     /* The target releases every injected input when it observes EOF. Do not
        start another blocking send after the drain thread has stopped. */
     setCursorVisible(true);
-    UnhookWindowsHookEx(g_hMouse);
-    UnhookWindowsHookEx(g_hKey);
-    g_hMouse = g_hKey = nullptr;
 
     RAWINPUTDEVICE rm = {};
     rm.usUsagePage = 1;
@@ -1940,6 +2999,433 @@ static void releaseAll(HeldInput &held)
     }
 }
 
+/* ── drag ghost overlay (visual only) ──────────────────────────────────────
+ * While a file drag crosses the shared edge, its Explorer drag image stays on
+ * the SOURCE machine (the pointer is clamped at the edge), so the person
+ * watching the other monitor only sees a cursor. Draw a small "ghost" next to
+ * the cursor there: a rounded card showing the dragged item's OWN shell image
+ * (its thumbnail when a provider exists, otherwise its icon) plus the name.
+ * The source extracts that image and ships it as BGRA frames; a peer that
+ * cannot provide one keeps the page-glyph fallback.
+ *
+ * The card is composed with GDI into a 32-bit DIB and pushed with
+ * UpdateLayeredWindow, so no message pump is needed on this thread. Moving the
+ * ghost only repositions the cached bitmap; it is recomposed when the name,
+ * count or icon changes. */
+struct DragGhostState {
+    HWND        hwnd = nullptr;
+    int         count = 0;
+    int         frames_left = 0;
+    std::string name;          /* UTF-8, from KVM_EV_DRAG_TEXT frames */
+    DragIconData icon;         /* first item's shell image, if it arrived */
+    DragIconAccum icon_acc;    /* icon frames still in flight */
+    /* Source Explorer's real drag image (premultiplied BGRA), which replaces
+     * the whole card when present. */
+    DragIconData real;
+    DragIconAccum real_acc;
+    int  real_ox = 0, real_oy = 0;
+    int  real_acc_ox = 0, real_acc_oy = 0;
+    bool has_real = false;
+    int         x = 0, y = 0;
+    bool        visible = false;
+
+    /* Cached layered-window surface. */
+    HDC         memdc = nullptr;
+    HBITMAP     dib = nullptr;
+    HGDIOBJ     oldbmp = nullptr;
+    void       *bits = nullptr;
+    int         card_w = 0, card_h = 0;
+    bool        card_valid = false;
+    bool        surface_real = false;   /* cached surface holds `real` */
+};
+static DragGhostState g_ghost;
+
+#define GHOST_H        64
+#define GHOST_R        12
+#define GHOST_ICON     48
+#define GHOST_PAD      12
+#define GHOST_TEXT_GAP 12
+#define GHOST_W_MIN    220
+#define GHOST_W_MAX    380
+
+static bool ghostInside(double px, double py, double w, double h)
+{
+    /* Rounded-rect coverage test in pixel space. */
+    if (px < 0 || py < 0 || px > w || py > h) return false;
+    const double cx = px < GHOST_R ? GHOST_R
+                    : px > w - GHOST_R ? w - GHOST_R : px;
+    const double cy = py < GHOST_R ? GHOST_R
+                    : py > h - GHOST_R ? h - GHOST_R : py;
+    const double dx = px - cx, dy = py - cy;
+    return dx * dx + dy * dy <= (double)GHOST_R * GHOST_R;
+}
+
+static void ghostReleaseSurface()
+{
+    if (g_ghost.memdc) {
+        if (g_ghost.oldbmp) SelectObject(g_ghost.memdc, g_ghost.oldbmp);
+        DeleteDC(g_ghost.memdc);
+    }
+    if (g_ghost.dib) DeleteObject(g_ghost.dib);
+    g_ghost.memdc = nullptr;
+    g_ghost.dib = nullptr;
+    g_ghost.oldbmp = nullptr;
+    g_ghost.bits = nullptr;
+    g_ghost.card_w = g_ghost.card_h = 0;
+    g_ghost.card_valid = false;
+    g_ghost.surface_real = false;
+}
+
+static bool ghostEnsureSurface(int w, int h)
+{
+    if (g_ghost.memdc && g_ghost.dib && g_ghost.card_w == w &&
+        g_ghost.card_h == h)
+        return true;
+
+    ghostReleaseSurface();
+    HDC screen = GetDC(nullptr);
+    if (!screen) return false;
+    HDC mem = CreateCompatibleDC(screen);
+    void *bits = nullptr;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;          /* top-down */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits,
+                                   nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!mem || !dib || !bits) {
+        if (mem) DeleteDC(mem);
+        if (dib) DeleteObject(dib);
+        return false;
+    }
+    g_ghost.memdc = mem;
+    g_ghost.dib = dib;
+    g_ghost.bits = bits;
+    g_ghost.oldbmp = SelectObject(mem, dib);
+    g_ghost.card_w = w;
+    g_ghost.card_h = h;
+    g_ghost.card_valid = false;
+    g_ghost.surface_real = false;
+    return true;
+}
+
+static bool ghostEnsureWindow()
+{
+    if (g_ghost.hwnd) return true;
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"MivaraDragGhost";
+    if (!RegisterClassExW(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return false;
+    g_ghost.hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+            WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        wc.lpszClassName, L"", WS_POPUP, 0, 0, GHOST_W_MIN, GHOST_H,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    return g_ghost.hwnd != nullptr;
+}
+
+/* Compose the card into the cached DIB. The text width decides the card
+ * width; the icon keeps its own aspect inside a 48x48 slot. */
+static bool ghostCompose()
+{
+    if (g_ghost.card_valid) return true;
+
+    std::wstring label;
+    if (!g_ghost.name.empty()) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, g_ghost.name.c_str(),
+                                          (int)g_ghost.name.size(), nullptr, 0);
+        if (n > 0) {
+            label.resize((size_t)n);
+            MultiByteToWideChar(CP_UTF8, 0, g_ghost.name.c_str(),
+                                (int)g_ghost.name.size(), &label[0], n);
+        }
+    }
+    if (label.empty()) label = L"文件";
+    if (g_ghost.count > 1)
+        label += L"  等 " + std::to_wstring(g_ghost.count) + L" 项";
+
+    LOGFONTW lf = {};
+    lf.lfHeight = -15;
+    lf.lfWeight = FW_NORMAL;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    std::wcsncpy(lf.lfFaceName, L"Microsoft YaHei UI",
+                 sizeof(lf.lfFaceName) / sizeof(lf.lfFaceName[0]) - 1);
+    HFONT font = CreateFontIndirectW(&lf);
+    if (!font) return false;
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) {
+        DeleteObject(font);
+        return false;
+    }
+    HDC measure = CreateCompatibleDC(screen);
+    SIZE text = {0, 0};
+    if (measure) {
+        HGDIOBJ old = SelectObject(measure, font);
+        GetTextExtentPoint32W(measure, label.c_str(), (int)label.size(), &text);
+        SelectObject(measure, old);
+        DeleteDC(measure);
+    }
+
+    int cw = GHOST_PAD + GHOST_ICON + GHOST_TEXT_GAP + (int)text.cx + GHOST_PAD;
+    if (cw < GHOST_W_MIN) cw = GHOST_W_MIN;
+    if (cw > GHOST_W_MAX) cw = GHOST_W_MAX;
+    const int ch = GHOST_H;
+    if (!ghostEnsureSurface(cw, ch)) {
+        ReleaseDC(nullptr, screen);
+        DeleteObject(font);
+        return false;
+    }
+
+    BYTE *px = (BYTE *)g_ghost.bits;
+    std::memset(px, 0, (size_t)cw * ch * 4);
+    HDC mem = g_ghost.memdc;
+
+    /* Card body + border. */
+    HBRUSH bg = CreateSolidBrush(RGB(28, 32, 40));
+    HPEN border = CreatePen(PS_SOLID, 1, RGB(78, 88, 104));
+    HGDIOBJ oldbrush = SelectObject(mem, bg);
+    HGDIOBJ oldpen = SelectObject(mem, border);
+    RoundRect(mem, 0, 0, cw - 1, ch - 1, GHOST_R * 2, GHOST_R * 2);
+
+    const int slot_x = GHOST_PAD;
+    const int slot_y = (ch - GHOST_ICON) / 2;
+    if (g_ghost.icon.valid()) {
+        /* GDI may batch the RoundRect fill; flush before compositing onto the
+         * DIB by hand, or the icon can be overwritten when the batch lands. */
+        GdiFlush();
+        /* Source-over composite of the shell image (non-premultiplied BGRA).
+         * The card is opaque inside the rounded region, so write RGB only;
+         * the coverage pass below supplies the window alpha. */
+        const DragIconData &ico = g_ghost.icon;
+        const int ix = slot_x + (GHOST_ICON - ico.w) / 2;
+        const int iy = slot_y + (GHOST_ICON - ico.h) / 2;
+        for (int y = 0; y < ico.h; y++) {
+            const int dy = iy + y;
+            if (dy < slot_y || dy >= slot_y + GHOST_ICON || dy >= ch)
+                continue;
+            for (int x = 0; x < ico.w; x++) {
+                const int dx = ix + x;
+                if (dx < slot_x || dx >= slot_x + GHOST_ICON || dx >= cw)
+                    continue;
+                const uint8_t *s = &ico.px[((size_t)y * ico.w + x) * 4];
+                BYTE *d = px + ((size_t)dy * cw + dx) * 4;
+                const unsigned a = s[3];
+                if (!a) continue;
+                d[0] = (BYTE)((s[0] * a + d[0] * (255u - a)) / 255u);
+                d[1] = (BYTE)((s[1] * a + d[1] * (255u - a)) / 255u);
+                d[2] = (BYTE)((s[2] * a + d[2] * (255u - a)) / 255u);
+            }
+        }
+    } else {
+        /* Fallback until the real image arrives (or for old peers). */
+        const int gx = slot_x + (GHOST_ICON - 24) / 2;
+        const int gy = slot_y + (GHOST_ICON - 32) / 2;
+        HBRUSH page = CreateSolidBrush(RGB(214, 224, 240));
+        HGDIOBJ pb = SelectObject(mem, page);
+        HGDIOBJ pp = SelectObject(mem, GetStockObject(NULL_PEN));
+        RoundRect(mem, gx, gy, gx + 24, gy + 32, 5, 5);
+        SelectObject(mem, pp);
+        SelectObject(mem, pb);
+        DeleteObject(page);
+    }
+
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(236, 241, 248));
+    HGDIOBJ oldfont = SelectObject(mem, font);
+    RECT rc = {GHOST_PAD + GHOST_ICON + GHOST_TEXT_GAP, 0, cw - GHOST_PAD,
+               ch};
+    DrawTextW(mem, label.c_str(), -1, &rc,
+              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(mem, oldfont);
+
+    SelectObject(mem, oldpen);
+    SelectObject(mem, oldbrush);
+    DeleteObject(border);
+    DeleteObject(bg);
+    DeleteObject(font);
+
+    /* Make sure GDI's batch is in shared DIB memory before touching it. */
+    GdiFlush();
+
+    /* Per-pixel alpha from the analytic rounded-rect coverage (3x3 samples),
+     * then premultiply RGB as ULW_ALPHA requires. */
+    const double rw = cw - 1, rh = ch - 1;
+    for (int y = 0; y < ch; y++) {
+        for (int x = 0; x < cw; x++) {
+            int hits = 0;
+            for (int sy = 0; sy < 3; sy++)
+                for (int sx = 0; sx < 3; sx++)
+                    if (ghostInside(x + (sx + 0.5) / 3.0,
+                                    y + (sy + 0.5) / 3.0, rw, rh))
+                        hits++;
+            const int a = hits * 255 / 9;
+            BYTE *p = px + ((size_t)y * cw + x) * 4;
+            p[3] = (BYTE)a;
+            p[0] = (BYTE)(p[0] * a / 255);
+            p[1] = (BYTE)(p[1] * a / 255);
+            p[2] = (BYTE)(p[2] * a / 255);
+        }
+    }
+
+    ReleaseDC(nullptr, screen);
+    g_ghost.card_valid = true;
+    return true;
+}
+
+/* Materialize the source image (already premultiplied) into the layered
+ * surface once; moves only call UpdateLayeredWindow afterwards. */
+static bool ghostEnsureRealSurface()
+{
+    const DragIconData &img = g_ghost.real;
+    if (!g_ghost.has_real || !img.valid()) return false;
+    if (g_ghost.surface_real && g_ghost.memdc &&
+        g_ghost.card_w == img.w && g_ghost.card_h == img.h)
+        return true;
+    if (!ghostEnsureSurface(img.w, img.h)) return false;
+    std::memcpy(g_ghost.bits, img.px.data(), img.px.size());
+    g_ghost.surface_real = true;
+    return true;
+}
+
+static void ghostPaint()
+{
+    if (!ghostEnsureWindow()) return;
+    HDC screen = GetDC(nullptr);
+    if (!screen) return;
+
+    /* The real drag image is drawn exactly like IDropTargetHelper: top-left
+     * at (cursor - hotspot), no card, and the OS clips it at the screen
+     * edges instead of shifting it inward. */
+    if (g_ghost.has_real) {
+        if (!ghostEnsureRealSurface()) {
+            ReleaseDC(nullptr, screen);
+            return;
+        }
+        POINT src = {0, 0};
+        SIZE size = {g_ghost.real.w, g_ghost.real.h};
+        POINT dst = {g_ghost.x - g_ghost.real_ox,
+                     g_ghost.y - g_ghost.real_oy};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        if (UpdateLayeredWindow(g_ghost.hwnd, screen, &dst, &size,
+                                g_ghost.memdc, &src, 0, &blend, ULW_ALPHA))
+            ShowWindow(g_ghost.hwnd, SW_SHOWNOACTIVATE);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+
+    if (!ghostCompose()) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    int x = g_ghost.x + 18, y = g_ghost.y + 18;
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (x + g_ghost.card_w > vx + vw) x = vx + vw - g_ghost.card_w;
+    if (y + g_ghost.card_h > vy + vh) y = vy + vh - g_ghost.card_h;
+    if (x < vx) x = vx;
+    if (y < vy) y = vy;
+
+    POINT src = {0, 0};
+    SIZE size = {g_ghost.card_w, g_ghost.card_h};
+    POINT dst = {x, y};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 245, AC_SRC_ALPHA};
+    if (UpdateLayeredWindow(g_ghost.hwnd, screen, &dst, &size, g_ghost.memdc,
+                            &src, 0, &blend, ULW_ALPHA))
+        ShowWindow(g_ghost.hwnd, SW_SHOWNOACTIVATE);
+    ReleaseDC(nullptr, screen);
+}
+
+static void ghostShow(int x, int y, int count)
+{
+    g_ghost.x = x;
+    g_ghost.y = y;
+    if (g_ghost.count != count) {
+        g_ghost.count = count;
+        g_ghost.card_valid = false;
+    }
+    g_ghost.visible = true;
+    ghostPaint();
+}
+
+static void ghostMove(int x, int y)
+{
+    if (!g_ghost.visible) return;
+    if (x == g_ghost.x && y == g_ghost.y) {
+        /* A late icon or text update can dirty the card while the pointer is
+         * still; repaint it in place instead of waiting for a mouse move. */
+        if (!g_ghost.card_valid) ghostPaint();
+        return;
+    }
+    g_ghost.x = x;
+    g_ghost.y = y;
+    ghostPaint();
+}
+
+static void ghostHide()
+{
+    g_ghost.visible = false;
+    g_ghost.frames_left = 0;
+    g_ghost.name.clear();
+    g_ghost.icon.clear();
+    g_ghost.icon_acc.reset();
+    g_ghost.real.clear();
+    g_ghost.real_acc.reset();
+    g_ghost.has_real = false;
+    g_ghost.surface_real = false;
+    g_ghost.card_valid = false;
+    if (g_ghost.hwnd) ShowWindow(g_ghost.hwnd, SW_HIDE);
+}
+
+/* Set the label without painting; the caller shows/moves it next. */
+static void ghostSetText(const std::string &name, int count)
+{
+    if (g_ghost.name == name && g_ghost.count == count) return;
+    g_ghost.name = name;
+    g_ghost.count = count;
+    g_ghost.card_valid = false;
+}
+
+/* Install the source item's shell image; an empty icon restores the page
+ * glyph. Recomposed lazily on the next paint. */
+static void ghostSetIcon(const DragIconData &icon)
+{
+    g_ghost.icon = icon;
+    g_ghost.card_valid = false;
+}
+
+/* Install the source Explorer drag image (premultiplied BGRA). It takes
+ * precedence over the reconstructed card; an empty image returns to it. */
+static void ghostSetRealImage(const DragIconData &image, int ox, int oy)
+{
+    g_ghost.real = image;
+    g_ghost.real_ox = ox;
+    g_ghost.real_oy = oy;
+    g_ghost.has_real = image.valid();
+    g_ghost.surface_real = false;
+    g_ghost.card_valid = false;
+}
+
+static void ghostEnd()
+{
+    ghostHide();
+    ghostReleaseSurface();
+    if (g_ghost.hwnd) {
+        DestroyWindow(g_ghost.hwnd);
+        g_ghost.hwnd = nullptr;
+    }
+}
+
 struct HeartbeatState {
     bool enabled = false;
     ULONGLONG last_rx = 0;
@@ -1955,7 +3441,8 @@ static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
                            ULONGLONG deadline_ms = 0,
                            HeartbeatState *hb = nullptr,
                            size_t *got = nullptr,
-                           bool *timed_out = nullptr)
+                           bool *timed_out = nullptr,
+                           std::mutex *tx = nullptr)
 {
     char *p = (char *)buf;
     size_t off = 0;
@@ -1975,7 +3462,16 @@ static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
             if (now >= hb->next_tx) {
                 KvmEvent ping = {};
                 ping.type = htonl(KVM_EV_PING);
-                if (!kvmSendAll(s, &ping, sizeof(ping))) return finish(false, false);
+                bool sent;
+                if (tx) {
+                    /* Same connection as the reverse watcher's icon frames;
+                     * keep whole 16-byte events from interleaving. */
+                    std::lock_guard<std::mutex> lk(*tx);
+                    sent = kvmSendAll(s, &ping, sizeof(ping));
+                } else {
+                    sent = kvmSendAll(s, &ping, sizeof(ping));
+                }
+                if (!sent) return finish(false, false);
                 hb->next_tx = now + 3000;
             }
         }
@@ -2739,9 +4235,23 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
                     auth->accept_files.load(std::memory_order_relaxed) != 0) &&
                    dropServiceStatus().state == 1 &&
                    (ntohl(hello.reserved[1]) & KVM_FEATURE_FILE_DROP) != 0;
+    /* Reverse (this machine → controller): independent of the forward gate —
+     * it needs OUR file_drop_send, the 8085 listener and the controller's
+     * advertised REVERSE bit, not file_drop_accept. */
+    bool reverse_ok =
+        (auth && auth->file_send.load(std::memory_order_relaxed) != 0) &&
+        dropServiceStatus().state == 1 &&
+        (ntohl(hello.reserved[1]) & KVM_FEATURE_REVERSE_DROP) != 0;
+    /* The session token is needed for EITHER direction: a reverse-only session
+     * (drop_ok = false) must still get a real random token, otherwise both
+     * sides would end up with an all-zero token and the 8085 gate would be no
+     * protection at all. */
     uint8_t drop_token[DROP_TOKEN_BYTES] = {};
-    if (drop_ok && !mivaraRandomBytes(drop_token, sizeof(drop_token)))
+    const bool need_token = drop_ok || reverse_ok;
+    if (need_token && !mivaraRandomBytes(drop_token, sizeof(drop_token))) {
         drop_ok = false;
+        reverse_ok = false;
+    }
     if (drop_ok) {
         if (dropGateInstall(drop_token, lease.lease.epoch)) lease.drop = true;
         else drop_ok = false;
@@ -2749,6 +4259,13 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     uint32_t feat = (ntohl(hello.reserved[1]) & KVM_FEATURE_HEARTBEAT)
                         ? KVM_FEATURE_HEARTBEAT : 0u;
     if (drop_ok) feat |= KVM_FEATURE_FILE_DROP;
+    if (reverse_ok) feat |= KVM_FEATURE_REVERSE_DROP;
+    /* Echo the icon capability only to a controller that advertised it: an
+     * older controller deletes the session on an unknown event type. */
+    if (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_ICON)
+        feat |= KVM_FEATURE_DRAG_ICON;
+    if (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_IMAGE)
+        feat |= KVM_FEATURE_DRAG_IMAGE;
     reply.reserved = htonl(feat);
 
     if (mode != MIVARA_AUTH_OPEN) {
@@ -2770,8 +4287,9 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     }
 
     /* Fixed 1 + 8 event sequence: the controller reads it before it starts
-     * drainLoop(), so the 16-byte event parser never sees a variable frame. */
-    if (drop_ok) {
+     * drainLoop(), so the 16-byte event parser never sees a variable frame.
+     * Sent for EITHER direction: a reverse-only session needs the token too. */
+    if (drop_ok || reverse_ok) {
         KvmEvent info = {};
         info.type = htonl(KVM_EV_DROP_INFO);
         info.a = htonl(0x4D564B58u);   /* 'MVKX' marker */
@@ -2794,17 +4312,251 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
             }
         }
     }
+    std::vector<uint8_t> rev_token;
+    if (reverse_ok) rev_token.assign(drop_token, drop_token + DROP_TOKEN_BYTES);
     mivaraSecureZero(drop_token, sizeof(drop_token));
+
+    /* ── reverse (this machine → controller) drag copy ─────────────────────
+     * The same Medium-integrity stitchcap helper, placed on the edge that
+     * FACES the controller (the back-crossing edge). A watcher thread tells
+     * the controller when a reverse drag starts/cancels (KVM_EV_RDRAG), and
+     * once the OLE Drop fires it sends the captured files to the controller's
+     * own 8085 listener. rev_token was copied before drop_token was zeroed. */
+    std::mutex tx_mtx;
+    std::atomic<bool> reverse_session{false};
+    std::thread reverse_watcher;
+    bool reverse_cap_started = false;
+    /* Where the controller's own reverse listener lives (its KvmHello carries
+     * it in reserved[1] bits 16..31). 0 => a pre-8087 peer, use the default. */
+    uint32_t rev_port = ntohl(hello.reserved[1]) >> 16;
+    if (rev_port < 1 || rev_port > 65535u) rev_port = (uint32_t)DROP_PORT;
+    /* Only talk icon frames to a controller that advertised the capability;
+     * an older controller would treat them as a protocol error and drop the
+     * session. */
+    const bool drag_icon_ok =
+        (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_ICON) != 0;
+    const bool drag_image_ok =
+        (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_IMAGE) != 0;
 
     std::cout << "[kvm] stitch session started (" << sw << "x" << sh
               << "); the peer now controls this desktop\n" << std::flush;
+
+    if (reverse_ok) {
+        /* The edge that faces the controller (the back-crossing edge). */
+        const int cap_side =
+            (side == KVM_SIDE_LEFT) ? KVM_SIDE_RIGHT :
+            (side == KVM_SIDE_RIGHT) ? KVM_SIDE_LEFT :
+            (side == KVM_SIDE_TOP) ? KVM_SIDE_BOTTOM : KVM_SIDE_TOP;
+        std::string why;
+        if (dropHelperStart(cap_side, why)) {
+            reverse_cap_started = true;
+            reverse_session = true;
+            reverse_watcher = std::thread([&, client, peer_ip, rev_token,
+                                           rev_port, drag_icon_ok] {
+                bool announced = false;
+                bool name_sent = false;
+                bool icon_tried = false;
+                bool image_sent = false;
+                ULONGLONG announced_tick = 0;
+                ULONGLONG name_deadline = 0;
+                auto sendRDrag = [&](uint32_t on) -> bool {
+                    KvmEvent ev = {};
+                    ev.type = htonl(KVM_EV_RDRAG);
+                    ev.a = htonl(on);
+                    std::lock_guard<std::mutex> lk(tx_mtx);
+                    return kvmSendAll(client, &ev, sizeof(ev));
+                };
+                auto sendDragInfo = [&](const std::string &first,
+                                        uint32_t count) -> bool {
+                    KvmEvent info = {};
+                    info.type = htonl(KVM_EV_DRAG_INFO);
+                    info.a = htonl(1u);
+                    info.b = htonl(count);
+                    info.c = htonl(first.empty() ? 0u : 4u);
+                    {
+                        std::lock_guard<std::mutex> lk(tx_mtx);
+                        if (!kvmSendAll(client, &info, sizeof(info)))
+                            return false;
+                    }
+                    if (first.empty()) return true;
+                    std::string text = first;
+                    const size_t max_bytes = 4 * 12;
+                    if (text.size() > max_bytes) {
+                        size_t cut = max_bytes;
+                        while (cut > 0 &&
+                               ((unsigned char)text[cut] & 0xC0) == 0x80)
+                            cut--;
+                        text.resize(cut);
+                    }
+                    bool ok = true;
+                    for (int i = 0; i < 4 && ok; i++) {
+                        char chunk[12] = {};
+                        const size_t off = (size_t)i * 12;
+                        if (off < text.size())
+                            std::memcpy(chunk, text.data() + off,
+                                        std::min<size_t>(
+                                            12, text.size() - off));
+                        KvmEvent t = {};
+                        t.type = htonl(KVM_EV_DRAG_TEXT);
+                        std::memcpy(&t.a, chunk, 4);
+                        std::memcpy(&t.b, chunk + 4, 4);
+                        std::memcpy(&t.c, chunk + 8, 4);
+                        std::lock_guard<std::mutex> lk(tx_mtx);
+                        ok = kvmSendAll(client, &t, sizeof(t));
+                    }
+                    return ok;
+                };
+                auto sendDragEnd = [&]() -> bool {
+                    KvmEvent end = {};
+                    end.type = htonl(KVM_EV_DRAG_INFO);   /* a=0: hide */
+                    std::lock_guard<std::mutex> lk(tx_mtx);
+                    return kvmSendAll(client, &end, sizeof(end));
+                };
+                /* Bounded extraction: a provider on a dead/cloud path must
+                 * not delay the drop check or the session join. */
+                auto trySendIcon = [&]() -> bool {
+                    if (!drag_icon_ok || icon_tried || image_sent) return true;
+                    std::string path;
+                    if (!dropHelperFirstFilePath(path)) return true;
+                    icon_tried = true;   /* one attempt per drag */
+                    DragIconData icon;
+                    if (!dragIconExtractTimed(path, icon, 250)) return true;
+                    return dragIconSendDirect(client, icon, tx_mtx);
+                };
+                /* The source helper publishes the drag image together with the
+                 * file list (before FILES_END), so retry until it exists. */
+                auto trySendImage = [&]() -> bool {
+                    if (!drag_image_ok || image_sent) return true;
+                    DropDragImage img;
+                    if (!dropHelperTakeDragImage(img) || !img.valid())
+                        return true;
+                    image_sent = true;
+                    return dragImageSendDirect(client, img, tx_mtx);
+                };
+                while (reverse_session.load() && running.load()) {
+                    const bool seen = dropHelperDragSeen();
+                    const bool live = dropHelperDragLive();
+                    const bool pending = dropHelperDragPending();
+                    const bool dropped = dropHelperDropped();
+                    const ULONGLONG now = GetTickCount64();
+
+                    if (seen && !announced) {
+                        announced = true;
+                        announced_tick = now;
+                        name_sent = false;
+                        icon_tried = false;
+                        image_sent = false;
+                        /* The helper publishes CF_HDROP only on FILES_END,
+                         * which can be seconds after DRAG; bound the wait so
+                         * a wedged capture cannot suppress back-crossing for
+                         * the whole session. */
+                        name_deadline = now + DRAG_CAPTURE_HARD_MS;
+                        if (!sendRDrag(1)) break;
+                        /* Tell the controller what is travelling so it can
+                         * draw the same ghost next to its own cursor. */
+                        std::string first;
+                        dropHelperFirstFileName(first);
+                        if (!sendDragInfo(first,
+                                          (uint32_t)dropHelperFileCount()))
+                            break;
+                        name_sent = !first.empty();
+                        /* The real image is already captured and cheaper to
+                         * forward than extracting an icon, so try it first. */
+                        if (!trySendImage()) break;
+                        if (!trySendIcon()) break;
+                    }
+
+                    /* FILES_END landed after the first poll (slow CF_HDROP
+                     * render): send a fresh header so the controller replaces
+                     * the placeholder name and can show the real icon. */
+                    if (announced && !name_sent && live) {
+                        std::string first;
+                        dropHelperFirstFileName(first);
+                        if (!first.empty()) {
+                            if (!sendDragInfo(first,
+                                              (uint32_t)dropHelperFileCount()))
+                                break;
+                            name_sent = true;
+                        }
+                    }
+                    if (announced && !trySendImage()) break;
+                    if (announced && !trySendIcon()) break;
+
+                    /* NODRAG leaves drag_seen sticky (the target has no local
+                     * mouseProc to reset it), so clear it here; otherwise the
+                     * next reverse drag would never be announced. */
+                    /* 100 ms of slack: the helper stores drag_seen before
+                     * drag_pending, and NODRAG can otherwise look like an
+                     * instant cancel on the same poll that announced. */
+                    const bool cancelled =
+                        announced && !live && !pending && !dropped &&
+                        now - announced_tick >= 100;
+                    const bool stalled =
+                        announced && !live && !dropped &&
+                        now > name_deadline;
+                    if (cancelled || stalled) {
+                        announced = false;
+                        name_sent = false;
+                        if (!sendRDrag(0)) break;
+                        if (!sendDragEnd()) break;
+                        dropHelperDiscard();
+                    }
+                    if (!seen && announced) {
+                        announced = false;
+                        if (!sendRDrag(0)) break;
+                        KvmEvent end = {};
+                        end.type = htonl(KVM_EV_DRAG_INFO);   /* a=0: hide */
+                        std::lock_guard<std::mutex> lk(tx_mtx);
+                        if (!kvmSendAll(client, &end, sizeof(end))) break;
+                    }
+                    if (dropHelperDragLive() && dropHelperDropped()) {
+                        std::vector<std::string> files;
+                        if (dropHelperTakeFiles(files) && !files.empty()) {
+                            announced = false;
+                            name_sent = false;
+                            if (!sendRDrag(0)) break;
+                            if (!sendDragEnd()) break;
+                            DropOptions opt;
+                            opt.peer_ip = peer_ip.c_str();
+                            opt.port = (uint16_t)rev_port;
+                            opt.flags = DROP_FLAG_REVERSE;
+                            opt.transfer_id =
+                                (uint32_t)(GetTickCount64() ^
+                                           (uint64_t)GetCurrentProcessId());
+                            std::cout << "[drop] reverse transfer -> "
+                                      << peer_ip << ":" << rev_port << "\n"
+                                      << std::flush;
+                            /* Release point is resolved by the CONTROLLER
+                             * from its own cursor, so x/y stay unused here. */
+                            const DropResult r =
+                                dropSendFiles(opt, files, rev_token.data(),
+                                              running);
+                            std::cout << "[drop] reverse transfer to " << peer_ip
+                                      << " status=" << r.status
+                                      << " committed=" << r.committed
+                                      << " failed=" << r.failed
+                                      << (r.message.empty()
+                                              ? "" : " msg=" + r.message)
+                                      << "\n" << std::flush;
+                        }
+                        dropHelperDiscard();
+                    }
+                    Sleep(20);
+                }
+            });
+        } else {
+            std::cout << "[kvm] reverse capture unavailable: " << why << "\n"
+                      << std::flush;
+        }
+    }
 
     HeldInput held;
     KvmEvent wire;
     bool io_ok = true;
     while (io_ok) {
         if (!running.load()) break;
-        if (!recvAllRunning(client, &wire, sizeof(wire), running, 0, &hb)) break;
+        if (!recvAllRunning(client, &wire, sizeof(wire), running, 0, &hb,
+                            nullptr, nullptr, &tx_mtx)) break;
         KvmEvent e;
         e.type = ntohl(wire.type);
         e.a = ntohl(wire.a);
@@ -2813,6 +4565,11 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
         switch (e.type) {
         case KVM_EV_MOVE:
             injectMove((int)e.a, (int)e.b, sw, sh);
+            /* KVM_EV_MOVE carries virtual-desktop-relative coordinates;
+             * UpdateLayeredWindow needs screen coordinates. The controller's
+             * reverse ghost already passes GetCursorPos(), so both roles now
+             * feed ghostMove the same space. */
+            ghostMove(sx + (int)e.a, sy + (int)e.b);
             break;
         case KVM_EV_BUTTON:
             injectButton(e.a, e.b != 0, held);
@@ -2830,7 +4587,95 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
             if (hb.enabled) {
                 KvmEvent pong = {};
                 pong.type = htonl(KVM_EV_PONG);
+                std::lock_guard<std::mutex> lk(tx_mtx);
                 io_ok = kvmSendAll(client, &pong, sizeof(pong));
+            }
+            break;
+        case KVM_EV_DRAG_INFO:
+            if (e.a) {
+                g_ghost.frames_left = (int)e.c;
+                g_ghost.icon_acc.reset();
+                g_ghost.real_acc.reset();
+                ghostSetText(std::string(), (int)e.b);
+                ghostSetIcon(DragIconData{});
+                ghostSetRealImage(DragIconData{}, 0, 0);
+                /* The first MOVE may still be in flight; anchor the new card
+                 * at the real cursor instead of the previous drag's position
+                 * (screen coordinates, matching ghostMove). */
+                POINT cur = {};
+                if (GetCursorPos(&cur)) {
+                    g_ghost.x = cur.x;
+                    g_ghost.y = cur.y;
+                }
+                ghostShow(g_ghost.x, g_ghost.y, (int)e.b);
+            } else {
+                ghostHide();
+            }
+            break;
+        case KVM_EV_DRAG_TEXT:
+            if (g_ghost.frames_left > 0) {
+                char chunk[12];
+                std::memcpy(chunk, &e.a, 4);
+                std::memcpy(chunk + 4, &e.b, 4);
+                std::memcpy(chunk + 8, &e.c, 4);
+                g_ghost.name.append(chunk, 12);
+                if (--g_ghost.frames_left == 0) {
+                    /* Drop the NUL padding of the fixed-size frames. */
+                    while (!g_ghost.name.empty() &&
+                           g_ghost.name.back() == '\0')
+                        g_ghost.name.pop_back();
+                    /* Appended in place, so the cached card is stale even
+                     * though ghostSetText() would compare equal. */
+                    g_ghost.card_valid = false;
+                    ghostShow(g_ghost.x, g_ghost.y, g_ghost.count);
+                }
+            }
+            break;
+        case KVM_EV_DRAG_ICON_INFO:
+            if (!g_ghost.icon_acc.begin(e.a, e.b, e.c))
+                g_ghost.icon_acc.reset();
+            break;
+        case KVM_EV_DRAG_ICON_DATA:
+            if (g_ghost.icon_acc.frames_left > 0) {
+                uint8_t chunk[DRAG_ICON_CHUNK];
+                std::memcpy(chunk, &e.a, 4);
+                std::memcpy(chunk + 4, &e.b, 4);
+                std::memcpy(chunk + 8, &e.c, 4);
+                DragIconData icon;
+                if (g_ghost.icon_acc.feed(chunk) &&
+                    g_ghost.icon_acc.take(icon)) {
+                    ghostSetIcon(icon);
+                    /* Frames for an already-cancelled drag must not pop the
+                     * window back up (ghostPaint always shows it). */
+                    if (g_ghost.visible) ghostPaint();
+                }
+            }
+            break;
+        case KVM_EV_DRAG_IMAGE_INFO: {
+            int w = 0, h = 0, ox = 0, oy = 0;
+            dragImageUnpackDimOff(e.a, w, ox);
+            dragImageUnpackDimOff(e.b, h, oy);
+            if (!g_ghost.real_acc.begin((uint32_t)w, (uint32_t)h, e.c)) {
+                g_ghost.real_acc.reset();
+            } else {
+                g_ghost.real_acc_ox = ox;
+                g_ghost.real_acc_oy = oy;
+            }
+            break;
+        }
+        case KVM_EV_DRAG_IMAGE_DATA:
+            if (g_ghost.real_acc.frames_left > 0) {
+                uint8_t chunk[DRAG_ICON_CHUNK];
+                std::memcpy(chunk, &e.a, 4);
+                std::memcpy(chunk + 4, &e.b, 4);
+                std::memcpy(chunk + 8, &e.c, 4);
+                DragIconData image;
+                if (g_ghost.real_acc.feed(chunk) &&
+                    g_ghost.real_acc.take(image)) {
+                    ghostSetRealImage(image, g_ghost.real_acc_ox,
+                                      g_ghost.real_acc_oy);
+                    if (g_ghost.visible) ghostPaint();
+                }
             }
             break;
         case KVM_EV_PONG:
@@ -2839,6 +4684,10 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
             break;
         }
     }
+    ghostEnd();
+    reverse_session = false;
+    if (reverse_watcher.joinable()) reverse_watcher.join();
+    if (reverse_cap_started) dropHelperStop();
     releaseAll(held);
     std::cout << "[kvm] stitch session from " << peer_ip << " ended\n"
               << std::flush;

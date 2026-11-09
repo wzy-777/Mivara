@@ -398,6 +398,7 @@ struct RxPolicy
     uint32_t iter = 0;
     bool     record_ok = false;   /* password mode: record present + valid */
     bool     accept_files = false;/* stitch: offer the 8085 file-drop channel */
+    bool     file_send = false;   /* stitch: allow reverse drag copy (send) */
     bool     accept_file_transfer = false; /* 8086: browse/upload/download */
     std::string why;              /* diagnostic when !record_ok */
 };
@@ -410,7 +411,7 @@ static KvmApprovalResult kvmApproveHook(const char *ip, const char *device,
                                         intptr_t client, void *ctx);
 static FtApprovalResult ftApproveHook(const char *ip, const char *device,
                                       intptr_t client, void *ctx);
-static KvmTargetAuth g_kvm_auth = {kvmPolicyHook, kvmApproveHook, 0, nullptr};
+static KvmTargetAuth g_kvm_auth = {kvmPolicyHook, kvmApproveHook, 0, 0, nullptr};
 static FtTargetAuth g_ft_auth = {kvmPolicyHook, ftApproveHook, 0, nullptr};
 
 static std::mutex g_policy_mtx;
@@ -598,6 +599,7 @@ static RxPolicy loadPolicyFromConfig()
     p.mode = mode;
     p.iter = (uint32_t)cfg.auth_iter;
     p.accept_files = cfg.file_drop_accept != 0;
+    p.file_send = cfg.file_drop_send != 0;
     p.accept_file_transfer = cfg.file_transfer_accept != 0;
 
     if (mode == MIVARA_AUTH_PASSWORD) {
@@ -638,6 +640,8 @@ static void applyPolicy(const RxPolicy &p, bool announce_error = true)
     }
     g_kvm_auth.accept_files.store(p.accept_files ? 1 : 0,
                                   std::memory_order_relaxed);
+    g_kvm_auth.file_send.store(p.file_send ? 1 : 0,
+                               std::memory_order_relaxed);
     g_ft_auth.enabled.store(p.accept_file_transfer ? 1 : 0,
                             std::memory_order_relaxed);
     emitRxStat("policy", std::string("mode=") + policyKey(p) +
@@ -2476,6 +2480,7 @@ int main(int argc, char* argv[])
 #endif
 
     int cli_accept_files = -1;
+    int cli_file_send = -1;
     int cli_accept_file_transfer = -1;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--gui") == 0)
@@ -2483,6 +2488,8 @@ int main(int argc, char* argv[])
         else if (std::strcmp(argv[i], "--accept-files") == 0 &&
                  i + 1 < argc)
             cli_accept_files = (std::atoi(argv[++i]) != 0) ? 1 : 0;
+        else if (std::strcmp(argv[i], "--file-drop") == 0 && i + 1 < argc)
+            cli_file_send = (std::atoi(argv[++i]) != 0) ? 1 : 0;
         else if (std::strcmp(argv[i], "--accept-file-transfer") == 0 &&
                  i + 1 < argc)
             cli_accept_file_transfer = (std::atoi(argv[++i]) != 0) ? 1 : 0;
@@ -2512,6 +2519,8 @@ int main(int argc, char* argv[])
     if (cli_accept_files >= 0)
         g_kvm_auth.accept_files.store(cli_accept_files,
                                       std::memory_order_relaxed);
+    if (cli_file_send >= 0)
+        g_kvm_auth.file_send.store(cli_file_send, std::memory_order_relaxed);
     if (cli_accept_file_transfer >= 0)
         g_ft_auth.enabled.store(cli_accept_file_transfer,
                                 std::memory_order_relaxed);
@@ -2539,7 +2548,8 @@ int main(int argc, char* argv[])
     /* 8085 file-drop channel. It only serves a token installed by an active
      * 8084 session, so it can idle here for the whole process lifetime. Start
      * it first so a session that connects immediately sees it listening. */
-    std::thread drop_thread(dropServiceRun, std::ref(g_running));
+    std::thread drop_thread(dropServiceRun, std::ref(g_running),
+                            (uint16_t)DROP_PORT);
     std::thread ft_thread(ftServiceRun, std::ref(g_running), &g_ft_auth);
     std::thread kvm_thread(kvmServiceRun, std::ref(g_running), &g_kvm_auth);
 

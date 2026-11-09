@@ -1643,6 +1643,7 @@ int main(int argc, char* argv[])
     int cli_add_modes = -1;                     /* -1 = not specified */
     int cli_stitch_side = KVM_SIDE_RIGHT;       /* where the peer sits */
     int cli_file_drop = 0;                      /* 1 = edge drag sends files */
+    int cli_accept_files = 0;                   /* 1 = accept reverse drops */
     int cli_port = 8081;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -1659,6 +1660,8 @@ int main(int argc, char* argv[])
             }
         } else if (std::strcmp(argv[i], "--file-drop") == 0 && i + 1 < argc) {
             cli_file_drop = (std::atoi(argv[++i]) != 0) ? 1 : 0;
+        } else if (std::strcmp(argv[i], "--accept-files") == 0 && i + 1 < argc) {
+            cli_accept_files = (std::atoi(argv[++i]) != 0) ? 1 : 0;
         } else if (std::strcmp(argv[i], "--extend-res") == 0 && i + 1 < argc) {
             cli_extend_res = argv[++i];
         } else if (std::strcmp(argv[i], "--vdd-add-modes") == 0 && i + 1 < argc) {
@@ -1776,6 +1779,7 @@ int main(int argc, char* argv[])
         kvm_auth.password = kvmPasswordHook;
         kvm_auth.report = kvmReportHook;
         kvm_auth.file_drop = cli_file_drop;
+        kvm_auth.accept_files = cli_accept_files;
         const int rc = kvmRunController(sel.ip_address.c_str(), KVM_PORT,
                                         cli_stitch_side, g_running, &kvm_auth);
         cleanupSockets();

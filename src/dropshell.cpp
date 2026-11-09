@@ -470,6 +470,151 @@ std::wstring dropStagingRoot(uint32_t transfer_id)
     return makeDirs(root) ? root : std::wstring();
 }
 
+/* ── icon placement at the release point ─────────────────────────────────── */
+
+/* Grab IFolderView + the view HWND for `folder`, using the desktop's view for
+   the Desktop folder and the matching Explorer window otherwise. */
+static bool folderViewFor(const std::wstring &folder,
+                          IFolderView **outView, HWND *outWnd)
+{
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr,
+                                CLSCTX_LOCAL_SERVER, IID_IShellWindows,
+                                (void **)&windows)) || !windows)
+        return false;
+
+    ComPtr<IDispatch> disp;
+    ComPtr<IShellView> view;
+    const std::wstring desktop = knownFolder(FOLDERID_Desktop);
+
+    if (!desktop.empty() && samePath(folder, desktop)) {
+        VARIANT loc, root;
+        VariantInit(&loc);
+        VariantInit(&root);
+        LONG hwnd = 0;
+        if (FAILED(windows->FindWindowSW(&loc, &root, SWC_DESKTOP, &hwnd,
+                                         SWFO_NEEDDISPATCH, &disp)) ||
+            !disp)
+            return false;
+    } else {
+        long count = 0;
+        if (FAILED(windows->get_Count(&count)) || count <= 0) return false;
+        for (long i = 0; i < count && !disp; i++) {
+            VARIANT v;
+            VariantInit(&v);
+            v.vt = VT_I4;
+            v.lVal = i;
+            ComPtr<IDispatch> cand;
+            const HRESULT hr = windows->Item(v, &cand);
+            VariantClear(&v);
+            if (FAILED(hr) || !cand) continue;
+            ComPtr<IWebBrowser2> wb;
+            if (FAILED(cand->QueryInterface(IID_IWebBrowser2,
+                                            (void **)&wb)) || !wb)
+                continue;
+            ComPtr<IServiceProvider> sp;
+            if (FAILED(wb->QueryInterface(IID_IServiceProvider,
+                                          (void **)&sp)) || !sp)
+                continue;
+            ComPtr<IShellBrowser> browser;
+            if (FAILED(sp->QueryService(SID_STopLevelBrowser,
+                                        IID_IShellBrowser,
+                                        (void **)&browser)) || !browser)
+                continue;
+            ComPtr<IShellView> sv;
+            if (FAILED(browser->QueryActiveShellView(&sv)) || !sv) continue;
+            ComPtr<IFolderView> fv;
+            if (FAILED(sv->QueryInterface(IID_IFolderView,
+                                          (void **)&fv)) || !fv)
+                continue;
+            ComPtr<IShellFolder> sf;
+            if (FAILED(fv->GetFolder(IID_IShellFolder, (void **)&sf)) || !sf)
+                continue;
+            ComPtr<IPersistFolder2> pf;
+            if (FAILED(sf->QueryInterface(IID_IPersistFolder2,
+                                          (void **)&pf)) || !pf)
+                continue;
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (FAILED(pf->GetCurFolder(&pidl)) || !pidl) continue;
+            wchar_t path[32768] = {};
+            const bool isFs =
+                SHGetPathFromIDListW(pidl, path) != FALSE;
+            CoTaskMemFree(pidl);
+            if (isFs && samePath(path, folder)) {
+                disp = cand;
+                view = sv;
+            }
+        }
+        if (!disp) return false;
+    }
+
+    ComPtr<IServiceProvider> sp;
+    if (FAILED(disp->QueryInterface(IID_IServiceProvider, (void **)&sp)) || !sp)
+        return false;
+    ComPtr<IShellBrowser> browser;
+    if (FAILED(sp->QueryService(SID_STopLevelBrowser, IID_IShellBrowser,
+                                (void **)&browser)) || !browser)
+        return false;
+    if (!view) {
+        if (FAILED(browser->QueryActiveShellView(&view)) || !view)
+            return false;
+    }
+    ComPtr<IFolderView> fv;
+    if (FAILED(view->QueryInterface(IID_IFolderView, (void **)&fv)) || !fv)
+        return false;
+    HWND wnd = nullptr;
+    view->GetWindow(&wnd);
+    if (!wnd) return false;
+    *outView = fv.p;
+    fv.p->AddRef();
+    *outWnd = wnd;
+    return true;
+}
+
+bool dropPlaceIcons(const std::wstring &dest_folder, int screen_x, int screen_y,
+                    const std::vector<std::wstring> &names)
+{
+    if (dest_folder.empty() || names.empty()) return false;
+
+    ComPtr<IFolderView> view;
+    HWND viewWnd = nullptr;
+    if (!folderViewFor(dest_folder, &view.p, &viewWnd)) return false;
+
+    /* Auto-arranged folders re-snap every icon to the grid, so a requested
+     * position cannot stick. Leave the copy alone and say nothing scary. */
+    if (view->GetAutoArrange() == S_OK) return false;
+
+    if (!IsWindowVisible(viewWnd)) return false;
+    POINT pt = {screen_x, screen_y};
+    if (!ScreenToClient(viewWnd, &pt)) return false;
+    /* Keep the icon's top-left inside the view; the point is the drop spot. */
+    RECT rc = {};
+    GetClientRect(viewWnd, &rc);
+    int spacing = 96;
+    POINT sp = {};
+    if (SUCCEEDED(view->GetSpacing(&sp)) && sp.y > 0) spacing = sp.y;
+
+    int placed = 0;
+    for (size_t i = 0; i < names.size(); i++) {
+        const std::wstring full = dest_folder + L"\\" + names[i];
+        PIDLIST_ABSOLUTE abs = nullptr;
+        if (FAILED(SHParseDisplayName(full.c_str(), nullptr, &abs, 0,
+                                      nullptr)) || !abs)
+            continue;
+        PCUITEMID_CHILD child = ILFindLastID(abs);
+        POINT at = {pt.x, pt.y + (LONG)placed * spacing};
+        if (at.x + 32 > rc.right) at.x = rc.right - 32;
+        if (at.y + 32 > rc.bottom) at.y = rc.bottom - 32;
+        if (at.x < 0) at.x = 0;
+        if (at.y < 0) at.y = 0;
+        if (SUCCEEDED(view->SelectAndPositionItems(
+                1, &child, &at, SVSI_POSITIONITEM | SVSI_SELECT)))
+            placed++;
+        CoTaskMemFree(abs);
+    }
+    return placed > 0;
+}
+
 bool dropCommitItems(const std::wstring &staging_root,
                      const std::wstring &dest_folder,
                      const std::vector<std::wstring> &top_level_names,
@@ -562,6 +707,11 @@ bool dropCommitItems(const std::wstring &, const std::wstring &,
     message = "file drop is Windows only";
     return false;
 }
+bool dropPlaceIcons(const std::wstring &, int, int,
+                    const std::vector<std::wstring> &)
+{
+    return false;
+}
 
 #endif /* _WIN32 */
 
@@ -612,11 +762,66 @@ struct HelperState {
     std::atomic<uint64_t> dropped_generation{0};
     std::vector<std::string> files;
     uint64_t files_tick = 0;
+    /* Real Explorer drag image from the current gesture (see drop.h). The
+     * helper sends IMG_BEGIN/IMG_CHUNK/IMG_END before FILES_END; the reader
+     * reconstructs it here and the ghost takes it once. Guarded by `m`. */
+    DropDragImage image;
+    std::vector<uint8_t> img_pending;
+    int img_w = 0, img_h = 0, img_ox = 0, img_oy = 0;
+    bool img_active = false;
     std::string pipe_name;
     int side = 1;
 };
 
 HelperState g_helper;
+
+/* Optional controller-side pipe trace (field diagnostics for the edge-capture
+ * path). MIVARA_DROP_TRACE=1 writes every helper message to
+ * %TEMP%\mivara-dropctl-trace.log; off by default. */
+void helperTrace(const std::string &msg)
+{
+    static const bool enabled = [] {
+        return GetEnvironmentVariableW(L"MIVARA_DROP_TRACE", nullptr, 0) > 0;
+    }();
+    if (!enabled) return;
+    wchar_t tmp[MAX_PATH] = {};
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    static HANDLE file = CreateFileW(
+        (std::wstring(tmp) + L"mivara-dropctl-trace.log").c_str(),
+        GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(file, 0, nullptr, FILE_END);
+    char line[1200];
+    const int n = std::snprintf(line, sizeof(line), "[%llu pid=%lu] %s\n",
+                                (unsigned long long)GetTickCount64(),
+                                GetCurrentProcessId(), msg.c_str());
+    if (n <= 0) return;
+    DWORD wrote = 0;
+    WriteFile(file, line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1,
+              &wrote, nullptr);
+}
+
+int hexNibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Append hex bytes to an image accumulator, bounded by `max` bytes. */
+bool hexAppend(const char *s, size_t n, std::vector<uint8_t> &out, size_t max)
+{
+    if (n % 2 != 0 || out.size() + n / 2 > max) return false;
+    for (size_t i = 0; i < n; i += 2) {
+        const int hi = hexNibble(s[i]);
+        const int lo = hexNibble(s[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back((uint8_t)(hi * 16 + lo));
+    }
+    return true;
+}
 
 int tokenIntegrity(HANDLE tok)
 {
@@ -895,30 +1100,36 @@ void helperReader()
     }
     std::vector<std::string> pending;
     std::vector<char> buf(1024 * 1024);
-    while (!g_helper.stop.load()) {
-        DWORD got = 0;
-        prepare();
-        if (!ReadFile(pipe, buf.data(), (DWORD)buf.size(), &got, &ov)) {
-            if (GetLastError() != ERROR_IO_PENDING) break;
-            if (!waitOverlapped(pipe, ov, got)) break;
-        }
-        if (got == 0) continue;
-        std::string msg(buf.data(), got);
-        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
-            msg.pop_back();
+    std::string rx;
+    /* The pipe is byte-mode: one ReadFile can return part of a line or
+     * several complete lines (the real-drag-image transport writes many large
+     * chunks back to back). Buffer by newline instead of assuming one read ==
+     * one message, which would also corrupt a FILES line that coalesced with
+     * a following IMG_END. */
+    auto handleLine = [&](const std::string &msg) -> bool {
         if (msg == "DRAG") {
             g_helper.drag_generation.fetch_add(1);
             g_helper.drag_seen = true;
             g_helper.drag_pending = true;
             g_helper.drop_called = false;
+            {
+                std::lock_guard<std::mutex> lk(g_helper.m);
+                g_helper.image = DropDragImage{};
+                g_helper.img_pending.clear();
+                g_helper.img_active = false;
+            }
         } else if (msg == "DROPPED") {
             g_helper.dropped_generation = g_helper.drag_generation.load();
             g_helper.drop_called = true;
         } else if (msg.rfind("READY\t", 0) == 0) {
             const int il = (int)strtol(msg.c_str() + 6, nullptr, 0);
             g_helper.il = il;
-            g_helper.hello = true;
+            /* Publish ready BEFORE hello: dropHelperStart treats
+             * "hello && !ready" as a final integrity verdict. Setting hello
+             * first would let its 20 ms poll catch a valid helper in the
+             * (hello=true, ready=false) window and refuse it. */
             g_helper.ready = (il <= g_helper.shell_il.load());
+            g_helper.hello = true;
             writeLine("SIDE\t" + std::to_string(g_helper.side) + "\n");
         } else if (msg == "FILES_BEGIN") {
             pending.clear();
@@ -946,19 +1157,92 @@ void helperReader()
         } else if (msg == "NODRAG") {
             if (g_helper.drop_called.load() &&
                 g_helper.dropped_generation.load() ==
-                    g_helper.drag_generation.load()) continue;
+                    g_helper.drag_generation.load())
+                return true;
             {
                 std::lock_guard<std::mutex> lk(g_helper.m);
                 g_helper.files.clear();
+                g_helper.image = DropDragImage{};
+                g_helper.img_pending.clear();
+                g_helper.img_active = false;
                 pending.clear();
             }
             g_helper.drag_live = false;
             g_helper.drop_called = false;
             g_helper.dropped_generation = 0;
             g_helper.drag_pending = false;
+        } else if (msg.rfind("IMG_BEGIN\t", 0) == 0) {
+            int w = 0, h = 0, ox = 0, oy = 0;
+            const bool parsed =
+                std::sscanf(msg.c_str(), "IMG_BEGIN\t%d\t%d\t%d\t%d",
+                            &w, &h, &ox, &oy) == 4;
+            std::lock_guard<std::mutex> lk(g_helper.m);
+            g_helper.img_pending.clear();
+            g_helper.img_w = w;
+            g_helper.img_h = h;
+            g_helper.img_ox = ox;
+            g_helper.img_oy = oy;
+            g_helper.img_active =
+                parsed && w > 0 && h > 0 &&
+                (uint64_t)w * (uint64_t)h <= DROP_DRAG_IMAGE_MAX_PIXELS;
+        } else if (msg.rfind("IMG_CHUNK\t", 0) == 0) {
+            std::lock_guard<std::mutex> lk(g_helper.m);
+            if (g_helper.img_active) {
+                const size_t max =
+                    (size_t)g_helper.img_w * (size_t)g_helper.img_h * 4;
+                if (!hexAppend(msg.c_str() + 10, msg.size() - 10,
+                               g_helper.img_pending, max))
+                    g_helper.img_active = false;
+            }
+        } else if (msg == "IMG_END") {
+            std::lock_guard<std::mutex> lk(g_helper.m);
+            const size_t need =
+                (size_t)g_helper.img_w * (size_t)g_helper.img_h * 4;
+            if (g_helper.img_active && need > 0 &&
+                g_helper.img_pending.size() == need) {
+                g_helper.image.w = g_helper.img_w;
+                g_helper.image.h = g_helper.img_h;
+                g_helper.image.ox = g_helper.img_ox;
+                g_helper.image.oy = g_helper.img_oy;
+                g_helper.image.px.swap(g_helper.img_pending);
+            }
+            g_helper.img_pending.clear();
+            g_helper.img_active = false;
         } else if (msg == "BYE" || msg == "QUIT") {
-            break;
+            return false;
         }
+        return true;
+    };
+    bool reader_done = false;
+    while (!g_helper.stop.load() && !reader_done) {
+        DWORD got = 0;
+        prepare();
+        if (!ReadFile(pipe, buf.data(), (DWORD)buf.size(), &got, &ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) break;
+            if (!waitOverlapped(pipe, ov, got)) break;
+        }
+        if (got == 0) continue;
+        rx.append(buf.data(), got);
+        size_t nl;
+        while ((nl = rx.find('\n')) != std::string::npos) {
+            std::string msg = rx.substr(0, nl);
+            rx.erase(0, nl + 1);
+            if (!msg.empty() && msg.back() == '\r') msg.pop_back();
+            if (msg.empty()) continue;
+            if (msg.rfind("FILES\t", 0) == 0)
+                helperTrace("rx< FILES (" + std::to_string(msg.size()) +
+                            " bytes)");
+            else if (msg.rfind("IMG_CHUNK\t", 0) == 0)
+                helperTrace("rx< IMG_CHUNK (" + std::to_string(msg.size()) +
+                            " chars)");
+            else
+                helperTrace("rx< " + msg);
+            if (!handleLine(msg)) {
+                reader_done = true;
+                break;
+            }
+        }
+        if (rx.size() > 4 * 1024 * 1024) rx.clear();
     }
     CloseHandle(ov.hEvent);
     g_helper.ready = false;
@@ -1091,6 +1375,9 @@ void dropHelperStop()
     g_helper.drag_pending = false;
     std::lock_guard<std::mutex> lk(g_helper.m);
     g_helper.files.clear();
+    g_helper.image = DropDragImage{};
+    g_helper.img_pending.clear();
+    g_helper.img_active = false;
 }
 
 bool dropHelperReady()
@@ -1107,11 +1394,23 @@ bool dropHelperTakeFiles(std::vector<std::string> &out)
     return !out.empty();
 }
 
+bool dropHelperTakeDragImage(DropDragImage &out)
+{
+    std::lock_guard<std::mutex> lk(g_helper.m);
+    if (!g_helper.image.valid()) return false;
+    out = std::move(g_helper.image);
+    g_helper.image = DropDragImage{};
+    return true;
+}
+
 void dropHelperDiscard()
 {
     {
         std::lock_guard<std::mutex> lk(g_helper.m);
         g_helper.files.clear();
+        g_helper.image = DropDragImage{};
+        g_helper.img_pending.clear();
+        g_helper.img_active = false;
     }
     g_helper.drag_live = false;
     g_helper.drop_called = false;
@@ -1136,6 +1435,40 @@ bool dropHelperDragPending()
     return g_helper.drag_pending.load();
 }
 
+size_t dropHelperFileCount()
+{
+    std::lock_guard<std::mutex> lk(g_helper.m);
+    return g_helper.files.size();
+}
+
+bool dropHelperFirstFileName(std::string &out)
+{
+    std::lock_guard<std::mutex> lk(g_helper.m);
+    if (g_helper.files.empty()) return false;
+    const std::string &path = g_helper.files.front();
+    size_t end = path.size();
+    while (end > 0 && (path[end - 1] == '/' || path[end - 1] == '\\')) end--;
+    const size_t sep = path.find_last_of("/\\", end ? end - 1 : 0);
+    out = path.substr(sep == std::string::npos ? 0 : sep + 1,
+                      end - (sep == std::string::npos ? 0 : sep + 1));
+    return !out.empty();
+}
+
+bool dropHelperFirstFilePath(std::string &out)
+{
+    std::lock_guard<std::mutex> lk(g_helper.m);
+    if (g_helper.files.empty()) return false;
+    out = g_helper.files.front();
+    return !out.empty();
+}
+
+bool dropHelperDropped()
+{
+    return g_helper.drop_called.load() &&
+           g_helper.dropped_generation.load() ==
+               g_helper.drag_generation.load();
+}
+
 void dropHelperSetSide(int side)
 {
     if (side < 0 || side > 3) return;
@@ -1158,6 +1491,11 @@ void dropHelperDiscard() {}
 bool dropHelperDragLive() { return false; }
 bool dropHelperDragSeen() { return false; }
 bool dropHelperDragPending() { return false; }
+size_t dropHelperFileCount() { return 0; }
+bool dropHelperFirstFileName(std::string &) { return false; }
+bool dropHelperFirstFilePath(std::string &) { return false; }
+bool dropHelperTakeDragImage(DropDragImage &) { return false; }
+bool dropHelperDropped() { return false; }
 void dropHelperSetSide(int) {}
 
 #endif /* _WIN32 */

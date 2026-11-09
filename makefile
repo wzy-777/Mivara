@@ -133,7 +133,9 @@ ifeq ($(OS),Windows_NT)
     # Medium-integrity stitchcap helper.
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi -ladvapi32 \
                      -luser32 -lole32 -loleaut32 -luuid -lshell32 -lshlwapi
-    RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32 \
+    # -lgdi32: the stitch drag ghost overlay (kvm.cpp, target side) draws into
+    # a 32-bit DIB and pushes it with UpdateLayeredWindow.
+    RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32 -lgdi32 \
                      -ladvapi32 -lole32 -loleaut32 -luuid -lshell32 -lshlwapi
     # app: -lwinhttp (update check/download), -lbcrypt (SHA-256 via CNG),
     #      -ladvapi32 (SetNamedSecurityInfo + SDDL on the update directory),
@@ -254,6 +256,7 @@ $(OBJ_AUTH): $(SRCDIR)/auth.h
 $(OBJ_TRAY): $(SRCDIR)/tray.h
 $(OBJ_DROP): $(SRCDIR)/drop.h $(SRCDIR)/auth.h $(SRCDIR)/dropshell.h
 $(OBJ_DROPSHELL): $(SRCDIR)/drop.h $(SRCDIR)/dropshell.h
+$(OBJ_STITCHCAP): $(SRCDIR)/drop.h
 $(OBJ_FILEXFER): $(SRCDIR)/filexfer.h $(SRCDIR)/auth.h $(SRCDIR)/proto.h
 $(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
 $(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/filexfer.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h

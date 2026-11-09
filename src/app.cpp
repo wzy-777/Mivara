@@ -4256,6 +4256,8 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
         args.push_back(kStitchSideKey[s < 0 ? (int)KVM_SIDE_RIGHT : s]);
         args.push_back("--file-drop");
         args.push_back(g_cfg.file_drop_send ? "1" : "0");
+        args.push_back("--accept-files");
+        args.push_back(g_cfg.file_drop_accept ? "1" : "0");
     } else {
         args.insert(args.end(), {
             "--codec", codec,
@@ -5554,6 +5556,7 @@ static void launchReceiver()
     if (!spawnChild(g_receiver, path,
                     {"--gui", "--accept-files",
                      g_cfg.file_drop_accept ? "1" : "0",
+                     "--file-drop", g_cfg.file_drop_send ? "1" : "0",
                      "--accept-file-transfer",
                      g_cfg.file_transfer_accept ? "1" : "0"},
                     flags, /*is_receiver=*/true, epoch)) {
@@ -8154,6 +8157,10 @@ static void onButton(int id, bool file_window = false)
          * across the working-copy commit (else the 24h throttle and the
          * ignored-version filter would be silently reset on every save). */
         AppConfig next = g_cfg_edit;
+        /* 拼接的拖拽发送开关只在会话启动时协商（见下方重连分支），先记住
+         * 本次保存是否改变了它；g_cfg 马上要被新值覆盖。 */
+        const bool stitch_drop_changed =
+            next.file_drop_send != g_cfg.file_drop_send;
         next.last_update_check = g_cfg.last_update_check;
         next.ignored_version = g_cfg.ignored_version;
         next.tray_hint_shown = g_cfg.tray_hint_shown;
@@ -8234,6 +8241,23 @@ static void onButton(int id, bool file_window = false)
                     return;
                 }
             }
+        }
+        /* 拼接的拖拽发送开关只在 kvmRunController 入口确定：stitchcap 助手
+         * 是否启动、KVM_FEATURE_FILE_DROP 是否协商都发生在握手时，SETP /
+         * STITCH|side 热更新都不会重读 --file-drop。若保存时该值已变而会话
+         * 保持不动，用户会在旧会话里反复拖拽却永远等不到生效，所以这里直接
+         * 按新配置重连（对端需要重新确认拼接授权）。 */
+        if (stitch_drop_changed && g_sender.active &&
+            g_child_mode == SEND_STITCH) {
+            const std::string ip = g_last_ip, nm = g_last_name;
+            const int port = g_last_port;
+            stopSender();
+            launchStream(ip, port, SEND_STITCH, nm, g_cfg.stitch_side.c_str());
+            if (g_sender.active)
+                g_status_note = g_cfg.file_drop_send
+                                    ? "已开启拖拽发送并重连拼接（对方需再次确认）"
+                                    : "已关闭拖拽发送并重连拼接（对方需再次确认）";
+            return;
         }
         if (reloadFailed) {
             g_status_tone = StatusTone::Error;
