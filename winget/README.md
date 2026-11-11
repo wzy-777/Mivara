@@ -29,12 +29,13 @@
 
 建议 PR 描述（英文参考，脚本用的就是这段）：
 
-> Mivara (幻屏) is an open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The source is MIT-licensed; the released sender/receiver binaries link GPL-3.0-or-later FFmpeg and are distributed under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (`/VERYSILENT`) is supported. Installer SHA-256 matches the GitHub release asset digest.
+> Mivara (幻屏) is an open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The source is MIT-licensed; the released sender/receiver binaries link GPL-3.0-or-later FFmpeg and are distributed under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (`/VERYSILENT`) is supported and skips the optional virtual display driver via `/MERGETASKS="!installvdd"`, so unattended installs never block on a driver-consent dialog; the driver can be installed later with `vdd\install_vdd.ps1`. Installer SHA-256 matches the GitHub release asset digest.
 
 版本目录由 release.sh 生成，其中 `InstallerUrl` **用带版本号的资产名**（不要用固定名 `Mivara-Setup.exe`），`InstallerSha256` 与 GitHub 上传后的 asset digest 一致。
 
 ## 备注
 
+- **静默安装必须跳过 VDD**：`InstallerSwitches` 里的 `/MERGETASKS="!installvdd"` 不能删。`devcon install` 会触发 Windows Security「是否安装此设备软件」确认框（发布者 SignPath Foundation），无人值守环境无法点击，winget 的安装验证会超时（`Validation-Unattended-Failed`）。跳过之后，扩展模式需在安装后手动运行 `vdd\install_vdd.ps1`（管理员 PowerShell）。
 - `AppsAndFeaturesEntries` 的 `DisplayName`/`ProductCode` 取自 Inno 写入注册表的实际值（`{AppId}_is1`）；如校验器提示不匹配，以注册表实际值为准修正。
 - 若校验器提示 `ManifestVersion` 需上调（winget-pkgs 会随时间提升 schema 版本），把三个文件的 `ManifestVersion` 与文件头 aka.ms 链接同步改成校验器要求的版本。
 - 若提示 URL 信誉问题（URL-Validation-Error）：属未签名新文件的正常现象，在 PR 中说明为开源项目即可，非硬性门槛。

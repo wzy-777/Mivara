@@ -412,7 +412,7 @@ if [ "${#PUBLISHED[@]}" -eq 0 ]; then
 else
   TITLE="Update: $PACKAGE_ID version $VER"
 fi
-BODY="Mivara (幻屏) is an open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The source is MIT-licensed; the released sender/receiver binaries link GPL-3.0-or-later FFmpeg and are distributed under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (\`/VERYSILENT\`) is supported. Installer SHA-256 matches the GitHub release asset digest."
+BODY="Mivara (幻屏) is an open-source, cross-platform LAN screen-casting / wireless second-monitor tool by wzy-777. The source is MIT-licensed; the released sender/receiver binaries link GPL-3.0-or-later FFmpeg and are distributed under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). The installer is built with MinGW + Inno Setup from the linked repository; it is not code-signed. Silent install (\`/VERYSILENT\`) is supported and skips the optional virtual display driver via \`/MERGETASKS=\"!installvdd\"\`, so unattended installs never block on a driver-consent dialog; the driver can be installed later with \`vdd\\install_vdd.ps1\`. Installer SHA-256 matches the GitHub release asset digest."
 
 if [ -z "$OPEN_PR" ]; then
   step "创建 PR"
@@ -434,7 +434,7 @@ else
   fi
   if [ "$CHANGES" = 1 ]; then
     if [ "${#PUBLISHED[@]}" -eq 0 ]; then
-      COMMENT="Updated to $VER (commit ${NEW_SHA:0:7}). The package has not been published yet, so this pull request now carries only the $VER manifest set instead of the previous unpublished version — a new-package pull request has to contain a single package version. Publisher, installer URL form, ARP entries and silent-install behaviour are unchanged; the installer SHA-256 ($HASH) matches the v$VER GitHub release asset digest."
+      COMMENT="Updated to $VER (commit ${NEW_SHA:0:7}). The package has not been published yet, so this pull request now carries only the $VER manifest set instead of the previous unpublished version — a new-package pull request has to contain a single package version. Publisher, installer URL form, ARP entries and the installer SHA-256 ($HASH) still match the v$VER GitHub release asset digest. Silent and silent-with-progress installs now pass /MERGETASKS=\"!installvdd\", so the optional virtual display driver is skipped during unattended installs — this removes the Windows driver-consent dialog that blocked validation. The driver can be installed later by running vdd\\install_vdd.ps1 as administrator."
     else
       COMMENT="Updated to $VER (commit ${NEW_SHA:0:7}). Installer SHA-256 ($HASH) matches the v$VER GitHub release asset digest."
     fi
