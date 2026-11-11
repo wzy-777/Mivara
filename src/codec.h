@@ -55,6 +55,14 @@ public:
      * this frame – skip it" (not an error). Returns "" on success. */
     std::string encode(const uint8_t *rgb24, std::vector<uint8_t> &out);
 
+    /* BGR24 variant for Windows capture. src_stride includes any row padding.
+     * The swscale pass converts directly to the encoder's YUV format, avoiding
+     * a separate full-frame BGR->RGB copy. DXGI frames are packed to BGR24 by
+     * the caller first: swscale's BGRA kernel is not pixel-identical to its
+     * BGR24 kernel (measured max 29 levels on synthetic input). */
+    std::string encodeBGR24(const uint8_t *bgr24, int src_stride,
+                            std::vector<uint8_t> &out);
+
     /* Request a keyframe for the next encode (best-effort IDR/I-frame). */
     void forceKeyframe();
 

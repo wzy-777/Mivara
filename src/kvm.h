@@ -15,7 +15,9 @@
  *   controller → target : KvmEvent  (16 bytes, repeated)
  *
  * After a KVM_FEATURE_HEARTBEAT negotiation, PING/PONG events travel in both
- * directions (3 s interval, 9 s receive deadline). Older peers get no PING.
+ * directions (KVM_HEARTBEAT_INTERVAL_MS, with a KVM_HEARTBEAT_TIMEOUT_MS
+ * receive deadline). Older peers get no PING. The controller automatically
+ * reconnects after an established session loses its socket.
  *
  * Authorization (protocol v2, PRD: 接收与授权)
  * -------------------------------------------
@@ -85,6 +87,12 @@
 #define KVM_MAGIC   0x4D564B31u   /* 'MVK1' on the wire */
 #define KVM_VERSION 2u
 #define KVM_FEATURE_HEARTBEAT 1u  /* KvmHello.reserved[1] / KvmReply.reserved */
+/* Heartbeat cadence. A stitch link is silent whenever the user is idle, so
+ * liveness has to be probed. Keep the deadline at three missed beats: a link
+ * change reports a socket error immediately, so a longer deadline would only
+ * make the target hold injected keys and its single-session slot longer. */
+#define KVM_HEARTBEAT_INTERVAL_MS 3000u
+#define KVM_HEARTBEAT_TIMEOUT_MS  9000u
 /* Reverse (target -> controller) drag copy. The controller advertises it when
  * its own file_drop_accept=1 (it can RECEIVE); the target echoes it when its
  * own file_drop_send=1 (it can SEND) and the 8085 listener is up. */
@@ -315,9 +323,23 @@ inline int kvmSideFromKey(const char *key)
  * Controller only: change the active side while a session is running. Safe to
  * call from any thread; the message loop applies it within one 50 ms tick.
  * If control is currently on the target it is handed back first (held keys
- * are released), then the new edge is armed. No-op outside a session.
+ * are released), then the new edge is armed. Outside a session the request is
+ * queued and used by the next session (including an automatic reconnect).
  */
 void kvmSetControllerSide(int side);
+
+/** Result codes for kvmRunController(). Only OK means "the caller stopped
+ *  it"; every other value carries a machine-readable failure class so the
+ *  resilient wrapper knows what may be retried. */
+enum KvmRunResult : int {
+    KVM_RUN_OK          = 0,   /* session ended by *running clearing        */
+    KVM_RUN_TRANSPORT   = 1,   /* connect/handshake/session I/O failure     */
+    KVM_RUN_DENIED      = 2,   /* target declined / local password cancelled */
+    KVM_RUN_UNSUPPORTED = 3,   /* stitch is not available on this platform  */
+    KVM_RUN_LOST        = 4,   /* an established session lost its socket    */
+    KVM_RUN_BUSY        = 5,   /* target's single session slot still held   */
+    KVM_RUN_PROTOCOL    = 6    /* version/protocol/local init; retry won't help */
+};
 
 /**
  * Controller side (sender): connect to peer_ip:peer_port, wait for the
@@ -337,15 +359,31 @@ void kvmSetControllerSide(int side);
  *   STAT|event=stitch|state=remote|mode=stitch|side=<side> (control on the target)
  *   STAT|event=stitch|state=local|mode=stitch|side=<side>  (control came back)
  *   STAT|event=stop|mode=stitch
- *   STAT|event=error|msg=<token>               (on failure)
+ *   STAT|event=error|msg=<token>               (on a non-retryable failure)
  *
- * Returns 0 on a clean session, 1 on connection/protocol failure, 2 when the
- * target declined or the authorization failed, and 3 when 拼接 is unsupported
- * on this platform.
+ * Returns a KvmRunResult. KVM_RUN_LOST means an established session's socket
+ * died (link change, peer restart, Wi-Fi roam); it deliberately emits no
+ * event=error because the resilient wrapper will retry.
  */
 int kvmRunController(const char *peer_ip, int peer_port, int side,
                      const std::atomic<bool> &running,
                      const KvmClientAuth *auth = nullptr);
+
+/**
+ * Controller side with automatic reconnect: runs kvmRunController and, after
+ * a session was established and then lost, reconnects with 1/2/4/8/16/30 s
+ * backoff until *running clears. Each wait is interruptible within 200 ms and
+ * emits
+ *   STAT|event=stitch|state=reconnecting|mode=stitch|side=<side>
+ *       |reason=<token>|err=<wsa>|retry=<n>|delay_ms=<ms>
+ * so the GUI keeps the session page and its stop button. A `STITCH|side=…`
+ * line received during the outage is applied to the next attempt. Failures
+ * before the first session (connect refused, busy, denied) return immediately
+ * as before; only a genuinely established-then-lost session is retried.
+ */
+int kvmRunControllerResilient(const char *peer_ip, int peer_port, int side,
+                              const std::atomic<bool> &running,
+                              const KvmClientAuth *auth = nullptr);
 
 /**
  * Target side (receiver): listen on KVM_PORT and serve one controller at a

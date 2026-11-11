@@ -550,6 +550,22 @@ static int recv_all(plat_sock_t s, void *buf, size_t len)
     return 0;
 }
 
+/* True when another stream byte is already pending. Used to coalesce display
+ * work only; coded AUs are still decoded in order to preserve references. */
+static bool stream_input_pending(plat_sock_t s)
+{
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(s, &rd);
+    struct timeval zero = {0, 0};
+#ifdef _WIN32
+    const int sel = select(0, &rd, nullptr, nullptr, &zero);
+#else
+    const int sel = select((int)s + 1, &rd, nullptr, nullptr, &zero);
+#endif
+    return sel > 0 && FD_ISSET(s, &rd);
+}
+
 static int send_all_p(plat_sock_t s, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
@@ -1971,6 +1987,7 @@ static bool runSession(GrantedSession &sess)
     SDL_Event ev;
     bool streaming = true;
     int frames_rx = 0;
+    int display_skips = 0;  /* bounded so a continuously busy socket cannot starve display */
     auto start_time = std::chrono::steady_clock::now();
 
     setActiveClient(client);
@@ -2160,6 +2177,18 @@ static bool runSession(GrantedSession &sess)
             }
             skip_until_key = 0;
 
+            /* Present can wait for vblank. If more bytes have already arrived,
+             * decode the next AU too but do not spend texture-upload/present
+             * time on this now-stale image. Never skip the decode itself:
+             * later H.264/H.265/AV1 frames may reference it. The bound keeps a
+             * continuously busy stream from starving presentation entirely. */
+            if (display_skips < 4 && stream_input_pending(client))
+            {
+                ++display_skips;
+                continue;
+            }
+            display_skips = 0;
+
             if (dec.fmt == DecodedFrame::FMT_I420)
             {
                 if (!ensureTex(SDL_PIXELFORMAT_IYUV, dec.width, dec.height))
@@ -2195,6 +2224,16 @@ static bool runSession(GrantedSession &sess)
         }
         else
         {
+            /* Raw/RLE frames have no reference dependencies, so a stale frame
+             * can skip both decompression and display when a newer one is
+             * already waiting. Use the same bounded catch-up as coded streams. */
+            if (display_skips < 4 && stream_input_pending(client))
+            {
+                ++display_skips;
+                continue;
+            }
+            display_skips = 0;
+
             /*
              * RLE decompression – per the negotiated codec. A full-size
              * payload is the raw fallback (GPU service unavailable).

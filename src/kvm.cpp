@@ -269,6 +269,16 @@ public:
         return true;
     }
 
+    /* Drop events left by a previous session. Only safe while no hooks are
+     * installed and the drain thread is not running (session start). A
+     * reconnect must never replay a stale button-up/key-up against the new
+     * session. */
+    void reset()
+    {
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+
 private:
     KvmEvent buf[CAP] = {};
     std::atomic<unsigned> head{0};
@@ -728,6 +738,40 @@ static bool dragImageSendDirect(kvm_sock_t s, const DropDragImage &img,
 
 std::atomic<bool>       g_netOK{true};
 std::atomic<bool>       g_heartbeat{false};
+
+/* Why the controller's drain loop gave up. Written by the drain thread,
+ * read by kvmRunControllerResilient() after it has joined that thread, and
+ * logged as a stable token so a field report can distinguish a link change
+ * (recv/select/send error) from a peer that really went away (EOF) or a
+ * heartbeat deadline from a protocol desync. */
+enum ControllerLoss : int {
+    LOSS_NONE = 0,
+    LOSS_PEER_CLOSED,
+    LOSS_RECV_ERROR,
+    LOSS_SELECT_ERROR,
+    LOSS_HEARTBEAT,
+    LOSS_SEND_ERROR,
+    LOSS_PROTOCOL_EVENT
+};
+static std::atomic<int> g_loss_code{LOSS_NONE};
+static std::atomic<int> g_loss_wsa{0};
+/* GetTickCount64 of the last successful event=start (0 = not established).
+ * The wrapper uses it to distinguish a real session that later dropped from a
+ * grant-then-drop crash loop, which must not reset the backoff to 1 s. */
+static ULONGLONG g_ctrl_session_start = 0;
+
+static const char *lossToken(int code)
+{
+    switch (code) {
+    case LOSS_PEER_CLOSED:    return "peer_closed";
+    case LOSS_RECV_ERROR:     return "recv_error";
+    case LOSS_SELECT_ERROR:   return "select_error";
+    case LOSS_HEARTBEAT:      return "heartbeat_timeout";
+    case LOSS_SEND_ERROR:     return "send_error";
+    case LOSS_PROTOCOL_EVENT: return "protocol_event";
+    default:                  return "unknown";
+    }
+}
 const std::atomic<bool> *g_running = nullptr;   /* true = keep the session */
 kvm_sock_t              g_sock = KVM_INVALID_SOCK;
 
@@ -883,6 +927,16 @@ static void emitStat(const std::string &line)
 static void emitStatError(const std::string &msg)
 {
     emitStat("event=error|msg=" + msg);
+}
+
+/* Human-readable diagnostic line on stdout. The GUI persists child stdout to
+ * app.log, so this is what makes a later "it disconnected again" report
+ * actionable (which side, which error, after how long). Serialised with
+ * emitStat() because the drain and message-loop threads both log. */
+static void emitLog(const std::string &line)
+{
+    std::lock_guard<std::mutex> lk(g_stat_out_mtx);
+    std::cout << "[kvm] " << line << "\n" << std::flush;
 }
 
 /* state=…|side=… — the GUI renders the local/remote hint and the active
@@ -1962,8 +2016,14 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         leaveRemote(true);
         PostQuitMessage(0);
         return 0;
-    case WM_DESTROY:
+    case WM_CLOSE:
         PostQuitMessage(0);
+        return 0;
+    case WM_DESTROY:
+        /* Never PostQuitMessage here. Teardown calls DestroyWindow() after the
+         * message loop has already exited; the synchronous WM_DESTROY would
+         * leave a WM_QUIT in this thread's queue, and the next reconnected
+         * session's GetMessageW() would return 0 immediately. */
         return 0;
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1972,16 +2032,37 @@ static LRESULT CALLBACK kvmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static void drainLoop()
 {
-    const ULONGLONG beat_ms = 3000, timeout_ms = 9000;
+    const ULONGLONG beat_ms = KVM_HEARTBEAT_INTERVAL_MS;
+    const ULONGLONG timeout_ms = KVM_HEARTBEAT_TIMEOUT_MS;
     ULONGLONG last_rx = GetTickCount64();
     ULONGLONG next_beat = last_rx + beat_ms;
+    ULONGLONG last_iter = last_rx;
     KvmEvent incoming = {};
     size_t incoming_bytes = 0;
-    const auto disconnected = [] {
+    const auto disconnected = [](int why, int wsa) {
+        /* Teardown shuts the socket down to wake this thread. That is not a
+         * peer loss and must not be logged as one. */
+        if (g_drainQuit.load(std::memory_order_relaxed)) return;
+        if (g_loss_code.load(std::memory_order_relaxed) == LOSS_NONE) {
+            g_loss_code.store(why, std::memory_order_relaxed);
+            g_loss_wsa.store(wsa, std::memory_order_relaxed);
+        }
+        emitLog(std::string("connection lost: ") + lossToken(why) +
+                (wsa ? " (wsa=" + std::to_string(wsa) + ")" : ""));
         g_netOK = false;
         if (g_hwnd) PostMessageW(g_hwnd, KVM_WM_DISCONNECT, 0, 0);
     };
     while (!g_drainQuit.load() && (!g_running || g_running->load())) {
+        /* A laptop resuming from sleep (or a long debugger/AV freeze) makes
+         * GetTickCount64 jump. That is not the peer going silent: restart the
+         * receive clock so a resume does not tear the session down. A socket
+         * that really died during the sleep still reports EOF/error below. */
+        const ULONGLONG iter_now = GetTickCount64();
+        if (g_heartbeat.load() && iter_now - last_iter > 3000) {
+            last_rx = iter_now;
+            next_beat = iter_now + beat_ms;
+        }
+        last_iter = iter_now;
         fd_set rd, ex;
         FD_ZERO(&rd);
         FD_ZERO(&ex);
@@ -1992,15 +2073,18 @@ static void drainLoop()
          * no timeBeginPeriod is active (sender.exe never calls it). */
         timeval tv = {0, g_queue.empty() ? 1000 : 0};
         const int selected = select(0, &rd, nullptr, &ex, &tv);
-        if (selected < 0) { disconnected(); break; }
+        if (selected < 0) {
+            disconnected(LOSS_SELECT_ERROR, WSAGetLastError());
+            break;
+        }
         if (selected > 0) {
             const int n = recv(g_sock, (char *)&incoming + incoming_bytes,
                                (int)(sizeof(incoming) - incoming_bytes), 0);
-            if (n == 0) { disconnected(); break; }
+            if (n == 0) { disconnected(LOSS_PEER_CLOSED, 0); break; }
             if (n < 0) {
                 const int err = WSAGetLastError();
                 if (err != WSAEWOULDBLOCK && err != WSAEINTR) {
-                    disconnected();
+                    disconnected(LOSS_RECV_ERROR, err);
                     break;
                 }
             } else {
@@ -2012,7 +2096,9 @@ static void drainLoop()
                         KvmEvent pong = {};
                         pong.type = htonl(KVM_EV_PONG);
                         if (!kvmSendAll(g_sock, &pong, sizeof(pong))) {
-                            disconnected();
+                            /* A failed send may have queued a partial frame;
+                             * never retry or continue this stream. */
+                            disconnected(LOSS_SEND_ERROR, WSAGetLastError());
                             break;
                         }
                     } else if (type == KVM_EV_RDRAG && g_reverse_ok) {
@@ -2106,7 +2192,9 @@ static void drainLoop()
                                 ++g_rev_image_ver;
                         }
                     } else if (type != KVM_EV_PONG || !g_heartbeat.load()) {
-                        disconnected();
+                        /* Unknown event type: the 16-byte stream is out of
+                         * sync (or the peer is not the build it claims). */
+                        disconnected(LOSS_PROTOCOL_EVENT, 0);
                         break;
                     }
                     incoming_bytes = 0;
@@ -2115,12 +2203,17 @@ static void drainLoop()
         }
         if (g_heartbeat.load()) {
             const ULONGLONG now = GetTickCount64();
-            if (now - last_rx >= timeout_ms) { disconnected(); break; }
+            if (now - last_rx >= timeout_ms) {
+                disconnected(LOSS_HEARTBEAT, 0);
+                break;
+            }
             if (now >= next_beat) {
                 KvmEvent ping = {};
                 ping.type = htonl(KVM_EV_PING);
                 if (!kvmSendAll(g_sock, &ping, sizeof(ping))) {
-                    disconnected();
+                    /* Never retry a failed fixed-stream send: the prefix may
+                     * already be queued. */
+                    disconnected(LOSS_SEND_ERROR, WSAGetLastError());
                     break;
                 }
                 next_beat = now + beat_ms;
@@ -2141,7 +2234,7 @@ static void drainLoop()
             wire.b = htonl(e.b);
             wire.c = htonl(e.c);
             if (!kvmSendAll(g_sock, &wire, sizeof(wire))) {
-                disconnected();
+                disconnected(LOSS_SEND_ERROR, WSAGetLastError());
                 send_ok = false;
                 break;
             }
@@ -2283,7 +2376,7 @@ static void kvmAuthErrorText(uint32_t status, std::string &out)
     }
 }
 
-enum class AuthOutcome { Ok, Status, Cancelled, Transport };
+enum class AuthOutcome { Ok, Status, Cancelled, Transport, Protocol };
 
 /* Controller half of the v2 authorization exchange: identity frame, optional
  * password proof, then the receiver's verdict. The client's verdict is left in
@@ -2315,7 +2408,7 @@ static AuthOutcome kvmClientAuthorize(kvm_sock_t s, const KvmHello &hello,
         const uint32_t iter = ntohl(as.kdf_iter);
         if (iter < HS_KDF_ITER_MIN || iter > HS_KDF_ITER_MAX) {
             why = "对方下发的密码参数无效";
-            return AuthOutcome::Transport;
+            return AuthOutcome::Protocol;
         }
         std::string pw;
         if (!auth || !auth->password) {
@@ -2375,7 +2468,7 @@ static AuthOutcome kvmClientAuthorize(kvm_sock_t s, const KvmHello &hello,
     }
     if (ntohl(res.magic) != TVHS_MAGIC || ntohl(res.version) != TVHS_VERSION) {
         why = "拼接授权应答无效";
-        return AuthOutcome::Transport;
+        return AuthOutcome::Protocol;
     }
     status = ntohl(res.status);
     return status == HS_OK ? AuthOutcome::Ok : AuthOutcome::Status;
@@ -2387,11 +2480,45 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
                      const std::atomic<bool> &running,
                      const KvmClientAuth *auth)
 {
-    if (!peer_ip || !*peer_ip) return 1;
+    if (!peer_ip || !*peer_ip) return KVM_RUN_PROTOCOL;
+
+    /* Clear anything a previous teardown left in this thread's queue (most
+     * importantly WM_QUIT from the old hidden window). The sender owns this
+     * thread, so no other component uses these messages. */
+    MSG pre;
+    while (PeekMessageW(&pre, nullptr, 0, 0, PM_REMOVE)) {
+        if (pre.message == KVM_WM_DRAG_ICON)
+            delete (DragIconPost *)pre.lParam;
+    }
 
     g_running = &running;
     g_netOK = true;
+    g_loss_code = LOSS_NONE;
+    g_loss_wsa = 0;
+    g_ctrl_session_start = 0;
     g_drainQuit = false;
+    /* A previous session may have stopped with events still queued (a final
+     * button-up, a drag frame). Replaying them against the new target would
+     * inject input the user never made. The hooks and drain thread are gone
+     * at this point, so the ring has no concurrent access. */
+    g_queue.reset();
+    {
+        /* Stale reverse-drag ghost state from a lost session must not be
+         * painted by the first reverse drag of the new one. No drain thread
+         * or message loop exists here. */
+        std::lock_guard<std::mutex> lk(g_rev_mtx);
+        g_rev_ready = false;
+        g_rev_visible = false;
+        g_rev_name.clear();
+        g_rev_count = 0;
+        g_rev_frames = 0;
+        g_rev_icon_acc.reset();
+        g_rev_icon.clear();
+        ++g_rev_icon_ver;
+        g_rev_image_acc.reset();
+        g_rev_image.clear();
+        ++g_rev_image_ver;
+    }
     g_state = ControlState::Local;
     g_cursor_hidden = false;
     g_edge_overshoot = 0;
@@ -2462,9 +2589,12 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     for (int attempt = 0; attempt < 2; attempt++) {
         g_sock = connectTimeout(peer_ip, peer_port, running, 5000);
         if (g_sock == KVM_INVALID_SOCK) {
+            /* connectTimeout also fails when the owner cleared *running mid-
+             * connect; that is a stop, not a connection error. */
+            if (!running.load()) return KVM_RUN_OK;
             emitStatError("无法连接拼接端口 " + std::to_string(peer_port) +
                           "（对方需先启动接收）");
-            return 1;
+            return KVM_RUN_TRANSPORT;
         }
         BOOL nodelay = TRUE;
         setsockopt(g_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay,
@@ -2496,10 +2626,10 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             (reverse_capable ? KVM_FEATURE_REVERSE_DROP : 0u) |
             (reverse_capable ? ((uint32_t)DROP_REVERSE_PORT << 16) : 0u));
         if (!kvmSendAll(g_sock, &hello, sizeof(hello))) {
-            emitStatError("拼接握手发送失败");
+            if (running.load()) emitStatError("拼接握手发送失败");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_TRANSPORT;
         }
 
         /* The target answers with one of three frames; the first word tells
@@ -2510,16 +2640,16 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         int rv = kvmRecvAllPoll(g_sock, &first_raw, sizeof(first_raw),
                                 running, 35000);
         if (rv == 0) {
-            emitStatError("对方未在 35 秒内回应拼接请求");
+            if (running.load()) emitStatError("对方未在 35 秒内回应拼接请求");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_TRANSPORT;
         }
         if (rv < 0) {
             if (running.load()) emitStatError("拼接握手失败（连接已断开）");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_TRANSPORT;
         }
         const uint32_t first = ntohl(first_raw);
 
@@ -2533,45 +2663,55 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
                 if (running.load()) emitStatError("拼接握手失败（对方应答不完整）");
                 kvmClose(g_sock);
                 g_sock = KVM_INVALID_SOCK;
-                return 1;
+                return KVM_RUN_TRANSPORT;
             }
             if (ntohl(reply.version) != KVM_VERSION) {
                 emitStatError("拼接协议版本不一致，请将两端更新到同一版本");
                 kvmClose(g_sock);
                 g_sock = KVM_INVALID_SOCK;
-                return 1;
+                return KVM_RUN_PROTOCOL;
             }
             status = ntohl(reply.status);
             if (status != KVM_ERR_BUSY || attempt == 1) break;
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            if (!running.load()) return 1;
+            if (!running.load()) return KVM_RUN_TRANSPORT;
             Sleep(300);
             continue;
         }
 
         if (first == TVHS_MAGIC) {
             /* A refusal sent before the challenge: the receiver's password
-             * record is missing/corrupt (fail closed), never a downgrade. */
+             * record is missing/corrupt (fail closed) or its session slot is
+             * still busy. Both are non-transport answers; BUSY is retryable. */
             HsResponseV2 res = {};
             res.magic = first_raw;
             rv = kvmRecvAllPoll(g_sock, (char *)&res + sizeof(uint32_t),
                                 sizeof(res) - sizeof(uint32_t), running, 35000);
+            if (rv <= 0) {
+                if (running.load()) emitStatError("拼接授权握手失败（对方应答不完整）");
+                kvmClose(g_sock);
+                g_sock = KVM_INVALID_SOCK;
+                return KVM_RUN_TRANSPORT;
+            }
             std::string why = "拼接授权被拒绝";
-            if (rv > 0 && ntohl(res.magic) == TVHS_MAGIC &&
-                ntohl(res.version) == TVHS_VERSION)
-                kvmAuthErrorText(ntohl(res.status), why);
+            uint32_t res_status = 0;
+            if (ntohl(res.magic) == TVHS_MAGIC &&
+                ntohl(res.version) == TVHS_VERSION) {
+                res_status = ntohl(res.status);
+                kvmAuthErrorText(res_status, why);
+            }
             emitStatError(why);
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 2;
+            return res_status == HS_ERR_BUSY ? KVM_RUN_BUSY : KVM_RUN_DENIED;
         }
 
         if (first != TVHA_MAGIC) {
             emitStatError("拼接握手失败（对方不是 Mivara 接收端）");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_PROTOCOL;
         }
 
         HsAuthStart as = {};
@@ -2582,13 +2722,13 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             if (running.load()) emitStatError("拼接授权握手失败（对方应答不完整）");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_TRANSPORT;
         }
         if (ntohl(as.version) != TVHA_VERSION) {
             emitStatError("拼接协议版本不一致，请将两端更新到同一版本");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_PROTOCOL;
         }
         const uint32_t auth_mode = ntohl(as.mode);
         if (auth_mode != AUTH_MODE_OPEN && auth_mode != AUTH_MODE_PASSWORD &&
@@ -2597,7 +2737,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             emitStatError("对方下发的授权方式无效");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 2;
+            return KVM_RUN_PROTOCOL;
         }
 
         uint32_t auth_status = 0;
@@ -2609,25 +2749,34 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             if (auth && auth->report && ao != AuthOutcome::Cancelled)
                 auth->report("cancelled", nullptr, auth->ctx);
             if (ao == AuthOutcome::Status) kvmAuthErrorText(auth_status, why);
-            emitStatError(why);
+            if (running.load()) emitStatError(why);
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return ao == AuthOutcome::Transport ? 1 : 2;
+            if (ao == AuthOutcome::Transport) return KVM_RUN_TRANSPORT;
+            if (ao == AuthOutcome::Protocol) return KVM_RUN_PROTOCOL;
+            if (ao == AuthOutcome::Cancelled) return KVM_RUN_DENIED;
+            return auth_status == HS_ERR_BUSY ? KVM_RUN_BUSY : KVM_RUN_DENIED;
         }
         /* Authorized: the metrics reply follows the verdict. */
         reply = KvmReply{};
         rv = kvmRecvAllPoll(g_sock, &reply, sizeof(reply), running, 35000);
-        if (rv <= 0 || ntohl(reply.magic) != KVM_MAGIC) {
+        if (rv <= 0) {
             if (running.load()) emitStatError("拼接授权后未收到会话参数");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_TRANSPORT;
+        }
+        if (ntohl(reply.magic) != KVM_MAGIC) {
+            if (running.load()) emitStatError("拼接授权后应答格式无效");
+            kvmClose(g_sock);
+            g_sock = KVM_INVALID_SOCK;
+            return KVM_RUN_PROTOCOL;
         }
         if (ntohl(reply.version) != KVM_VERSION) {
             emitStatError("拼接协议版本不一致，请将两端更新到同一版本");
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 1;
+            return KVM_RUN_PROTOCOL;
         }
         status = ntohl(reply.status);
         if (status != KVM_OK) {
@@ -2636,7 +2785,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             emitStatError(why);
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
-            return 2;
+            return status == KVM_ERR_BUSY ? KVM_RUN_BUSY : KVM_RUN_DENIED;
         }
         if (auth && auth->report) auth->report("granted", nullptr, auth->ctx);
         break;
@@ -2650,7 +2799,9 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             emitStatError("拼接请求被拒绝（错误码 " + std::to_string(status) + "）");
         kvmClose(g_sock);
         g_sock = KVM_INVALID_SOCK;
-        return 2;
+        return status == KVM_ERR_BUSY ? KVM_RUN_BUSY
+              : status == KVM_ERR_DENIED ? KVM_RUN_DENIED
+                                         : KVM_RUN_PROTOCOL;
     }
 
     g_heartbeat = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
@@ -2678,7 +2829,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             g_sock = KVM_INVALID_SOCK;
             g_drop_ready = false;
             g_reverse_ok = false;
-            return 1;
+            return KVM_RUN_TRANSPORT;
         }
         for (int i = 0; i < 8; i++) {
             rv2 = kvmRecvAllPoll(g_sock, &ev, sizeof(ev), running, 35000);
@@ -2689,7 +2840,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
                 g_sock = KVM_INVALID_SOCK;
                 g_drop_ready = false;
                 g_reverse_ok = false;
-                return 1;
+                return KVM_RUN_TRANSPORT;
             }
             const uint32_t word = ntohl(ev.b);
             std::memcpy(g_drop_token + i * 4, &word, 4);
@@ -2704,19 +2855,54 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     /* Reverse (target → controller): if the peer also sends, run OUR 8085
      * listener with the same session token and let its edge helper drive the
      * crossing in the opposite direction. */
+    struct DropServiceGuard {
+        bool started = false;
+        ~DropServiceGuard()
+        {
+            if (!started) return;
+            g_drop_service_run = false;
+            if (g_drop_service.joinable()) g_drop_service.join();
+            dropGateClear(/*epoch=*/1);
+        }
+    } drop_guard;
     if (g_reverse_ok) {
         /* Dedicated port: a local receiver.exe already owns 8085 (the usual
          * always-receiving setup), and binding it here used to fail silently,
          * leaving the token installed in a process that never served it —
          * every reverse transfer then got DROP_ERR_AUTH. */
         dropGateInstall(g_drop_token, /*epoch=*/1);
+        /* Publish "starting" before the worker runs, so a stale success from
+         * the previous session cannot be mistaken for this bind. */
+        dropServiceStatusReset();
         g_drop_service_run = true;
         g_drop_service = std::thread([] {
             dropServiceRun(g_drop_service_run,
                            (uint16_t)DROP_REVERSE_PORT);
         });
-        emitStat("event=drop|state=reverse_ready|port=" +
-                 std::to_string((int)DROP_REVERSE_PORT));
+        int st = 0;
+        /* cleanupStaging() runs before bind and may take a moment; allow 2 s
+         * without delaying the normal case (usually the first 20 ms tick). */
+        for (int i = 0; i < 100 && st == 0; ++i) {
+            Sleep(20);
+            st = dropServiceStatus().state;
+        }
+        if (st == 1) {
+            drop_guard.started = true;
+            emitStat("event=drop|state=reverse_ready|port=" +
+                     std::to_string((int)DROP_REVERSE_PORT));
+        } else {
+            /* A reconnect can land while the previous listener's accepted
+             * socket is still in TIME_WAIT; SO_EXCLUSIVEADDRUSE then makes
+             * the rebind fail. Never advertise reverse_ready in that case. */
+            emitLog("reverse file-drop listener failed on port " +
+                    std::to_string((int)DROP_REVERSE_PORT) + " (state=" +
+                    std::to_string(st) + ")");
+            g_drop_service_run = false;
+            if (g_drop_service.joinable()) g_drop_service.join();
+            dropGateClear(/*epoch=*/1);
+            emitStat("event=drop|state=reverse_error|port=" +
+                     std::to_string((int)DROP_REVERSE_PORT));
+        }
     }
 
     g_tgt_x0 = (int)(int32_t)ntohl((uint32_t)reply.screen_x);
@@ -2739,19 +2925,34 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     wc.lpfnWndProc = kvmWndProc;
     wc.hInstance = inst;
     wc.lpszClassName = cls;
+    /* The controller can be entered more than once in one process now (the
+     * resilient wrapper reconnects). Every early return below must undo the
+     * class/drop-listener setup, or the next attempt fails with
+     * ERROR_CLASS_ALREADY_EXISTS or overwrites a joinable std::thread. */
+    bool class_registered = false;
+    struct ClassGuard {
+        bool &registered;
+        const wchar_t *name;
+        HINSTANCE inst;
+        ~ClassGuard()
+        {
+            if (registered) UnregisterClassW(name, inst);
+        }
+    } class_guard{class_registered, cls, inst};
     if (!RegisterClassExW(&wc)) {
         emitStatError("拼接初始化失败（窗口类）");
         kvmClose(g_sock);
         g_sock = KVM_INVALID_SOCK;
-        return 1;
+        return KVM_RUN_PROTOCOL;
     }
+    class_registered = true;
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, cls, L"Mivara Stitch Input",
                              0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) {
         emitStatError("拼接初始化失败（隐藏窗口）");
         kvmClose(g_sock);
         g_sock = KVM_INVALID_SOCK;
-        return 1;
+        return KVM_RUN_PROTOCOL;
     }
 
     RAWINPUTDEVICE rid = {};
@@ -2765,7 +2966,10 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         g_hwnd = nullptr;
         kvmClose(g_sock);
         g_sock = KVM_INVALID_SOCK;
-        return 1;
+        /* Can fail transiently during a desktop/UAC transition; the wrapper
+         * retries it only after an established session (never on the first
+         * connection, which keeps the old one-shot error). */
+        return KVM_RUN_TRANSPORT;
     }
 
     g_hMouse = SetWindowsHookExW(WH_MOUSE_LL, mouseProc, inst, 0);
@@ -2784,13 +2988,14 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         g_hwnd = nullptr;
         kvmClose(g_sock);
         g_sock = KVM_INVALID_SOCK;
-        return 1;
+        return KVM_RUN_TRANSPORT;
     }
 
     if (g_drag_icon) g_drag_icon_worker.start();
     g_drain = std::thread(drainLoop);
     SetTimer(g_hwnd, KVM_TIMER_ID, 50, nullptr);
 
+    g_ctrl_session_start = GetTickCount64();
     emitStat("event=start|mode=stitch|dst=" + std::string(peer_ip));
     emitStitchState("local");
     std::cout << "Stitch controller active – peer desktop " << g_tgt_w << "x"
@@ -2862,13 +3067,118 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         g_hwnd = nullptr;
     }
     UnregisterClassW(cls, inst);
+    class_registered = false;
     kvmClose(g_sock);
     g_sock = KVM_INVALID_SOCK;
 
+    /* A lost session is not a failure the user must see: the resilient
+     * wrapper reconnects and the GUI keeps the session page. Suppress the
+     * stop line too, so the panel never flashes "会话已结束" between the loss
+     * and the first state=reconnecting line. Only a local stop or a clean
+     * end is terminal. */
+    if (!g_netOK.load() && running.load()) return KVM_RUN_LOST;
     emitStat("event=stop|mode=stitch");
-    if (!g_netOK.load() && running.load())
-        emitStatError("拼接连接已断开");
-    return 0;
+    return KVM_RUN_OK;
+}
+
+/* Sleep in slices so STOP|mivara (which clears *running on the stdin thread)
+ * never has to wait out a 30 s backoff. Returns false when asked to stop. */
+static bool kvmSleepRetry(int ms, const std::atomic<bool> &running)
+{
+    const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)ms;
+    while (running.load()) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return true;
+        const ULONGLONG left = deadline - now;
+        Sleep((DWORD)(left < 200 ? left : 200));
+    }
+    return false;
+}
+
+int kvmRunControllerResilient(const char *peer_ip, int peer_port, int side,
+                              const std::atomic<bool> &running,
+                              const KvmClientAuth *auth)
+{
+    bool had_session = false;
+    int retry = 0;
+    int busy_streak = 0;
+    int last_loss = LOSS_NONE;
+    int last_wsa = 0;
+    for (;;) {
+        const int rc = kvmRunController(peer_ip, peer_port, side, running, auth);
+        /* A local stop wins over whatever the attempt reported: a password
+         * prompt cancelled by STOP must not be shown as a terminal error. */
+        if (!running.load()) return KVM_RUN_OK;
+        if (rc == KVM_RUN_OK || rc == KVM_RUN_DENIED ||
+            rc == KVM_RUN_UNSUPPORTED || rc == KVM_RUN_PROTOCOL)
+            return rc;
+        if (rc == KVM_RUN_BUSY) {
+            /* The target is reachable but another session holds its slot.
+             * A link-drop race clears within the heartbeat deadline; a truly
+             * occupied target must not keep this UI in "reconnecting" forever. */
+            if (++busy_streak >= 20) {
+                emitStatError("对方正在接收其他连接，已停止自动重连");
+                return KVM_RUN_BUSY;
+            }
+        } else {
+            busy_streak = 0;
+        }
+        if (rc == KVM_RUN_LOST) {
+            last_loss = g_loss_code.load(std::memory_order_relaxed);
+            last_wsa = g_loss_wsa.load(std::memory_order_relaxed);
+            if (last_loss == LOSS_PROTOCOL_EVENT) {
+                /* A stream that delivered an unknown event type will not be
+                 * fixed by reconnecting; retrying would loop silently. */
+                emitStatError("拼接事件流校验失败，请将两端更新到同一版本");
+                return KVM_RUN_PROTOCOL;
+            }
+            /* An established session lost its socket. Reset the backoff only
+             * if it actually stayed up; a grant-then-immediate-drop loop
+             * (half-open path, peer crash loop) must escalate instead of
+             * reconnecting every second. */
+            had_session = true;
+            const ULONGLONG lasted = g_ctrl_session_start
+                                         ? GetTickCount64() - g_ctrl_session_start
+                                         : 0;
+            if (lasted >= 30000) retry = 1;
+            else if (retry < 16) ++retry;
+            if (retry < 1) retry = 1;
+        } else if (!had_session) {
+            /* Nothing was ever established: preserve the old one-shot error
+             * semantics (GUI shows "无法连接"/"对方已有一个拼接会话"). */
+            return rc;
+        } else if (retry < 16) {
+            ++retry;
+        }
+        int delay_ms = 1000;
+        for (int i = 1; i < retry && delay_ms < 30000; ++i) delay_ms *= 2;
+        if (delay_ms > 30000) delay_ms = 30000;
+
+        /* A STITCH|side request can arrive during the outage (the GUI chips
+         * stay live). It was queued by kvmSetControllerSide(); use it for the
+         * display line and pass it into the next attempt so g_side is not
+         * reset to the original CLI value. */
+        int side_now = g_side;
+        const int queued = g_side_req.load(std::memory_order_relaxed);
+        if (queued >= (int)KVM_SIDE_LEFT && queued <= (int)KVM_SIDE_BOTTOM)
+            side_now = queued;
+        side = side_now;
+
+        /* Keep the original session-loss reason across failed retries (those
+         * emit their own event=error line); resetting g_loss_code at the top
+         * of each kvmRunController() must not turn the panel's reason into
+         * "unknown". */
+        emitStat(std::string("event=stitch|state=reconnecting|mode=stitch|side=") +
+                 kvmSideKey(side_now) + "|reason=" + lossToken(last_loss) +
+                 "|err=" + std::to_string(last_wsa) +
+                 "|retry=" + std::to_string(retry) +
+                 "|delay_ms=" + std::to_string(delay_ms));
+        emitLog("reconnect attempt " + std::to_string(retry) + " in " +
+                std::to_string(delay_ms) + " ms (reason=" +
+                lossToken(last_loss) +
+                (last_wsa ? ", wsa=" + std::to_string(last_wsa) : "") + ")");
+        if (!kvmSleepRetry(delay_ms, running)) return KVM_RUN_OK;
+    }
 }
 
 void kvmSetControllerSide(int side)
@@ -3430,6 +3740,11 @@ struct HeartbeatState {
     bool enabled = false;
     ULONGLONG last_rx = 0;
     ULONGLONG next_tx = 0;
+    /* Why the receive loop ended, for the target's session-end log. Stable
+     * tokens: local_stop / deadline / heartbeat_timeout / ping_send_error /
+     * peer_closed / recv_error. */
+    const char *reason = nullptr;
+    int err = 0;
 };
 
 /* deadline_ms == 0 means "until shutdown/EOF"; used for the hello so a peer
@@ -3447,18 +3762,36 @@ static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
     char *p = (char *)buf;
     size_t off = 0;
     const ULONGLONG start = GetTickCount64();
+    ULONGLONG last_iter = start;
     const auto finish = [&](bool ok, bool deadline) {
         if (got) *got = off;
         if (timed_out) *timed_out = deadline;
         return ok;
     };
+    const auto fail = [&](const char *why, int err) {
+        if (hb) {
+            hb->reason = why;
+            hb->err = err;
+        }
+        return finish(false, false);
+    };
     while (off < len) {
-        if (!running.load()) return finish(false, false);
-        if (deadline_ms && GetTickCount64() - start > deadline_ms)
+        const ULONGLONG now = GetTickCount64();
+        /* Suspend/starve: the process, not the peer, was frozen. Restart the
+         * heartbeat clock; a socket that really died still errors below. */
+        if (hb && hb->enabled && now - last_iter > 3000) {
+            hb->last_rx = now;
+            hb->next_tx = now + KVM_HEARTBEAT_INTERVAL_MS;
+        }
+        last_iter = now;
+        if (!running.load()) return fail("local_stop", 0);
+        if (deadline_ms && now - start > deadline_ms) {
+            if (hb) hb->reason = "deadline";
             return finish(false, true);
+        }
         if (hb && hb->enabled) {
-            const ULONGLONG now = GetTickCount64();
-            if (now - hb->last_rx >= 9000) return finish(false, false);
+            if (now - hb->last_rx >= KVM_HEARTBEAT_TIMEOUT_MS)
+                return fail("heartbeat_timeout", 0);
             if (now >= hb->next_tx) {
                 KvmEvent ping = {};
                 ping.type = htonl(KVM_EV_PING);
@@ -3471,16 +3804,16 @@ static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
                 } else {
                     sent = kvmSendAll(s, &ping, sizeof(ping));
                 }
-                if (!sent) return finish(false, false);
-                hb->next_tx = now + 3000;
+                if (!sent) return fail("ping_send_error", WSAGetLastError());
+                hb->next_tx = now + KVM_HEARTBEAT_INTERVAL_MS;
             }
         }
         int n = recv(s, p + off, (int)(len - off), 0);
-        if (n == 0) return finish(false, false);
+        if (n == 0) return fail("peer_closed", 0);
         if (n < 0) {
             int err = WSAGetLastError();
             if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
-            return finish(false, false);
+            return fail("recv_error", err);
         }
         if (hb) hb->last_rx = GetTickCount64();
         off += (size_t)n;
@@ -3750,6 +4083,7 @@ struct HsEntry {
     int         strikes = 0;
     ULONGLONG   until = 0;   /* abuse-cooldown end (0 = none) */
     ULONGLONG   last = 0;    /* last admission, for eviction */
+    ULONGLONG   last_success = 0; /* completed session; see hsRelease */
 };
 static HsEntry g_kvm_hs[KVM_HS_SLOTS];
 static unsigned g_kvm_hs_next = 0;
@@ -3817,9 +4151,16 @@ static void hsRelease(const std::string &ip, bool admitted, bool abandoned,
     if (success) {
         e->strikes = 0;
         e->until = 0;
+        e->last_success = GetTickCount64();
         return;
     }
     if (!abandoned) return;
+    /* Abandons right after a completed session are a reconnect over a flaky
+     * link, not handshake abuse; punishing them turns a 20 s outage into a
+     * minute-long cooldown. */
+    if (e->last_success &&
+        GetTickCount64() - e->last_success < 60000)
+        return;
     e->strikes++;
     if (e->strikes > KVM_HS_FREE_ABANDONS) {
         const int step = e->strikes - KVM_HS_FREE_ABANDONS - 1; /* 0,1,2... */
@@ -4280,7 +4621,7 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
     HeartbeatState hb;
     hb.enabled = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
     hb.last_rx = GetTickCount64();
-    hb.next_tx = hb.last_rx + 3000;
+    hb.next_tx = hb.last_rx + KVM_HEARTBEAT_INTERVAL_MS;
     if (!kvmSendAll(client, &reply, sizeof(reply))) {
         mivaraSecureZero(drop_token, sizeof(drop_token));
         return;
@@ -4528,9 +4869,13 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
                                       << std::flush;
                             /* Release point is resolved by the CONTROLLER
                              * from its own cursor, so x/y stay unused here. */
+                            /* Session-scoped liveness, not the receiver's
+                             * process-wide flag: when the 8084 session dies,
+                             * teardown must be able to abort an in-flight
+                             * reverse copy and free the single-session slot. */
                             const DropResult r =
                                 dropSendFiles(opt, files, rev_token.data(),
-                                              running);
+                                              reverse_session);
                             std::cout << "[drop] reverse transfer to " << peer_ip
                                       << " status=" << r.status
                                       << " committed=" << r.committed
@@ -4589,6 +4934,10 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
                 pong.type = htonl(KVM_EV_PONG);
                 std::lock_guard<std::mutex> lk(tx_mtx);
                 io_ok = kvmSendAll(client, &pong, sizeof(pong));
+                if (!io_ok) {
+                    hb.reason = "pong_send_error";
+                    hb.err = WSAGetLastError();
+                }
             }
             break;
         case KVM_EV_DRAG_INFO:
@@ -4684,12 +5033,20 @@ static void serveClient(kvm_sock_t client, const std::string &peer_ip,
             break;
         }
     }
-    ghostEnd();
+    /* Release injected input before any join/helper teardown: the KVM session
+     * is already over, and a reverse transfer can take seconds to wind down.
+     * reverse_session is the drop's liveness flag, so clearing it aborts the
+     * transfer and bounds the watcher join. */
+    releaseAll(held);
     reverse_session = false;
+    ghostEnd();
     if (reverse_watcher.joinable()) reverse_watcher.join();
     if (reverse_cap_started) dropHelperStop();
-    releaseAll(held);
-    std::cout << "[kvm] stitch session from " << peer_ip << " ended\n"
+    const char *end_reason =
+        hb.reason ? hb.reason : (io_ok ? "local_stop" : "pong_send_error");
+    std::cout << "[kvm] stitch session from " << peer_ip << " ended (reason="
+              << end_reason
+              << (hb.err ? ", err=" + std::to_string(hb.err) : "") << ")\n"
               << std::flush;
 }
 
@@ -4855,6 +5212,13 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     std::cout << "STAT|event=error|msg=拼接模式目前仅支持 Windows\n"
               << std::flush;
     return 3;
+}
+
+int kvmRunControllerResilient(const char *peer_ip, int peer_port, int side,
+                              const std::atomic<bool> &running,
+                              const KvmClientAuth *auth)
+{
+    return kvmRunController(peer_ip, peer_port, side, running, auth);
 }
 
 void kvmSetControllerSide(int side)

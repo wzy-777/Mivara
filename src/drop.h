@@ -104,6 +104,10 @@ struct DropStartupStatus {
     uint16_t port;
 };
 DropStartupStatus dropServiceStatus();
+/** Reset the published startup result to "starting" before launching a new
+ *  dropServiceRun thread, so a caller can wait for THIS attempt's bind result
+ *  instead of reading the previous session's state. */
+void dropServiceStatusReset();
 
 /** Target (receiver): listen until *running clears. The token gate is
  *  installed by the 8084 session thread; without a gate every connection is

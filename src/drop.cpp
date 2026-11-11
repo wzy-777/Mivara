@@ -1204,6 +1204,11 @@ DropStartupStatus dropServiceStatus()
     return st;
 }
 
+void dropServiceStatusReset()
+{
+    reportStartup(0, 0, 0);
+}
+
 bool dropGateInstall(const uint8_t token[DROP_TOKEN_BYTES], uint64_t epoch)
 {
     if (!token) return false;
@@ -1584,6 +1589,10 @@ DropStartupStatus dropServiceStatus()
     st.state = 2;
     st.port = (uint16_t)DROP_PORT;
     return st;
+}
+
+void dropServiceStatusReset()
+{
 }
 
 void dropServiceRun(std::atomic<bool> &, uint16_t) {}

@@ -538,6 +538,13 @@ enum SendPhase {
 };
 static SendPhase g_send_phase = SP_IDLE;
 
+/* A stitch controller that lost its socket stays alive and reconnects. The
+ * session page must remain visible (with its stop button) and every STAT line
+ * produced during the outage must not be mistaken for a fresh session. */
+static bool g_stitch_reconnecting = false;
+static const char *const kStitchReconnectNote =
+    "连接中断，正在自动重连";
+
 /* STAT lines are last-wins and can arrive out of order on a slow link: once the
  * session is live, an older auth line must not drag the UI back to 等待授权. */
 static void setSendPhase(SendPhase p)
@@ -828,8 +835,10 @@ struct LiveStats {
     bool valid = false;
     std::string event, msg;
     std::string fps, kbps, codec, hw, mode, src, dst, quality, frames, t;
-    std::string state;      /* event=stitch: waiting | local | remote */
+    std::string state;      /* event=stitch: waiting | local | remote | reconnecting */
     std::string side;       /* event=stitch: left | right | top | bottom */
+    std::string retry;      /* event=stitch state=reconnecting: attempt number */
+    std::string reason;     /* event=stitch state=reconnecting: loss token */
     std::string id;         /* event=auth: approval request id            */
     std::string dev, ip;    /* event=auth|start|stop: peer identity      */
     std::string req;        /* event=auth: video (8081) | stitch (8084) | files (8086) */
@@ -3054,6 +3063,8 @@ static void parseStatLine(const std::string &line, bool from_receiver)
             else if (k == "msg") s.msg = v;
             else if (k == "state") s.state = v;
             else if (k == "side") s.side = v;
+            else if (k == "retry") s.retry = v;
+            else if (k == "reason") s.reason = v;
             else if (k == "id") s.id = v;
             else if (k == "dev") s.dev = v;
             else if (k == "ip") s.ip = v;
@@ -3074,6 +3085,10 @@ static void parseStatLine(const std::string &line, bool from_receiver)
         applyReceiverStat(s);
         return;
     }
+    /* Once the user asked to stop, a line that was already in the pipe must
+     * not resurrect the session UI (a reconnecting/start line can arrive
+     * after stopSender cleared the phase and the note). */
+    if (g_sender_stop_requested) return;
     /* File-drop progress is informational and must not replace the live
      * session snapshot (a drop line carries no frames/codec fields). */
     if (s.event == "drop" || s.event == "files") {
@@ -3081,6 +3096,12 @@ static void parseStatLine(const std::string &line, bool from_receiver)
                 (s.msg.empty() ? "" : " · " + s.msg));
         return;
     }
+    /* Each reconnect attempt starts with kvmRunController's normal
+     * state=waiting line. The user is not starting a session — they are
+     * waiting for the old one to come back — so keep the panel in the
+     * reconnecting state until a real local/remote line arrives. */
+    if (g_stitch_reconnecting && s.event == "stitch" && s.state == "waiting")
+        s.state = "reconnecting";
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         g_stats = s;
@@ -3123,6 +3144,13 @@ static void parseStatLine(const std::string &line, bool from_receiver)
             g_auth_wait_note.clear();
         }
     } else if (s.event == "error") {
+        if (g_stitch_reconnecting && g_sender.active) {
+            /* A reconnect attempt failed. The wrapper emits state=reconnecting
+             * and tries again, and a genuinely terminal error is surfaced by
+             * childExited(); flashing SP_FAILED here would hide the Stop
+             * button and offer a Retry that is refused while the child lives. */
+            return;
+        }
         g_pw_sender_pending = false;
         g_pw_sender_error.clear();
         if (g_pw_ask.open && !g_pw_file_transfer) closePasswordAsk(false);
@@ -3132,13 +3160,44 @@ static void parseStatLine(const std::string &line, bool from_receiver)
         }
         g_auth_wait_note.clear();
     } else if (s.event == "start") {
+        /* A successful reconnect emits the normal start line; the outage is
+         * over, so drop the warning note and return to the live session. */
+        if (g_stitch_reconnecting) {
+            g_stitch_reconnecting = false;
+            if (g_status_note.rfind(kStitchReconnectNote, 0) == 0) {
+                g_status_note.clear();
+                g_status_tone = StatusTone::Info;
+            }
+        }
         setSendPhase(SP_LIVE);
         recordStartedSession();
         g_auth_wait_note.clear();
     } else if (s.event == "stitch") {
         /* state=waiting is emitted before the 8084 connect and before the peer
-         * authorizes, so it is not a live session yet. Only local/remote are. */
-        if (s.state != "waiting") {
+         * authorizes, so it is not a live session yet. local/remote are; and
+         * reconnecting keeps the session page alive while the controller
+         * retries in the background (it never asks the user to reconnect by
+         * hand). */
+        if (s.state == "reconnecting") {
+            g_stitch_reconnecting = true;
+            setSendPhase(SP_LIVE);
+            if (!s.retry.empty() ||
+                g_status_note.rfind(kStitchReconnectNote, 0) != 0) {
+                g_status_note = kStitchReconnectNote;
+                if (!s.retry.empty())
+                    g_status_note += "（第 " + s.retry + " 次）";
+                g_status_note += "…";
+            }
+            g_status_tone = StatusTone::Warning;
+            g_auth_wait_note.clear();
+        } else if (s.state == "local" || s.state == "remote") {
+            if (g_stitch_reconnecting) {
+                g_stitch_reconnecting = false;
+                if (g_status_note.rfind(kStitchReconnectNote, 0) == 0) {
+                    g_status_note.clear();
+                    g_status_tone = StatusTone::Info;
+                }
+            }
             setSendPhase(SP_LIVE);
             recordStartedSession();
             g_auth_wait_note.clear();
@@ -3966,6 +4025,11 @@ static void stopSender()
     g_child_extend = false;
     g_send_phase = SP_IDLE;
     g_auth_wait_note.clear();
+    if (g_stitch_reconnecting) {
+        g_stitch_reconnecting = false;
+        if (g_status_note.rfind(kStitchReconnectNote, 0) == 0)
+            g_status_note.clear();
+    }
     g_status_tone = StatusTone::Info;
     /* A queued sender password request is meaningless once the child is gone. */
     g_pw_sender_pending = false;
@@ -4215,6 +4279,7 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     g_last_name = name;
     g_history_recorded = false;
     g_sender_stop_requested = false;
+    g_stitch_reconnecting = false;
     g_details_open = false;
     g_send_phase = SP_CONNECTING;
     g_status_note.clear();
@@ -4276,6 +4341,13 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         g_stats = LiveStats{};
+    }
+    /* Drop any STAT lines the previous child queued before it was joined;
+     * with g_sender_stop_requested reset below, they would otherwise be
+     * applied to this new session. */
+    {
+        std::lock_guard<std::mutex> lk(g_stat_q_mtx);
+        g_stat_q.clear();
     }
     logPush("[gui] launch sender " + ip + ":" + std::to_string(port) +
             " mode=" + sendModeKey(mode) + (stitch ? "" : " codec=" + codec));
@@ -6525,7 +6597,9 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
         int side = kvmSideFromKey(s.side.c_str());
         if (side < 0) side = stitchSideFromConfig();
         std::string hint;
-        if (s.state == "waiting") {
+        if (g_stitch_reconnecting || s.state == "reconnecting") {
+            hint = "连接中断，正在自动重连…网络恢复后会继续，可点「停止」结束会话";
+        } else if (s.state == "waiting") {
             hint = "等待对方确认…";
         } else if (s.state == "remote") {
             hint = std::string("已接管对方键鼠 · Ctrl+Alt+Shift+Q 或移出对方") +
@@ -8998,6 +9072,7 @@ int main(int argc, char *argv[])
         if (g_sender.active && childExited(g_sender, "sender")) {
             drainChildStats();
             g_child_extend = false;
+            g_stitch_reconnecting = false;
             std::string err;
             {
                 std::lock_guard<std::mutex> lk(g_stats_mtx);

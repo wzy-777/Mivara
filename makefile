@@ -131,8 +131,10 @@ ifeq ($(OS),Windows_NT)
     # -lole32/-luuid/-lshell32/-lshlwapi: 8085 file-drop channel (drop.cpp,
     # dropshell.cpp); -ladvapi32 also covers CreateProcessWithTokenW for the
     # Medium-integrity stitchcap helper.
+    # -ld3d11/-ldxgi: DXGI Desktop Duplication capture (capture_dda.cpp).
     SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lgdi32 -lsetupapi -ladvapi32 \
-                     -luser32 -lole32 -loleaut32 -luuid -lshell32 -lshlwapi
+                     -luser32 -lole32 -loleaut32 -luuid -lshell32 -lshlwapi \
+                     -ld3d11 -ldxgi
     # -lgdi32: the stitch drag ghost overlay (kvm.cpp, target side) draws into
     # a 32-bit DIB and pushes it with UpdateLayeredWindow.
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS) -luser32 -lgdi32 \
@@ -198,6 +200,7 @@ OBJ_DROP     := $(BUILDDIR)/drop.o
 OBJ_DROPSHELL := $(BUILDDIR)/dropshell.o
 OBJ_FILEXFER := $(BUILDDIR)/filexfer.o
 OBJ_STITCHCAP := $(BUILDDIR)/stitchcap.o
+OBJ_CAPTURE_DDA := $(BUILDDIR)/capture_dda.o
 
 # ============================================================================
 # PHONY TARGET DECLARATIONS
@@ -258,7 +261,8 @@ $(OBJ_DROP): $(SRCDIR)/drop.h $(SRCDIR)/auth.h $(SRCDIR)/dropshell.h
 $(OBJ_DROPSHELL): $(SRCDIR)/drop.h $(SRCDIR)/dropshell.h
 $(OBJ_STITCHCAP): $(SRCDIR)/drop.h
 $(OBJ_FILEXFER): $(SRCDIR)/filexfer.h $(SRCDIR)/auth.h $(SRCDIR)/proto.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h
+$(OBJ_CAPTURE_DDA): $(SRCDIR)/capture_dda.h
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/version.h $(SRCDIR)/capture_dda.h
 $(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/kvm.h $(SRCDIR)/drop.h $(SRCDIR)/filexfer.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/config.h $(SRCDIR)/version.h
 $(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/filexfer.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h $(SRCDIR)/auth.h $(SRCDIR)/tray.h $(SRCDIR)/logo_icon.h
 
@@ -266,7 +270,7 @@ $(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/confi
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_CAPTURE_DDA) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
@@ -361,6 +365,7 @@ check:
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
                kvm.cpp kvm.h \
                drop.cpp drop.h dropshell.cpp dropshell.h stitchcap.cpp filexfer.cpp filexfer.h \
+               capture_dda.cpp capture_dda.h \
                config.cpp config.h history.cpp history.h \
 	               update.cpp update.h version.h theme.cpp theme.h \
                auth.cpp auth.h tray.cpp tray.h logo_icon.h; do \

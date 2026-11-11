@@ -60,6 +60,9 @@
 #include "proto.h"
 #include "codec.h"
 #include "version.h"
+#ifdef _WIN32
+#include "capture_dda.h"
+#endif
 
 /* ── Platform headers ───────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -534,35 +537,132 @@ public:
 };
 
 /* ══════════════════════════════════════════════════════════════════════════
- * SCREEN CAPTURE  –  platform-specific, always returns RGB24
+ * SCREEN CAPTURE  –  Windows exposes BGR24 so coded streams can let swscale
+ * perform the only colour conversion. RAW/RLE use packed RGB24.
  * ══════════════════════════════════════════════════════════════════════════ */
-#ifdef _WIN32
-static std::vector<uint8_t> captureScreen()
+struct CapturedFrame {
+    std::vector<uint8_t> rgb;       /* reused RGB storage / non-Windows pixels */
+    const uint8_t *pixels = nullptr;
+    int stride = 0;
+    bool bgr24 = false;             /* packed 3-byte BGR               */
+};
+
+static const uint8_t *captureFrameRGB(CapturedFrame &f)
+{
+    if (!f.pixels) return nullptr;
+    if (!f.bgr24) return f.pixels;
+    const size_t width = (size_t)SCREEN_WIDTH;
+    const size_t height = (size_t)SCREEN_HEIGHT;
+    const size_t need = width * height * 3;
+    /* DDA packs BGR24 into f.rgb itself, so the conversion must tolerate
+     * src == dst; reading each pixel's bytes before writing any of them
+     * keeps the blue channel intact in that case. */
+    const bool in_place = (f.pixels == f.rgb.data());
+    f.rgb.resize(need);
+    for (size_t y = 0; y < height; y++) {
+        uint8_t *dst = f.rgb.data() + y * width * 3;
+        const uint8_t *src = in_place ? dst : f.pixels + y * (size_t)f.stride;
+        for (size_t x = 0; x < width; x++) {
+            const uint8_t b = src[x * 3];
+            const uint8_t g = src[x * 3 + 1];
+            const uint8_t r = src[x * 3 + 2];
+            dst[x * 3]     = r;
+            dst[x * 3 + 1] = g;
+            dst[x * 3 + 2] = b;
+        }
+    }
+    f.pixels = f.rgb.data();
+    f.stride = (int)(width * 3);
+    f.bgr24 = false;
+    return f.pixels;
+}
+
+/* DXGI frames are BGRA; pack them to the BGR24 layout the encoder already
+ * accepts. This keeps the proven swscale path (its BGRA kernel produces
+ * measurably different colours) and costs ~1 ms at 1440p. */
+static void captureBgrFromBgra(CapturedFrame &f, const uint8_t *bgra, int stride)
 {
     const size_t width = (size_t)SCREEN_WIDTH;
     const size_t height = (size_t)SCREEN_HEIGHT;
-    const size_t stride = (width * 3 + 3) & ~(size_t)3;
-    std::vector<uint8_t> px(width * height * 3, 0);
-    std::vector<uint8_t> dib(stride * height, 0);
-    HDC sdc = GetDC(nullptr);
-    if (!sdc) return {};
-    HDC mdc = CreateCompatibleDC(sdc);
-    if (!mdc) { ReleaseDC(nullptr, sdc); return {}; }
-    HBITMAP bmp = CreateCompatibleBitmap(sdc, SCREEN_WIDTH, SCREEN_HEIGHT);
+    f.rgb.resize(width * height * 3);
+    for (size_t y = 0; y < height; y++) {
+        const uint8_t *src = bgra + y * (size_t)stride;
+        uint8_t *dst = f.rgb.data() + y * width * 3;
+        for (size_t x = 0; x < width; x++) {
+            dst[x * 3]     = src[x * 4];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 2];
+        }
+    }
+    f.pixels = f.rgb.data();
+    f.stride = (int)(width * 3);
+    f.bgr24 = true;
+}
+
+#ifdef _WIN32
+struct WinCaptureContext {
+    HDC sdc = nullptr;
+    HDC mdc = nullptr;
+    HBITMAP bmp = nullptr;
     HGDIOBJ old = nullptr;
-    const auto cleanup = [&] {
-        if (old && old != HGDI_ERROR) SelectObject(mdc, old);
+    int w = 0, h = 0;
+    size_t stride = 0;
+    int cursor_w = 0, cursor_h = 0;
+    std::vector<uint8_t> dib;
+
+    ~WinCaptureContext() { reset(); }
+
+    void reset()
+    {
+        if (mdc && old && old != HGDI_ERROR) SelectObject(mdc, old);
         if (bmp) DeleteObject(bmp);
-        DeleteDC(mdc);
-        ReleaseDC(nullptr, sdc);
-    };
-    if (!bmp) { cleanup(); return {}; }
-    old = SelectObject(mdc, bmp);
-    if (!old || old == HGDI_ERROR) { old = nullptr; cleanup(); return {}; }
-    if (!BitBlt(mdc, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, sdc,
+        if (mdc) DeleteDC(mdc);
+        if (sdc) ReleaseDC(nullptr, sdc);
+        sdc = nullptr;
+        mdc = nullptr;
+        bmp = nullptr;
+        old = nullptr;
+        w = h = 0;
+        stride = 0;
+        dib.clear();
+    }
+
+    bool ensure(int nw, int nh)
+    {
+        if (nw == w && nh == h && sdc && mdc && bmp) return true;
+        reset();
+        w = nw;
+        h = nh;
+        stride = ((size_t)w * 3 + 3) & ~(size_t)3;
+        dib.resize(stride * (size_t)h);
+        sdc = GetDC(nullptr);
+        if (!sdc) { reset(); return false; }
+        mdc = CreateCompatibleDC(sdc);
+        if (!mdc) { reset(); return false; }
+        bmp = CreateCompatibleBitmap(sdc, w, h);
+        if (!bmp) { reset(); return false; }
+        old = SelectObject(mdc, bmp);
+        if (!old || old == HGDI_ERROR) { reset(); return false; }
+        cursor_w = GetSystemMetrics(SM_CXCURSOR);
+        cursor_h = GetSystemMetrics(SM_CYCURSOR);
+        return true;
+    }
+};
+
+static bool captureScreen(CapturedFrame &f)
+{
+    f.pixels = nullptr;
+    f.stride = 0;
+    f.bgr24 = false;
+    static WinCaptureContext ctx;
+    if (!ctx.ensure(SCREEN_WIDTH, SCREEN_HEIGHT)) return false;
+
+    /* Reuse the HDC, bitmap and readback buffer for this capture generation.
+     * GetDIBits overwrites every DIB byte, so per-frame zero-fill is redundant. */
+    if (!BitBlt(ctx.mdc, 0, 0, ctx.w, ctx.h, ctx.sdc,
                 g_cap_origin.x, g_cap_origin.y, SRCCOPY | CAPTUREBLT)) {
-        cleanup();
-        return {};
+        ctx.reset();
+        return false;
     }
 
     CURSORINFO ci = {};
@@ -571,11 +671,11 @@ static std::vector<uint8_t> captureScreen()
     if (haveCur && (ci.flags & CURSOR_SHOWING)) {
         const int cx = ci.ptScreenPos.x - g_cap_origin.x;
         const int cy = ci.ptScreenPos.y - g_cap_origin.y;
-        if (cx >= 0 && cy >= 0 && cx < SCREEN_WIDTH && cy < SCREEN_HEIGHT) {
+        if (cx >= 0 && cy >= 0 && cx < ctx.w && cy < ctx.h) {
             ICONINFO ii = {};
             if (GetIconInfo(ci.hCursor, &ii)) {
-                DrawIconEx(mdc, cx - ii.xHotspot, cy - ii.yHotspot, ci.hCursor,
-                           GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR),
+                DrawIconEx(ctx.mdc, cx - ii.xHotspot, cy - ii.yHotspot,
+                           ci.hCursor, ctx.cursor_w, ctx.cursor_h,
                            0, NULL, DI_NORMAL);
                 if (ii.hbmMask) DeleteObject(ii.hbmMask);
                 if (ii.hbmColor) DeleteObject(ii.hbmColor);
@@ -585,32 +685,31 @@ static std::vector<uint8_t> captureScreen()
 
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = SCREEN_WIDTH;
-    bi.bmiHeader.biHeight = -SCREEN_HEIGHT;
+    bi.bmiHeader.biWidth = ctx.w;
+    bi.bmiHeader.biHeight = -ctx.h;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 24;
     bi.bmiHeader.biCompression = BI_RGB;
-    const UINT rows = GetDIBits(mdc, bmp, 0, (UINT)SCREEN_HEIGHT, dib.data(),
+    const UINT rows = GetDIBits(ctx.mdc, ctx.bmp, 0, (UINT)ctx.h, ctx.dib.data(),
                                 &bi, DIB_RGB_COLORS);
-    cleanup();
-    if (rows != (UINT)SCREEN_HEIGHT) return {};
-    for (size_t y = 0; y < height; y++) {
-        const uint8_t *src = dib.data() + y * stride;
-        for (size_t x = 0; x < width; x++) {
-            const size_t di = (y * width + x) * 3;
-            px[di] = src[x * 3 + 2];
-            px[di + 1] = src[x * 3 + 1];
-            px[di + 2] = src[x * 3];
-        }
+    if (rows != (UINT)ctx.h) {
+        ctx.reset();
+        return false;
     }
-    return px;
+    f.pixels = ctx.dib.data();
+    f.stride = (int)ctx.stride;
+    f.bgr24 = true;
+    return true;
 }
 
 #elif defined(__APPLE__)
-static std::vector<uint8_t> captureScreen()
+static bool captureScreen(CapturedFrame &f)
 {
+    f.pixels = nullptr;
+    f.stride = 0;
+    f.bgr24 = false;
     CGImageRef img = CGDisplayCreateImage(kCGDirectMainDisplay);
-    if (!img) return {};
+    if (!img) return false;
     const size_t width = CGImageGetWidth(img);
     const size_t height = CGImageGetHeight(img);
     const size_t bpr = CGImageGetBytesPerRow(img);
@@ -623,48 +722,93 @@ static std::vector<uint8_t> captureScreen()
     if (!raw || (size_t)CFDataGetLength(raw) < bpr * height) {
         if (raw) CFRelease(raw);
         CGImageRelease(img);
-        return {};
+        return false;
     }
     const uint8_t *src = CFDataGetBytePtr(raw);
-    if (!src) { CFRelease(raw); CGImageRelease(img); return {}; }
-    std::vector<uint8_t> px(width * height * 3, 0);
+    if (!src) { CFRelease(raw); CGImageRelease(img); return false; }
+    f.rgb.resize(width * height * 3);
     const size_t bpp = bits / 8;
     for (size_t y = 0; y < height; y++) {
         for (size_t x = 0; x < width; x++) {
             const size_t si = y * bpr + x * bpp;
             const size_t di = (y * width + x) * 3;
-            px[di] = src[si + 2];
-            px[di + 1] = src[si + 1];
-            px[di + 2] = src[si];
+            f.rgb[di] = src[si + 2];
+            f.rgb[di + 1] = src[si + 1];
+            f.rgb[di + 2] = src[si];
         }
     }
     CFRelease(raw);
     CGImageRelease(img);
-    return px;
+    f.pixels = f.rgb.data();
+    f.stride = (int)(width * 3);
+    return true;
 }
 
 #else   /* Linux / X11 */
-static std::vector<uint8_t> captureScreen()
+static bool captureScreen(CapturedFrame &f)
 {
-    std::vector<uint8_t> px(SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL, 0);
+    f.pixels = nullptr;
+    f.stride = 0;
+    f.bgr24 = false;
+    f.rgb.assign((size_t)SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL, 0);
+    const auto done = [&] {
+        f.pixels = f.rgb.data();
+        f.stride = SCREEN_WIDTH * BYTES_PER_PIXEL;
+        return true;
+    };
     Display *dpy = XOpenDisplay(nullptr);
-    if (!dpy) return px;
+    if (!dpy) return done();
     Window root = RootWindow(dpy, DefaultScreen(dpy));
     XImage *xi  = XGetImage(dpy, root, 0, 0,
                              SCREEN_WIDTH, SCREEN_HEIGHT, AllPlanes, ZPixmap);
-    if (!xi) { XCloseDisplay(dpy); return px; }
+    if (!xi) { XCloseDisplay(dpy); return done(); }
     for (int y = 0; y < SCREEN_HEIGHT; y++) {
         for (int x = 0; x < SCREEN_WIDTH; x++) {
             unsigned long p = XGetPixel(xi, x, y);
             size_t i = ((size_t)y * SCREEN_WIDTH + x) * 3;
-            px[i+0] = (uint8_t)((p >> 16) & 0xFF); /* R */
-            px[i+1] = (uint8_t)((p >>  8) & 0xFF); /* G */
-            px[i+2] = (uint8_t)( p        & 0xFF); /* B */
+            f.rgb[i+0] = (uint8_t)((p >> 16) & 0xFF); /* R */
+            f.rgb[i+1] = (uint8_t)((p >>  8) & 0xFF); /* G */
+            f.rgb[i+2] = (uint8_t)( p        & 0xFF); /* B */
         }
     }
     XDestroyImage(xi);
     XCloseDisplay(dpy);
-    return px;
+    return done();
+}
+#endif
+
+#ifdef _WIN32
+/* Capture backend selection. DXGI Desktop Duplication removes the GDI
+ * screen-readback wait (one to two refresh intervals); GDI remains the
+ * automatic fallback and the MIVARA_CAPTURE=gdi escape hatch. */
+static bool captureDdaAllowed()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = std::getenv("MIVARA_CAPTURE");
+        cached = !(v && (std::strcmp(v, "gdi") == 0 ||
+                         std::strcmp(v, "0") == 0));
+    }
+    return cached != 0;
+}
+
+static bool startDdaCapture(std::string &why)
+{
+    if (!captureDdaAllowed()) {
+        why = "disabled by MIVARA_CAPTURE";
+        return false;
+    }
+    const char *dev = g_cap_device.empty() ? nullptr : g_cap_device.c_str();
+    if (!ddaOpen(dev, &why)) return false;
+    if (ddaWidth() != SCREEN_WIDTH || ddaHeight() != SCREEN_HEIGHT) {
+        why = "output " + std::to_string(ddaWidth()) + "x" +
+              std::to_string(ddaHeight()) + " != capture " +
+              std::to_string(SCREEN_WIDTH) + "x" +
+              std::to_string(SCREEN_HEIGHT);
+        ddaClose();
+        return false;
+    }
+    return true;
 }
 #endif
 
@@ -1780,8 +1924,11 @@ int main(int argc, char* argv[])
         kvm_auth.report = kvmReportHook;
         kvm_auth.file_drop = cli_file_drop;
         kvm_auth.accept_files = cli_accept_files;
-        const int rc = kvmRunController(sel.ip_address.c_str(), KVM_PORT,
-                                        cli_stitch_side, g_running, &kvm_auth);
+        /* Lost sessions reconnect automatically (1..30 s backoff); the stdin
+         * reader above keeps STOP|mivara and STITCH|side= live throughout. */
+        const int rc = kvmRunControllerResilient(sel.ip_address.c_str(),
+                                                 KVM_PORT, cli_stitch_side,
+                                                 g_running, &kvm_auth);
         cleanupSockets();
         return rc == 0 ? 0 : 1;
     }
@@ -2071,8 +2218,64 @@ int main(int argc, char* argv[])
     std::chrono::steady_clock::time_point capture_fail_since{};
     std::vector<uint8_t> comp_buf;
     std::vector<uint8_t> au;
+    CapturedFrame captured;
+    unsigned long loop_ticks = 0;   /* geometry poll: every 32 iterations */
+
+    /* Periodic stats are emitted from the idle path too: with duplication an
+     * unchanged desktop sends no frames, and the GUI must not show counters
+     * frozen from the moment the desktop went quiet. */
+    auto emitPeriodicStats = [&]() {
+        auto now  = std::chrono::steady_clock::now();
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - last_stats).count();
+        if (secs < STATS_INTERVAL_SEC) return;
+        showStats(frames_sent, secs, total_bytes);
+        double ifps = secs > 0 ? (double)stat_frames / (double)secs : 0.0;
+        long ikbps = (long)((double)stat_bytes / 1024.0 /
+                            (double)(secs > 0 ? secs : 1));
+        long tsec = (long)std::chrono::duration_cast<std::chrono::seconds>(
+                        now - sess_start).count();
+        emitStatLine(tsec, frames_sent, ifps, ikbps);
+        last_stats  = now;
+        stat_bytes  = 0;
+        stat_frames = 0;
+    };
+
+#ifdef _WIN32
+    /* Low-latency capture. A desktop-duplication failure (output not
+     * duplicable, unsupported format, another duplicator) leaves the proven
+     * GDI path in place; MIVARA_CAPTURE=gdi forces GDI for A/B tests. */
+    bool use_dda = false;
+    /* Keep trying after a failure: the VDD may appear late and a transient
+     * ACCESS_LOST must not cost the session. Backoff caps at 60 s. */
+    bool dda_ever = true;
+    {
+        std::string why;
+        if (startDdaCapture(why)) {
+            use_dda = true;
+            std::cout << COL_GREEN << "[capture] DXGI Desktop Duplication "
+                      << ddaWidth() << "x" << ddaHeight() << " active\n"
+                      << COL_RESET;
+        } else {
+            /* MIVARA_CAPTURE=gdi must not be retried; a real failure is. */
+            dda_ever = captureDdaAllowed();
+            std::cout << COL_YELLOW << "[capture] Desktop Duplication "
+                      << "unavailable (" << why << ") – GDI capture\n"
+                      << COL_RESET;
+        }
+    }
+    /* Frame pacing: a frame may be sent once per frame_dur. The ddaWait()
+     * call itself is the wait, so no sleep granularity is involved. */
+    auto next_tick = std::chrono::steady_clock::now();
+    auto last_tx   = next_tick;
+    /* Retry schedule after an ACCESS_LOST fallback (UAC secure desktop, mode
+     * change, driver reset). A transient loss must not cost the session. */
+    auto next_dda_retry = std::chrono::steady_clock::time_point{};
+    auto dda_retry_delay = std::chrono::seconds(2);
+#endif
 
     while (g_running) {
+        ++loop_ticks;
         auto t0 = std::chrono::steady_clock::now();
 
         /* ── Runtime reconfigure (SETP from the GUI) ── */
@@ -2175,6 +2378,10 @@ int main(int argc, char* argv[])
                     emitStatLine((long)elapsed, frames_sent,
                                  elapsed > 0 ? frames_sent / elapsed : 0.0,
                                  kbps_now, "applied");
+#ifdef _WIN32
+                    /* FPS may have changed: re-base the rate deadline. */
+                    next_tick = std::chrono::steady_clock::now();
+#endif
                     continue;   /* skip this frame */
                 }
             }
@@ -2183,8 +2390,10 @@ int main(int argc, char* argv[])
 #ifdef _WIN32
         /* Live resolution change: if the user resized the virtual display
          * in Windows display settings mid-stream, follow it. Tell the
-         * receiver via CTRL_MARKER + CTRL_RESIZE + a fresh HsRequestV2. */
-        if (DISPLAY_MODE == MODE_TRUE_EXTEND && (frames_sent & 31) == 0) {
+         * receiver via CTRL_MARKER + CTRL_RESIZE + a fresh HsRequestV2.
+         * Poll on loop ticks, not sent frames: with duplication an idle
+         * desktop sends nothing, so a frame counter would never advance. */
+        if (DISPLAY_MODE == MODE_TRUE_EXTEND && (loop_ticks & 31) == 0) {
             int nx = 0, ny = 0, nw = 0, nh = 0;
             if (!vddFindMonitorRect(g_cap_device, nx, ny, nw, nh)) {
                 std::cerr << COL_RED
@@ -2235,18 +2444,132 @@ int main(int argc, char* argv[])
                 std::cout << COL_GREEN << "Resolution changed → "
                           << SCREEN_WIDTH << "x" << SCREEN_HEIGHT << "\n"
                           << COL_RESET;
+                if (dda_ever) {
+                    /* The duplicated output changed mode; re-open it for the
+                     * new size instead of dropping to GDI for the session.
+                     * A failed attempt is retried by the backoff below. */
+                    ddaClose();
+                    std::string why;
+                    if (startDdaCapture(why)) {
+                        use_dda = true;
+                        next_tick = std::chrono::steady_clock::now();
+                        next_dda_retry = std::chrono::steady_clock::time_point{};
+                    } else {
+                        use_dda = false;
+                        next_dda_retry = std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(5);
+                        std::cout << COL_YELLOW
+                                  << "[capture] Desktop Duplication reopen "
+                                  << "failed (" << why << ") – GDI capture\n"
+                                  << COL_RESET;
+                    }
+                }
                 continue;   /* skip this partial frame */
             }
         }
 #endif
 
-        auto frame = captureScreen();
-        if (frame.empty()) {
+#ifdef _WIN32
+        /* After ACCESS_LOST or a failed resize reopen, retry duplication with
+         * a backoff; a transient UAC / mode switch must not leave the whole
+         * session on the slow GDI path. */
+        if (!use_dda && dda_ever &&
+            std::chrono::steady_clock::now() >= next_dda_retry) {
+            std::string why;
+            if (startDdaCapture(why)) {
+                use_dda = true;
+                next_tick = std::chrono::steady_clock::now();
+                next_dda_retry = std::chrono::steady_clock::time_point{};
+                dda_retry_delay = std::chrono::seconds(2);
+                std::cout << COL_GREEN << "[capture] Desktop Duplication "
+                          << "reopened " << ddaWidth() << "x" << ddaHeight()
+                          << "\n" << COL_RESET;
+            } else {
+                next_dda_retry = std::chrono::steady_clock::now() +
+                                 dda_retry_delay;
+                dda_retry_delay = std::min(dda_retry_delay * 2,
+                                           std::chrono::seconds(60));
+            }
+        }
+#endif
+
+        captured.pixels = nullptr;
+        captured.bgr24 = false;
+        bool have_frame = false;
+#ifdef _WIN32
+        if (use_dda) {
+            /* Wait for new desktop content or a cursor move, but never send
+             * faster than frame_dur: intermediate frames are overwritten in
+             * the module buffer and only the newest one is encoded. */
+            for (;;) {
+                const auto now = std::chrono::steady_clock::now();
+                if (have_frame && now >= next_tick) break;
+                int wait_ms = 0;
+                if (now < next_tick) {
+                    wait_ms = (int)std::chrono::duration_cast<
+                                  std::chrono::milliseconds>(next_tick - now)
+                                  .count();
+                }
+                const int r = ddaWait(wait_ms);
+                if (r < 0) {
+                    /* A frame drained earlier in this tick is unusable:
+                     * ddaClose() invalidates the module buffer. */
+                    have_frame = false;
+                    ddaClose();
+                    use_dda = false;
+                    next_dda_retry = now + std::chrono::seconds(2);
+                    dda_retry_delay = std::chrono::seconds(2);
+                    std::cout << COL_YELLOW << "[capture] Desktop Duplication "
+                              << "lost – GDI capture\n" << COL_RESET
+                              << std::flush;
+                    break;
+                }
+                if (r == 0) break;      /* timeout: nothing changed */
+                have_frame = true;
+            }
+            if (have_frame && ddaPixels()) {
+                captureBgrFromBgra(captured, ddaPixels(), ddaStride());
+            } else if (have_frame) {
+                /* Defensive: a frame without pixels is never encodable. */
+                have_frame = false;
+                ddaClose();
+                use_dda = false;
+                next_dda_retry = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(2);
+                dda_retry_delay = std::chrono::seconds(2);
+                std::cout << COL_YELLOW << "[capture] Desktop Duplication "
+                          << "returned no pixels – GDI capture\n"
+                          << COL_RESET << std::flush;
+            } else if (use_dda) {
+                /* Static desktop and a still cursor: nothing to encode. A
+                 * tiny control packet keeps the receiver's 30 s read timeout
+                 * from expiring (the receiver ignores it). 500 ms rather than
+                 * seconds: the receiver pumps its SDL events only between
+                 * reads, so a longer gap makes ESC/close feel stuck. */
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_tx >= std::chrono::milliseconds(500)) {
+                    uint32_t marker = htonl(CTRL_MARKER);
+                    uint32_t ctype  = htonl(CTRL_FORCE_IDR);
+                    if (!conn.sendAll(&marker, 4) ||
+                        !conn.sendAll(&ctype, 4)) {
+                        emitStatError("send_failed");
+                        break;
+                    }
+                    last_tx = now;
+                }
+                emitPeriodicStats();
+                next_tick += frame_dur;
+                if (next_tick < now) next_tick = now;
+                continue;
+            }
+        }
+#endif
+        if (!have_frame && !captureScreen(captured)) {
             /* A display-mode switch, a UAC / secure-desktop transition or a
              * driver hiccup can make a capture fail for a moment. Retry for
-             * up to ~3 s of wall-clock time (not a frame count: captureScreen
-             * allocates and zeroes the full frame, so a frame-based budget
-             * could stretch far past the receiver's read timeout). */
+             * up to ~3 s of wall-clock time, not a frame count: a slow capture
+             * otherwise stretches the failure budget far past the receiver's
+             * read timeout. */
             const auto now = std::chrono::steady_clock::now();
             if (!capture_fail_since.time_since_epoch().count())
                 capture_fail_since = now;
@@ -2264,9 +2587,12 @@ int main(int argc, char* argv[])
         capture_misses = 0;
         capture_fail_since = std::chrono::steady_clock::time_point{};
 
+        bool sent_any = false;
         if (isCodedCodec()) {
             /* Coded: one access unit per frame, framed like any DATA packet */
-            std::string enc_err = encoder.encode(frame.data(), au);
+            std::string enc_err = captured.bgr24
+                ? encoder.encodeBGR24(captured.pixels, captured.stride, au)
+                : encoder.encode(captured.pixels, au);
             if (!enc_err.empty()) {
                 std::cerr << COL_RED << "Encode failed: " << enc_err
                           << "\n" << COL_RESET;
@@ -2285,16 +2611,18 @@ int main(int argc, char* argv[])
                 total_bytes += 4 + au.size();
                 stat_bytes  += 4 + au.size();
                 stat_frames++;
+                sent_any = true;
             }
         } else {
             /* RAW / RLE transport (unchanged). GPU offload: RLE compress on
              * the receiver, only active when the negotiated codec is RLE. */
-            const uint8_t *send_ptr  = frame.data();
-            uint32_t       send_size = (uint32_t)frame.size();
+            const uint8_t *send_ptr  = captureFrameRGB(captured);
+            uint32_t       send_size = (uint32_t)SCREEN_WIDTH * SCREEN_HEIGHT *
+                                       BYTES_PER_PIXEL;
 
             if (g_gpu_active) {
                 uint8_t *out = nullptr;
-                int csz = gpu_remote_compress(g_gpu_sock, frame.data(),
+                int csz = gpu_remote_compress(g_gpu_sock, send_ptr,
                                               (uint32_t)SCREEN_WIDTH,
                                               (uint32_t)SCREEN_HEIGHT, &out);
                 if (csz > 0 && out) {
@@ -2323,26 +2651,28 @@ int main(int argc, char* argv[])
             total_bytes += 4 + send_size;
             stat_bytes  += 4 + send_size;
             stat_frames++;
+            sent_any = true;
         }
 
-        auto now  = std::chrono::steady_clock::now();
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-                        now - last_stats).count();
-        if (secs >= STATS_INTERVAL_SEC) {
-            showStats(frames_sent, secs, total_bytes);
-            double ifps = secs > 0 ? (double)stat_frames / (double)secs : 0.0;
-            long ikbps = (long)((double)stat_bytes / 1024.0 /
-                                (double)(secs > 0 ? secs : 1));
-            long tsec = (long)std::chrono::duration_cast<std::chrono::seconds>(
-                            now - sess_start).count();
-            emitStatLine(tsec, frames_sent, ifps, ikbps);
-            last_stats  = now;
-            stat_bytes  = 0;
-            stat_frames = 0;
-        }
+#ifdef _WIN32
+        if (use_dda && sent_any) last_tx = std::chrono::steady_clock::now();
+#else
+        (void)sent_any;
+#endif
+
+        emitPeriodicStats();
 
         /* Adaptive timing */
         auto elapsed = std::chrono::steady_clock::now() - t0;
+#ifdef _WIN32
+        if (use_dda) {
+            /* ddaWait() is the wait; only advance the rate deadline. When the
+             * frame took longer than frame_dur, do not try to catch up. */
+            next_tick += frame_dur;
+            const auto done = std::chrono::steady_clock::now();
+            if (next_tick < done) next_tick = done;
+        } else
+#endif
         if (elapsed > frame_dur) {
             if (++fbehind > MAX_FRAME_SKIP) { fbehind = 0; continue; }
         } else {
@@ -2350,6 +2680,10 @@ int main(int argc, char* argv[])
             std::this_thread::sleep_for(frame_dur - elapsed);
         }
     }
+
+#ifdef _WIN32
+    ddaClose();
+#endif
 
     /* Final stats */
     auto total_s = std::chrono::duration_cast<std::chrono::seconds>(

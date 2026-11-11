@@ -216,6 +216,8 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
         →  SDL_UpdateTexture/YUVTexture → RenderCopy → RenderPresent
 ```
 
+Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`）：直接从合成器取帧并复制到 staging 纹理，光标由采集端自行合成，因此一次采集只需约 2–6 ms，不再等待垂直周期；打开复制会话时先用一次 GDI 回读填充初始背景，避免静止桌面只有空帧时黑屏。GDI（`GetDC(NULL)` + `BitBlt`）作为自动回退，实测其回读固定耗时约 17–33 ms 且与请求面积无关。采集帧统一打包为 BGR24 后交给 swscale，RAW/RLE 仍使用 packed RGB24。采集目标桌面与“位于采集输出内”的光标都未变化时不编码、不发送，只每 500 毫秒发送一个接收端会忽略的控制包以保活；`ACCESS_LOST` 或首次打开失败后按 2→60 秒指数退避重试复制。接收端保留垂直同步，如果后续字节已经到达，会有界地跳过旧画面的纹理上传与呈现来追赶最新帧，但编码流仍逐 AU 解码，不丢参考帧。`MIVARA_CAPTURE=gdi` 可强制回退 GDI 做对比。
+
 控制包：`0xFFFFFFFF` + `ctrl_type` + 负载。`CTRL_RESIZE`（扩展模式分辨率变化）与 `CTRL_RECONFIG`（运行时参数变化）都携带完整 `HsRequestV2`，接收端据此重建解码器并跳到下一个关键帧。
 
 各编码的实际带宽占用见 [性能](performance.md)。
@@ -260,13 +262,13 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 - 光标被系统钳制在虚拟桌面边缘时，钩子的坐标不再变化；因此用 `RIDEV_INPUTSINK` Raw Input 的设备增量判断"继续朝所选方向推"并驱动远端光标。越过所选边缘 3 像素即进入远程状态，本地输入被吞掉；朝其他方向移动会清零累计值。
 - 远程时把对方光标移出**进入时那条边**，或按 `Ctrl+Alt+Shift+Q`，即交还控制；进入/离开时重新同步物理按住的修饰键与鼠标键，避免对端卡键。四条边的对应关系：右侧→本机右缘出、对方左缘入/出；左侧→本机左缘出、对方右缘入/出；上方→本机上缘出、对方下缘入/出；下方→本机下缘出、对方上缘入/出。
 - 方向由 `--stitch-side left|right|top|bottom` 指定（默认 `right`）；GUI 在启动前弹窗选择并写入 `config.ini` 的 `stitch_side`，下次作为默认。会话中切换方向走 GUI→sender 的 stdin 行 `STITCH|side=…`：stdin 线程调用 `kvmSetControllerSide()` 排队，消息循环在 50 ms 定时器里应用——若此刻正在控制对方，会先交还并释放按键，再挂上新边。
-- 连接失败、握手失败、对方拒绝、连接断开都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 状态面板据此显示当前方向并提供四个切换选项。
+- 连接失败、握手失败、对方拒绝都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 状态面板据此显示当前方向并提供四个切换选项。已建立的会话因网卡切换/对端重启/Wi-Fi 漫游丢失连接时不会结束会话：`kvmRunControllerResilient` 以 1/2/4/8/16/30 秒退避自动重连，期间输出 `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`，GUI 保持会话页和「停止」按钮；断线期间的 `STITCH|side=…` 会应用到下一次连接。首次连接失败（拒绝连接、对方忙、授权拒绝）仍按原样报错，不进入重试。
 - 非 Windows 平台直接返回错误（拼接暂只支持 Windows）。
 
 **目标侧（receiver 的 8084 服务）**
 
 - 独立线程监听 8084，与视频监听互不影响；空闲与会话中都会轮询停止标志，所有退出路径都会 join。
-- 会话在独立线程中执行，监听线程始终保持响应：会话进行中第二个控制端会立即收到 `KVM_ERR_BUSY`（先读取其 hello 再回复，避免关闭未读完的连接触发 RST）。控制器 drain 线程同时检查 EOF/错误，不让对端退出在空闲时无限漏检。两端以 `KvmHello.reserved[1]` / `KvmReply.reserved` 的 `KVM_FEATURE_HEARTBEAT` 协商心跳；都支持时每 3 秒双向 PING/PONG，约 9 秒未收到数据即断开并释放按键。旧端不协商心跳，回退为 TCP 保活（空闲 15 s、间隔 3 s）。本地停止先 `shutdown` 唤醒发送，目标收到 EOF 后释放输入，不再重复阻塞发送。
+- 会话在独立线程中执行，监听线程始终保持响应：会话进行中第二个控制端会立即收到 `KVM_ERR_BUSY`（先读取其 hello 再回复，避免关闭未读完的连接触发 RST）。控制器 drain 线程同时检查 EOF/错误，不让对端退出在空闲时无限漏检。两端以 `KvmHello.reserved[1]` / `KvmReply.reserved` 的 `KVM_FEATURE_HEARTBEAT` 协商心跳；都支持时每 3 秒双向 PING/PONG，9 秒未收到数据即断开并释放按键。两端还会识别本机休眠/卡顿造成的时钟跳变（循环间隔超过 3 秒时重置接收计时），避免笔记本唤醒被误判成对端失联。旧端不协商心跳，回退为 TCP 保活（空闲 15 s、间隔 3 s）。会话结束会在对端日志中写入稳定原因（`peer_closed`/`heartbeat_timeout`/`recv_error|send_error` 等），控制器侧由 `kvmRunControllerResilient` 自动重连。本地停止先 `shutdown` 唤醒发送，目标收到 EOF 后释放输入，不再重复阻塞发送。
 - 收到合法 `KvmHello` 后**先执行接收策略**（不再单独弹一次「拼接确认」）：`open` 直接放行；`password` 校验 HMAC 证明（失败按来源节流）；`manual` 复用 8081 的审批流程——GUI 模式下由 app 弹窗（显示设备名、IP 与「请求：拼接控制」，默认拒绝，30 秒超时，重复请求合并），单独运行 `bin/receiver` 时回退为置顶原生确认框（默认「否」，30 秒自动拒绝，进程退出时自动关闭，等待期间 `select` 连接以便控制端断开时立即释放）。授权通过后才返回目标虚拟桌面尺寸并开始注入；明确拒绝后 60 秒内同一来源直接拒绝。密码记录缺失或损坏时回 `HS_ERR_AUTH_CONFIG`（状态 10），绝不降级为任意连接。版本 1 的控制端收到 `KVM_ERR_VERSION`。
 - 事件用 `SendInput` 注入：鼠标为绝对坐标 + `MOUSEEVENTF_VIRTUALDESK`（0..65535 归一化），键盘优先用扫描码（`KEYEVENTF_SCANCODE`，必要时加扩展位）。会话结束、断开或进程正常退出都会对已按下的每个键/鼠标键发送一次释放（进程被强制终止时来不及执行，这是 GUI 默认隐藏控制台启动下「停止接收」的已知限制）。
 - 注入在会话线程内串行执行；`SendInput` 不能跨 UIPI 注入**更高**完整性级别的窗口，也不会作用于安全桌面（因此无法模拟 Ctrl+Alt+Del）。单独运行的 `receiver` 是普通权限，管理员窗口收不到拼接输入；经 GUI 启动的接收端继承 GUI 的管理员权限，因此可以输入到管理员窗口。

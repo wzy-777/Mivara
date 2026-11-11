@@ -7,7 +7,7 @@
  *   SVT-AV1    preset=8 + fast-decode=1
  *   NVENC      tune=ull / delay=0 ·  QSV async_depth=1 ·  AMF ultralowlatency
  *
- * Hardware encoders are fed system-memory NV12 (swscale RGB24→NV12) –
+ * Hardware encoders are fed system-memory NV12 (swscale RGB24/BGR24→NV12) –
  * no hw_frames_ctx. If a hardware encoder fails to open, the next
  * candidate is tried (software last).
  */
@@ -139,6 +139,7 @@ struct Encoder::Priv {
     AVFrame        *frame = nullptr;
     AVPacket       *pkt   = nullptr;
     SwsContext     *sws   = nullptr;
+    SwsContext     *sws_bgr = nullptr;
     int src_w = 0, src_h = 0;
     int dst_w = 0, dst_h = 0;
     int64_t pts = 0;
@@ -147,6 +148,9 @@ struct Encoder::Priv {
     std::string name;
     std::string last_err;
     CodecId codec = CODEC_H264;
+
+    std::string encodeFrame(const uint8_t *src, int src_stride,
+                            SwsContext *converter, std::vector<uint8_t> &out);
 };
 
 Encoder::Encoder() : p_(new Priv) {}
@@ -165,6 +169,7 @@ void Encoder::forceKeyframe() { p_->force_idr = true; }
 
 void Encoder::close()
 {
+    if (p_->sws_bgr) { sws_freeContext(p_->sws_bgr); p_->sws_bgr = nullptr; }
     if (p_->sws)   { sws_freeContext(p_->sws); p_->sws = nullptr; }
     if (p_->pkt)   { av_packet_free(&p_->pkt); }
     if (p_->frame) { av_frame_free(&p_->frame); }
@@ -380,53 +385,76 @@ std::string Encoder::open(const EncoderConfig &cfg)
     return "encoder: all candidates failed – " + errs;
 }
 
-std::string Encoder::encode(const uint8_t *rgb24, std::vector<uint8_t> &out)
+std::string Encoder::Priv::encodeFrame(const uint8_t *src, int src_stride,
+                                       SwsContext *converter,
+                                       std::vector<uint8_t> &out)
 {
     out.clear();
-    if (!p_->ctx || !rgb24) return "encoder: not open";
+    if (!ctx || !src || !converter) return "encoder: not open";
+    if (src_stride < src_w * 3) return "encoder: invalid source stride";
 
-    /* One sws pass: RGB24 (src size) → encoder pix_fmt (coded size). */
-    const uint8_t *slices[1] = {rgb24};
-    int strides[1] = {p_->src_w * 3};
-    if (av_frame_make_writable(p_->frame) < 0)
+    /* One sws pass: packed source → encoder pix_fmt (also handles --scale). */
+    const uint8_t *slices[1] = {src};
+    int strides[1] = {src_stride};
+    if (av_frame_make_writable(frame) < 0)
         return "encoder: frame not writable";
 
-    int ret = sws_scale(p_->sws, slices, strides, 0, p_->src_h,
-                        p_->frame->data, p_->frame->linesize);
+    int ret = sws_scale(converter, slices, strides, 0, src_h,
+                        frame->data, frame->linesize);
     if (ret <= 0) return "encoder: swscale failed";
 
-    p_->frame->pts = p_->pts++;
-    if (p_->force_idr) {
-        p_->frame->pict_type = AV_PICTURE_TYPE_I;
-        p_->force_idr = false;
+    frame->pts = pts++;
+    if (force_idr) {
+        frame->pict_type = AV_PICTURE_TYPE_I;
+        force_idr = false;
     } else {
-        p_->frame->pict_type = AV_PICTURE_TYPE_NONE;
+        frame->pict_type = AV_PICTURE_TYPE_NONE;
     }
 
-    ret = avcodec_send_frame(p_->ctx, p_->frame);
+    ret = avcodec_send_frame(ctx, frame);
     while (ret == AVERROR(EAGAIN)) {
         /* Output not drained – flush packets first, then retry the frame
          * (send_frame does NOT consume the frame on EAGAIN). */
-        while ((ret = avcodec_receive_packet(p_->ctx, p_->pkt)) == 0) {
-            out.insert(out.end(), p_->pkt->data, p_->pkt->data + p_->pkt->size);
-            av_packet_unref(p_->pkt);
+        while ((ret = avcodec_receive_packet(ctx, pkt)) == 0) {
+            out.insert(out.end(), pkt->data, pkt->data + pkt->size);
+            av_packet_unref(pkt);
         }
         if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
             return "encoder: receive_packet: " + avErr(ret);
-        ret = avcodec_send_frame(p_->ctx, p_->frame);
+        ret = avcodec_send_frame(ctx, frame);
         if (ret < 0 && ret != AVERROR(EAGAIN))
             return "encoder: send_frame: " + avErr(ret);
     }
     if (ret < 0 && ret != AVERROR(EAGAIN))
         return "encoder: send_frame: " + avErr(ret);
 
-    while ((ret = avcodec_receive_packet(p_->ctx, p_->pkt)) == 0) {
-        out.insert(out.end(), p_->pkt->data, p_->pkt->data + p_->pkt->size);
-        av_packet_unref(p_->pkt);
+    while ((ret = avcodec_receive_packet(ctx, pkt)) == 0) {
+        out.insert(out.end(), pkt->data, pkt->data + pkt->size);
+        av_packet_unref(pkt);
     }
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return "";              /* no AU this frame – caller skips */
     return "encoder: receive_packet: " + avErr(ret);
+}
+
+std::string Encoder::encode(const uint8_t *rgb24, std::vector<uint8_t> &out)
+{
+    return p_->encodeFrame(rgb24, p_->src_w * 3, p_->sws, out);
+}
+
+std::string Encoder::encodeBGR24(const uint8_t *bgr24, int src_stride,
+                                 std::vector<uint8_t> &out)
+{
+    out.clear();
+    if (!p_->ctx || !bgr24) return "encoder: not open";
+    if (!p_->sws_bgr) {
+        p_->sws_bgr = sws_getContext(
+            p_->src_w, p_->src_h, AV_PIX_FMT_BGR24,
+            p_->dst_w, p_->dst_h, p_->ctx->pix_fmt,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!p_->sws_bgr) return "encoder: BGR24 swscale init failed";
+    }
+    return p_->encodeFrame(bgr24, src_stride, p_->sws_bgr, out);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
