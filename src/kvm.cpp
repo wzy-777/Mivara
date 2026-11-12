@@ -3072,8 +3072,8 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     g_sock = KVM_INVALID_SOCK;
 
     /* A lost session is not a failure the user must see: the resilient
-     * wrapper reconnects and the GUI keeps the session page. Suppress the
-     * stop line too, so the panel never flashes "会话已结束" between the loss
+     * wrapper reconnects and the GUI keeps the home stitch card. Suppress the
+     * stop line too, so the card never flashes "会话已结束" between the loss
      * and the first state=reconnecting line. Only a local stop or a clean
      * end is terminal. */
     if (!g_netOK.load() && running.load()) return KVM_RUN_LOST;

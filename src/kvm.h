@@ -376,7 +376,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
  * emits
  *   STAT|event=stitch|state=reconnecting|mode=stitch|side=<side>
  *       |reason=<token>|err=<wsa>|retry=<n>|delay_ms=<ms>
- * so the GUI keeps the session page and its stop button. A `STITCH|side=…`
+ * so the GUI keeps the home stitch card and its 停止拼接 button. A `STITCH|side=…`
  * line received during the outage is applied to the next attempt. Failures
  * before the first session (connect refused, busy, denied) return immediately
  * as before; only a genuinely established-then-lost session is retried.

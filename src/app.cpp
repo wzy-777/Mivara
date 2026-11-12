@@ -13,12 +13,15 @@
  *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend)
  *   NOT_FOUND  – 继续搜索 / 手动输入ip
  *   MANUAL_IP  – type a receiver IP, then the same mode choice
- *   STREAMING  – session running (bin/sender …) + live STAT panel
+ *   HOME       – connect entry / receive bar / history; a running stitch
+ *                session also lives here (status, direction switch, stop, log)
+ *   STREAMING  – mirror/extend session running (bin/sender …) + live STAT panel
  *   SETTINGS   – AppConfig editor (codec / hw / quality / fps / bitrate / …)
  *
  * Children run either with their own console (show_status_console=1) or
  * hidden with stdout+stderr captured into a log ring that feeds a second
- * "Mivara 日志" window; STAT| lines feed the in-app status panel.
+ * "Mivara 日志" window; STAT| lines feed the in-app status panel
+ * (mirror/extend) or the home stitch card.
  *
  * Stopping the sender is always graceful (Ctrl+C / SIGINT) so vddShutdown()
  * detaches the virtual display – never TerminateProcess as the first resort.
@@ -174,27 +177,44 @@
 #define HOME_SESSION_BACK_W 116
 #define HOME_SESSION_STOP_X (HOME_CARD_X(0) + HOME_CARD_W - 16 - HOME_SESSION_STOP_W)
 #define HOME_SESSION_BACK_X (HOME_SESSION_STOP_X - 8 - HOME_SESSION_BACK_W)
+/* A running stitch session lives entirely on 主页: there is no separate
+ * session screen for it, so the hero card carries the status, the direction
+ * switch, 停止 and 日志. It is taller than the mirror/extend session card and
+ * pushes the receive bar + history down; see homeCardH()/homeHistVisible(). */
+#define HOME_STITCH_CARD_H 140
+#define HOME_STITCH_ACTION_H 30
+#define HOME_STITCH_LOG_W 68
+#define HOME_STITCH_STOP_W 96
+#define HOME_STITCH_STOP_X (HOME_CARD_X(0) + HOME_CARD_W - 20 - HOME_STITCH_STOP_W)
+#define HOME_STITCH_LOG_X (HOME_STITCH_STOP_X - 8 - HOME_STITCH_LOG_W)
+#define HOME_STITCH_ACTION_Y (HOME_CARD_Y + 12)
+/* The failed state swaps 停止 for 重试 and adds a 关闭 that returns to the
+ * connect card (the failure card must not strand the search entry). */
+#define HOME_STITCH_RETRY_W 84
+#define HOME_STITCH_CLOSE_W 64
+#define HOME_STITCH_RETRY_X (HOME_CARD_X(0) + HOME_CARD_W - 20 - HOME_STITCH_RETRY_W)
+#define HOME_STITCH_CLOSE_X (HOME_STITCH_RETRY_X - 8 - HOME_STITCH_CLOSE_W)
+#define HOME_STITCH_FAIL_LOG_X (HOME_STITCH_CLOSE_X - 8 - HOME_STITCH_LOG_W)
 
-#define RECV_BAR_Y 300
+/* The receive bar and history card follow the home hero card (which grows for
+ * a stitch session); their Y positions are homeRecvBarY()/homeHistCardY(). */
 #define RECV_BAR_H 68
 #define RECV_BAR_ACT_W 104
 #define RECV_BAR_ACT_H 32
 #define RECV_BAR_ACT_X (BODY_R - 16 - RECV_BAR_ACT_W)
-#define RECV_BAR_ACT_Y (RECV_BAR_Y + (RECV_BAR_H - RECV_BAR_ACT_H) / 2)
 
-#define HIST_CARD_Y 376
-#define HIST_CARD_H 284
 #define HIST_ROW_X (BODY_X + 16)
 #define HIST_ROW_W (BODY_W - 32)
 #define HIST_ROW_H 44
-#define HIST_ROW_Y(i) (HIST_CARD_Y + 42 + (i) * 48)
 #define HIST_BTN_X 584                  /* 投屏 / 扩展 / 拼接 / 删除, right-aligned */
 #define HIST_BTN_W 64
 #define HIST_BTN_GAP 6
 #define HIST_DEL_X (HIST_ROW_X + HIST_ROW_W - 44)
 #define HIST_TEXT_W (HIST_BTN_X - 8 - (HIST_ROW_X + 12))   /* name/subtitle fit */
+#define HOME_BOTTOM 660                 /* history card's bottom edge            */
 #define HIST_PAGER_Y 674                /* footer caption, clear of the card's
-                                         * bottom edge at 660 and its shadow */
+                                         * bottom edge at HOME_BOTTOM and its
+                                         * shadow */
 #define HIST_CARD_H_EMPTY 132
 #define HIST_FOLDER_W 24
 #define HIST_FOLDER_H 20
@@ -324,20 +344,33 @@ static int foundActionsY(int n)
 
 /* These build compound literals, so they must be functions, not macros —
  * SDL_Rect{...}.x does not parse as a macro expansion in an argument list. */
+/* Defined after the globals (they read g_sender/g_child_mode): the home card
+ * grows while a stitch session runs, and the receive bar + history follow it. */
+static bool homeStitchSession();
+static bool homeStitchFailed();
+static bool homeStitchCard();
+static int  homeCardH();
+static int  homeRecvBarY();
+static int  homeRecvBarActY();
+static int  homeHistCardY();
+static int  homeHistCardH();
+static int  homeHistVisible();
+
 static SDL_Rect rcHomeCard(int i)
 {
-    return SDL_Rect{HOME_CARD_X(i), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H};
+    return SDL_Rect{HOME_CARD_X(i), HOME_CARD_Y, HOME_CARD_W, homeCardH()};
 }
 static SDL_Rect rcHistRow(int i)
 {
-    return SDL_Rect{HIST_ROW_X, HIST_ROW_Y(i), HIST_ROW_W, HIST_ROW_H};
+    return SDL_Rect{HIST_ROW_X, homeHistCardY() + 42 + i * 48,
+                    HIST_ROW_W, HIST_ROW_H};
 }
 static SDL_Rect rcHistBtn(int i, int which)   /* 0 投屏 / 1 扩展 / 2 拼接 / 3 删除 */
 {
     static const int w[4] = {HIST_BTN_W, HIST_BTN_W, HIST_BTN_W, 44};
     int x = (which == 3) ? HIST_DEL_X
                          : HIST_BTN_X + which * (HIST_BTN_W + HIST_BTN_GAP);
-    return SDL_Rect{x, HIST_ROW_Y(i) + 6, w[which], 32};
+    return SDL_Rect{x, homeHistCardY() + 42 + i * 48 + 6, w[which], 32};
 }
 
 /* 拼接 direction chooser (modal over whatever screen opened it). The pads are
@@ -379,7 +412,10 @@ static SDL_Rect rcSideCancel()
     return SDL_Rect{SIDE_DLG_CX - 60, SIDE_DLG_Y + 264, 120, 34};
 }
 
-/* In-session four-way switch, drawn inside the stitch status panel. */
+/* In-session four-way 拼接 switch. It used to live in the stitch session
+ * screen's status panel; that screen is gone for stitch, so the chips now sit
+ * in the home session card, under the target line. ST_PANEL_* still lays out
+ * the mirror/extend connection-details panel. */
 #define ST_PANEL_X BODY_X
 #define ST_PANEL_Y 330
 #define ST_PANEL_W BODY_W
@@ -387,9 +423,9 @@ static SDL_Rect rcSideCancel()
 #define ST_DIR_CAPTION_W 36
 #define ST_DIR_CHIP_W 70
 #define ST_DIR_CHIP_H 26
-#define ST_DIR_CHIP_Y (ST_PANEL_Y + 112)
-#define ST_DIR_CHIP_X(i) \
-    (ST_PANEL_X + 20 + ST_DIR_CAPTION_W + (i) * (ST_DIR_CHIP_W + 8))
+#define HOME_STITCH_DIR_Y (HOME_CARD_Y + 68)
+#define HOME_STITCH_CHIP_X(i) \
+    (HOME_CARD_X(0) + 20 + ST_DIR_CAPTION_W + (i) * (ST_DIR_CHIP_W + 8))
 
 /* settings: two columns of cards */
 #define SET_COL_L 160
@@ -539,11 +575,18 @@ enum SendPhase {
 static SendPhase g_send_phase = SP_IDLE;
 
 /* A stitch controller that lost its socket stays alive and reconnects. The
- * session page must remain visible (with its stop button) and every STAT line
- * produced during the outage must not be mistaken for a fresh session. */
+ * home stitch card must remain visible (with its 停止拼接 button) and every
+ * STAT line produced during the outage must not be mistaken for a fresh
+ * session. */
 static bool g_stitch_reconnecting = false;
 static const char *const kStitchReconnectNote =
     "连接中断，正在自动重连";
+
+/* The failed stitch card must keep its reason after g_status_note is cleared
+ * (openSettings/cancelSettings/save) or overwritten by an unrelated action
+ * (e.g. starting the receiver). Written by launchStream()/childExited(),
+ * cleared by a new launch, stopSender() and 关闭. */
+static std::string g_stitch_fail_reason;
 
 /* STAT lines are last-wins and can arrive out of order on a slow link: once the
  * session is live, an older auth line must not drag the UI back to 等待授权. */
@@ -568,6 +611,9 @@ enum BtnId {
     BTN_HOME_RECV_START,                /* 接收状态栏 开启 / 重试   */
     BTN_HOME_RECV_DETAIL,               /* 接收状态栏 → 接收详情    */
     BTN_HOME_RECV_SETTINGS,             /* 接收状态栏 → 接收与安全  */
+    BTN_HOME_SESSION_LOG,               /* 拼接会话卡 · 日志        */
+    BTN_HOME_SESSION_RETRY,             /* 拼接失败卡 · 重试        */
+    BTN_HOME_SESSION_DISMISS,           /* 拼接失败卡 · 关闭        */
     /* receiving */
     BTN_RECV_STOP = 200,
     BTN_RECV_LOG,
@@ -644,7 +690,7 @@ enum BtnId {
                                          * nothing else, so it may sit outside
                                          * the kThemeIds table */
     /* 拼接 direction: the modal chooser shown right after clicking 拼接, and
-     * the live four-way switch on the session screen. Same order as KvmSide
+     * the live four-way switch on the home stitch card. Same order as KvmSide
      * (left/right/top/bottom), so id - base indexes the side tables. */
     BTN_STITCH_SIDE_BASE = 9000,        /* +0..3, plus cancel */
     BTN_STITCH_SIDE_CANCEL = 9004,
@@ -1132,6 +1178,57 @@ static int stitchSideCurrent()
     std::lock_guard<std::mutex> lk(g_stats_mtx);
     const int s = kvmSideFromKey(g_stats.side.c_str());
     return s >= 0 ? s : stitchSideFromConfig();
+}
+
+/* ── home layout ─────────────────────────────────────────────────────────── */
+/* The stitch session owns 主页 instead of a separate session screen, so its
+ * card is taller than the mirror/extend one. Everything below it moves down
+ * together; the history card keeps its bottom edge and loses one visible row
+ * (five → four) while the session runs. */
+static bool homeStitchSession()
+{
+    return g_sender.active && g_child_mode == SEND_STITCH;
+}
+/* A failed stitch attempt keeps the same card (error, 日志, 重试, 关闭) instead
+ * of falling back to the connect card: the old session screen did the same,
+ * and a first-ever failure has no history row to retry from. */
+static bool homeStitchFailed()
+{
+    return !g_sender.active && g_child_mode == SEND_STITCH &&
+           g_send_phase == SP_FAILED && !g_last_ip.empty();
+}
+static bool homeStitchCard()
+{
+    return homeStitchSession() || homeStitchFailed();
+}
+static int homeCardH()
+{
+    return homeStitchCard() ? HOME_STITCH_CARD_H : HOME_CARD_H;
+}
+static int homeRecvBarY()
+{
+    return HOME_CARD_Y + homeCardH() + 12;
+}
+static int homeRecvBarActY()
+{
+    return homeRecvBarY() + (RECV_BAR_H - RECV_BAR_ACT_H) / 2;
+}
+static int homeHistCardY()
+{
+    return homeRecvBarY() + RECV_BAR_H + 8;
+}
+static int homeHistCardH()
+{
+    return HOME_BOTTOM - homeHistCardY();
+}
+static int homeHistVisible()
+{
+    /* only complete rows fit; the pager must never claim a row that is not
+     * painted */
+    int n = (homeHistCardH() - 42 - HIST_ROW_H) / 48 + 1;
+    if (n < 1) n = 1;
+    if (n > HIST_VISIBLE) n = HIST_VISIBLE;
+    return n;
 }
 
 /* ── paths & fonts ───────────────────────────────────────────────────────── */
@@ -3175,7 +3272,7 @@ static void parseStatLine(const std::string &line, bool from_receiver)
     } else if (s.event == "stitch") {
         /* state=waiting is emitted before the 8084 connect and before the peer
          * authorizes, so it is not a live session yet. local/remote are; and
-         * reconnecting keeps the session page alive while the controller
+         * reconnecting keeps the home stitch card alive while the controller
          * retries in the background (it never asks the user to reconnect by
          * hand). */
         if (s.state == "reconnecting") {
@@ -4025,6 +4122,7 @@ static void stopSender()
     g_child_extend = false;
     g_send_phase = SP_IDLE;
     g_auth_wait_note.clear();
+    g_stitch_fail_reason.clear();
     if (g_stitch_reconnecting) {
         g_stitch_reconnecting = false;
         if (g_status_note.rfind(kStitchReconnectNote, 0) == 0)
@@ -4193,7 +4291,9 @@ static void setScreen(Screen s)
 
 static Screen resolveHomeScreen()
 {
-    if (g_sender.active) return SCR_STREAMING;
+    /* 拼接 lives on 主页, so there is no session screen to return to. */
+    if (g_sender.active)
+        return (g_child_mode == SEND_STITCH) ? SCR_HOME : SCR_STREAMING;
     if (g_receiver.active) return SCR_RECEIVING;
     return g_session_screen;
 }
@@ -4266,7 +4366,7 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     if (g_sender.active) {
         g_status_note = "已有发送会话";
         g_status_tone = StatusTone::Warning;
-        setScreen(SCR_STREAMING);
+        setScreen(resolveHomeScreen());
         return;
     }
     const bool extend = (mode == SEND_EXTEND);
@@ -4285,11 +4385,15 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     g_status_note.clear();
     g_status_tone = StatusTone::Info;
     g_auth_wait_note.clear();
+    g_stitch_fail_reason.clear();
     auto fail = [&](const std::string &message) {
         g_status_note = message;
         g_status_tone = StatusTone::Error;
         g_send_phase = SP_FAILED;
-        setScreen(SCR_STREAMING);
+        if (stitch) g_stitch_fail_reason = message;
+        /* A stitch attempt never opens a session screen; it stays on 主页,
+         * where the failed card offers 重试 / 日志 / 关闭. */
+        setScreen(stitch ? SCR_HOME : SCR_STREAMING);
     };
     std::string path = sibling("sender.exe");
 #ifndef _WIN32
@@ -4384,7 +4488,7 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     g_status_note = "目标: " + sendTargetEndpoint();
     g_status_tone = StatusTone::Info;
     g_live_params = g_cfg;
-    setScreen(SCR_STREAMING);
+    setScreen(stitch ? SCR_HOME : SCR_STREAMING);
 }
 
 /* 拼接 always asks which side the peer is on before spawning the controller:
@@ -4429,7 +4533,7 @@ static void startSendMode(const std::string &ip, int port, int mode,
 {
     if (g_sender.active) {           /* launchStream() also guards, defensively */
         g_status_note = "已有发送会话";
-        setScreen(SCR_STREAMING);
+        setScreen(resolveHomeScreen());
         return;
     }
     if (mode == SEND_STITCH) openStitchDialog(ip, port, name);
@@ -5886,7 +5990,7 @@ static bool confirmExit()
                            MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
 #else
     /* No tray on POSIX: closing the window keeps its old meaning and the
-     * session screen still offers a deliberate stop. */
+     * session UI still offers a deliberate stop. */
     return true;
 #endif
 }
@@ -6234,7 +6338,44 @@ static void buildButtons()
                 addButton(BODY_X, HOME_BAND_Y, BODY_W, 36, "", BTN_UPD_NOTICE,
                           BTN_V_GHOST);
         }
-        if (g_sender.active) {
+        {
+            /* The stitch card is taller, so the history list can show one row
+             * fewer while it is up; keep a scrolled list on its last full page
+             * when the layout changes under it. */
+            const int maxScroll = std::max(0, (int)g_hist.size() - homeHistVisible());
+            if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
+            if (g_hist_scroll < 0) g_hist_scroll = 0;
+        }
+        if (homeStitchCard()) {
+            /* 拼接 never leaves 主页: the hero card is the whole session UI.
+             * A failed attempt keeps the card for its 重试 / 日志 / 关闭. */
+            if (homeStitchSession() && g_send_phase == SP_LIVE) {
+                const int cur = stitchSideCurrent();
+                for (int i = 0; i < 4; i++)
+                    addChoice(HOME_STITCH_CHIP_X(i), HOME_STITCH_DIR_Y,
+                              ST_DIR_CHIP_W, ST_DIR_CHIP_H, kStitchSideLabel[i],
+                              BTN_STITCH_SWITCH_BASE + i, i == cur, g_fontS);
+            }
+            if (homeStitchFailed()) {
+                addButton(HOME_STITCH_FAIL_LOG_X, HOME_STITCH_ACTION_Y,
+                          HOME_STITCH_LOG_W, HOME_STITCH_ACTION_H, "日志",
+                          BTN_HOME_SESSION_LOG, BTN_V_SECONDARY);
+                addButton(HOME_STITCH_CLOSE_X, HOME_STITCH_ACTION_Y,
+                          HOME_STITCH_CLOSE_W, HOME_STITCH_ACTION_H, "关闭",
+                          BTN_HOME_SESSION_DISMISS, BTN_V_SECONDARY);
+                addButton(HOME_STITCH_RETRY_X, HOME_STITCH_ACTION_Y,
+                          HOME_STITCH_RETRY_W, HOME_STITCH_ACTION_H, "重试",
+                          BTN_HOME_SESSION_RETRY, BTN_V_PRIMARY);
+            } else {
+                addButton(HOME_STITCH_LOG_X, HOME_STITCH_ACTION_Y,
+                          HOME_STITCH_LOG_W, HOME_STITCH_ACTION_H, "日志",
+                          BTN_HOME_SESSION_LOG, BTN_V_SECONDARY);
+                addButton(HOME_STITCH_STOP_X, HOME_STITCH_ACTION_Y,
+                          HOME_STITCH_STOP_W, HOME_STITCH_ACTION_H,
+                          std::string("停止") + g_child_label,
+                          BTN_HOME_SENDER_STOP, BTN_V_DANGER);
+            }
+        } else if (g_sender.active) {
             /* Returning to 主页 must never strand a running session: the hero
              * card becomes the session card with real 返回会话 / 停止 buttons,
              * and the connect entry is not registered (a second sender cannot
@@ -6247,7 +6388,7 @@ static void buildButtons()
                       std::string("停止") + g_child_label,
                       BTN_HOME_SENDER_STOP, BTN_V_DANGER);
         } else {
-            addButton(HOME_CARD_X(0), HOME_CARD_Y, HOME_CARD_W, HOME_CARD_H, "",
+            addButton(HOME_CARD_X(0), HOME_CARD_Y, HOME_CARD_W, homeCardH(), "",
                       BTN_HOME_CONNECT, BTN_V_GHOST);
         }
 
@@ -6259,16 +6400,16 @@ static void buildButtons()
             const RecvAction act = recvActionFor(rv);
             const int actId = recvActionButton(rv);
             if (actId != BTN_NONE)
-                addButton(RECV_BAR_ACT_X, RECV_BAR_ACT_Y, RECV_BAR_ACT_W,
+                addButton(RECV_BAR_ACT_X, homeRecvBarActY(), RECV_BAR_ACT_W,
                           RECV_BAR_ACT_H, recvActionLabel(rv),
                           actId, (act == RA_STOP) ? BTN_V_DANGER
                                                   : BTN_V_SECONDARY);
             if (rv.state != RSV_OFF)
-                addButton(BODY_X, RECV_BAR_Y, BODY_W, RECV_BAR_H, "",
+                addButton(BODY_X, homeRecvBarY(), BODY_W, RECV_BAR_H, "",
                           BTN_HOME_RECV_DETAIL, BTN_V_GHOST);
         }
         /* connection history rows */
-        for (int i = 0; i < HIST_VISIBLE; i++) {
+        for (int i = 0; i < homeHistVisible(); i++) {
             const int idx = i + g_hist_scroll;
             if (idx >= (int)g_hist.size()) break;
             const HistEntry &e = g_hist[idx];
@@ -6297,8 +6438,8 @@ static void buildButtons()
                       BTN_V_LINK);
         }
         if (!g_hist.empty())
-            addButton(BODY_R - 88, HIST_CARD_Y + 12, 88, 28, "清空", BTN_HIST_CLEAR,
-                      BTN_V_LINK);
+            addButton(BODY_R - 88, homeHistCardY() + 12, 88, 28, "清空",
+                      BTN_HIST_CLEAR, BTN_V_LINK);
         break;
     }
 
@@ -6349,14 +6490,7 @@ static void buildButtons()
         break;
 
     case SCR_STREAMING: {
-        if (g_sender.active && g_child_mode == SEND_STITCH &&
-            g_send_phase == SP_LIVE) {
-            const int cur = stitchSideCurrent();
-            for (int i = 0; i < 4; i++)
-                addChoice(ST_DIR_CHIP_X(i), ST_DIR_CHIP_Y, ST_DIR_CHIP_W,
-                          ST_DIR_CHIP_H, kStitchSideLabel[i],
-                          BTN_STITCH_SWITCH_BASE + i, i == cur, g_fontS);
-        }
+        /* Mirror/extend only: a stitch session never leaves 主页. */
         if (g_send_phase == SP_LIVE)
             addButton(ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W, 48, "",
                       BTN_STREAM_DETAILS, BTN_V_GHOST);
@@ -6563,10 +6697,9 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
     drawCard(ren, card, CARD_R);
     const int x = card.x + 20;
     const int maxW = card.w - 40;
-    const bool stitch_session = g_sender.active && g_child_mode == SEND_STITCH;
     drawText(ren, g_send_phase == SP_LIVE ? "连接详情" : "连接状态",
              x, card.y + 16, THEME.textDim, g_fontBS);
-    if (g_send_phase == SP_LIVE && !stitch_session)
+    if (g_send_phase == SP_LIVE)
         drawTextV(ren, g_details_open ? "收起 ▲" : "展开 ▼", card.x + card.w - 20,
                   card.y + 26, THEME.textDim, g_fontS, ALIGN_RIGHT);
 
@@ -6574,10 +6707,7 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
         drawText(ren, sendPhaseLabel(), x, card.y + 48, sendPhaseColor(), g_font);
         return;
     }
-    if (!stitch_session && !g_details_open) return;
-
-    if (stitch_session)
-        drawText(ren, "方向", x, ST_DIR_CHIP_Y + 5, THEME.textDim, g_fontS);
+    if (!g_details_open) return;
 
     if (!s.valid) {
         drawText(ren, "等待统计数据…", x, card.y + 54, THEME.textDim, g_font);
@@ -6593,32 +6723,127 @@ static void drawStatPanel(SDL_Renderer *ren, SDL_Rect card)
                  x, card.y + 54, THEME.text, g_font);
         return;
     }
-    if (s.event == "stitch") {
-        int side = kvmSideFromKey(s.side.c_str());
-        if (side < 0) side = stitchSideFromConfig();
-        std::string hint;
-        if (g_stitch_reconnecting || s.state == "reconnecting") {
-            hint = "连接中断，正在自动重连…网络恢复后会继续，可点「停止」结束会话";
-        } else if (s.state == "waiting") {
-            hint = "等待对方确认…";
-        } else if (s.state == "remote") {
-            hint = std::string("已接管对方键鼠 · Ctrl+Alt+Shift+Q 或移出对方") +
-                   kStitchBackEdge[side] + "返回";
-        } else {
-            hint = std::string("光标移到屏幕") + kStitchEnterEdge[side] +
-                   "即可控制对方";
-        }
-        drawText(ren, "控制状态", x, card.y + 50, THEME.text, g_fontB);
-        drawText(ren, fitText(hint, g_fontS, maxW), x, card.y + 86,
-                 THEME.textDim, g_fontS);
-        return;
-    }
     drawText(ren, fitText(statLine1(s), g_fontB, maxW), x, card.y + 54,
              THEME.text, g_fontB);
     std::string l2 = statLine2(s);
     if (!l2.empty())
         drawText(ren, fitText(l2, g_fontS, maxW), x, card.y + 94,
                  THEME.textDim, g_fontS);
+}
+
+/* 控制状态 for the home stitch card. The reconnect warning is the only tone
+ * that differs from the rest of the row: the session is alive but the link is
+ * not, and the stop button must stay reachable. */
+static std::string stitchSessionHint(SDL_Color &color)
+{
+    LiveStats s;
+    {
+        std::lock_guard<std::mutex> lk(g_stats_mtx);
+        s = g_stats;
+    }
+    color = THEME.textDim;
+    /* An authorization note outranks the reconnect warning: a reconnect reruns
+     * the handshake, and with 每次手动授权 the peer is showing its approval
+     * dialog right now. Hiding that behind "网络恢复后会继续" would tell the
+     * user to wait while the peer is waiting for them. */
+    if (!g_auth_wait_note.empty()) {
+        color = g_stitch_reconnecting ? THEME.warning : sendPhaseColor();
+        return (g_stitch_reconnecting ? std::string("重连：") : std::string()) +
+               g_auth_wait_note;
+    }
+    if (g_stitch_reconnecting) {
+        color = THEME.warning;
+        return std::string(kStitchReconnectNote) +
+               "…网络恢复后会继续，可点「停止」结束会话";
+    }
+    if (g_send_phase != SP_LIVE) {
+        color = sendPhaseColor();
+        if (g_send_phase == SP_PASSWORD) return "请在弹窗中输入连接密码";
+        if (g_send_phase == SP_CONNECTING) return "正在建立连接，请稍候…";
+        if (g_send_phase == SP_FAILED) {
+            /* A finished attempt carries its own copy of the reason, because
+             * g_status_note is cleared by openSettings/cancelSettings/save and
+             * can be overwritten by an unrelated action. A live child with a
+             * stale launch-time note must not have that dressed up as the
+             * failure either — read the sender's own error. */
+            if (!g_sender.active && !g_stitch_fail_reason.empty())
+                return g_stitch_fail_reason;
+            if (s.valid && s.event == "error" && !s.msg.empty())
+                return "连接失败：" + senderErrorText(s.msg);
+            if (!g_sender.active && !g_status_note.empty()) return g_status_note;
+            return "连接失败";
+        }
+        return sendPhaseLabel();
+    }
+    int side = kvmSideFromKey(s.side.c_str());
+    if (side < 0) side = stitchSideFromConfig();
+    if (s.valid && s.event == "stitch") {
+        if (s.state == "reconnecting") {
+            color = THEME.warning;
+            return std::string(kStitchReconnectNote) +
+                   "…网络恢复后会继续，可点「停止」结束会话";
+        }
+        if (s.state == "waiting") return "等待对方确认…";
+        if (s.state == "remote")
+            return std::string("已接管对方键鼠 · Ctrl+Alt+Shift+Q 或移出对方") +
+                   kStitchBackEdge[side] + "返回";
+    }
+    return std::string("光标移到屏幕") + kStitchEnterEdge[side] +
+           "即可控制对方";
+}
+
+/* The hero card while a stitch session runs. There is no stitch session
+ * screen, so this card is the whole session UI: target, state, the four-way
+ * direction switch, 停止 and 日志 (the chips and buttons are BTN_V_* cells
+ * painted by the common button pass, not here). */
+static void drawHomeStitchCard(SDL_Renderer *ren, SDL_Rect card)
+{
+    const bool failed = homeStitchFailed();
+    const bool live = (g_send_phase == SP_LIVE);
+    const bool reconnect = (live && g_stitch_reconnecting);
+    SDL_Color hint_color = THEME.textDim;
+    const std::string hint = stitchSessionHint(hint_color);
+
+    SDL_Rect tile{card.x + 18, card.y + 16, 34, 34};
+    fillRoundRect(ren, tile, 11,
+                  failed ? THEME.dangerTint
+                         : (live ? (reconnect ? THEME.warningTint
+                                              : THEME.successTint)
+                                 : THEME.primaryTint));
+    drawGlyph(ren, GLYPH_MONITOR, tile.x + tile.w / 2, tile.y + tile.h / 2, 18,
+              failed ? THEME.onDangerTint
+                     : (live ? (reconnect ? THEME.onWarningTint
+                                          : THEME.onSuccessTint)
+                             : THEME.onPrimaryTint));
+
+    const int text_x = card.x + 64;
+    /* "正在拼接" in green would claim the link is healthy during a reconnect;
+     * the warning tone + label match the 控制状态 row and the tile. */
+    const std::string phase = failed ? "连接失败"
+                            : (reconnect ? "正在重连拼接" : sendPhaseLabel());
+    /* The failed card has three buttons, so its title fits up to the leftmost
+     * one (日志), not the live card's 日志 position. */
+    const int title_right = failed ? HOME_STITCH_FAIL_LOG_X : HOME_STITCH_LOG_X;
+    drawTextV(ren, fitText(phase, g_fontB, title_right - 12 - text_x),
+              text_x, card.y + 29,
+              failed ? THEME.danger
+                     : (reconnect ? THEME.warning : sendPhaseColor()),
+              g_fontB, ALIGN_LEFT);
+    const std::string sub = sendTargetName() + " · " + sendTargetEndpoint();
+    drawText(ren, fitText(sub, g_fontS, card.x + card.w - 20 - text_x),
+             text_x, card.y + 48, THEME.textDim, g_fontS);
+
+    drawTextV(ren, "方向", card.x + 20, HOME_STITCH_DIR_Y + ST_DIR_CHIP_H / 2,
+              THEME.textDim, g_fontS, ALIGN_LEFT);
+    if (!live)
+        drawTextV(ren, std::string(kStitchSideLabel[stitchSideCurrent()]) +
+                           "（连接后可切换）",
+                  HOME_STITCH_CHIP_X(0), HOME_STITCH_DIR_Y + ST_DIR_CHIP_H / 2,
+                  THEME.textDim, g_fontS, ALIGN_LEFT);
+
+    drawText(ren, "控制状态", card.x + 20, card.y + 100, THEME.textDim, g_fontS);
+    drawText(ren, fitText(hint, g_fontS, card.x + card.w - 20 - (card.x + 84)),
+             card.x + 84, card.y + 100, hint_color, g_fontS);
 }
 
 /* Modal scrim + card for the 拼接 direction question. The four pads are
@@ -7230,7 +7455,8 @@ static void renderScreen(int mousex, int mousey)
             drawTextV(g_ren, fitText(g_status_note, g_fontS, BODY_W - 220),
                       BODY_R, HOME_TITLE_Y + 10, statusToneColor(),
                       g_fontS, ALIGN_RIGHT);
-        drawText(g_ren, "快捷操作", BODY_X, HOME_CAPTION_Y, THEME.textDim, g_fontBS);
+        drawText(g_ren, homeStitchCard() ? "拼接会话" : "快捷操作",
+                 BODY_X, HOME_CAPTION_Y, THEME.textDim, g_fontBS);
 
         /* 连接设备 — the one primary entry. 接收 used to sit next to it as an
          * equal-weight card, which read as "start a second app"; it is now a
@@ -7240,38 +7466,46 @@ static void renderScreen(int mousex, int mousey)
             const SDL_Rect card = rcHomeCard(0);
             drawCard(g_ren, card, CARD_R);
 
-            SDL_Rect tile{card.x + 18, card.y + 26, 46, 46};
-            const bool live = (g_send_phase == SP_LIVE);
-            fillRoundRect(g_ren, tile, 14,
-                          live ? THEME.successTint : THEME.primaryTint);
-            drawGlyph(g_ren, g_sender.active ? GLYPH_MONITOR : GLYPH_ARROW_UP,
-                      tile.x + 23, tile.y + 23, 22,
-                      live ? THEME.onSuccessTint : THEME.onPrimaryTint);
-
-            if (g_sender.active) {
-                drawTextV(g_ren, sendPhaseLabel(), card.x + 82,
-                          card.y + 42, sendPhaseColor(), g_fontB, ALIGN_LEFT);
-                const std::string sub = sendTargetName() + " · " + sendTargetEndpoint();
-                drawText(g_ren,
-                         fitText(sub, g_fontS,
-                                 HOME_SESSION_BACK_X - 12 - (card.x + 82)),
-                         card.x + 82, card.y + 66, THEME.textDim, g_fontS);
+            if (homeStitchCard()) {
+                /* 拼接's whole session UI: status, direction switch, hint,
+                 * 日志 and 停止 (or 重试 / 关闭 after a failure). The buttons
+                 * themselves are painted by the common button pass; this only
+                 * paints what has no hit area. */
+                drawHomeStitchCard(g_ren, card);
             } else {
-                if (g_hot == BTN_HOME_CONNECT || g_press == BTN_HOME_CONNECT)
-                    fillRoundRect(g_ren, card, CARD_R, THEME.hover);
-                drawTextV(g_ren, "选择目标设备", card.x + 82, card.y + 42,
-                          THEME.text, g_fontB, ALIGN_LEFT);
-                drawText(g_ren, "搜索后直接选择投屏、扩展或拼接",
-                         card.x + 82, card.y + 66, THEME.textDim, g_fontS);
-                drawTextV(g_ren, "›", card.x + card.w - 22, card.y + card.h / 2,
-                          THEME.textDim, g_fontL, ALIGN_RIGHT);
+                SDL_Rect tile{card.x + 18, card.y + 26, 46, 46};
+                const bool live = (g_send_phase == SP_LIVE);
+                fillRoundRect(g_ren, tile, 14,
+                              live ? THEME.successTint : THEME.primaryTint);
+                drawGlyph(g_ren, g_sender.active ? GLYPH_MONITOR : GLYPH_ARROW_UP,
+                          tile.x + 23, tile.y + 23, 22,
+                          live ? THEME.onSuccessTint : THEME.onPrimaryTint);
+
+                if (g_sender.active) {
+                    drawTextV(g_ren, sendPhaseLabel(), card.x + 82,
+                              card.y + 42, sendPhaseColor(), g_fontB, ALIGN_LEFT);
+                    const std::string sub = sendTargetName() + " · " + sendTargetEndpoint();
+                    drawText(g_ren,
+                             fitText(sub, g_fontS,
+                                     HOME_SESSION_BACK_X - 12 - (card.x + 82)),
+                             card.x + 82, card.y + 66, THEME.textDim, g_fontS);
+                } else {
+                    if (g_hot == BTN_HOME_CONNECT || g_press == BTN_HOME_CONNECT)
+                        fillRoundRect(g_ren, card, CARD_R, THEME.hover);
+                    drawTextV(g_ren, "选择目标设备", card.x + 82, card.y + 42,
+                              THEME.text, g_fontB, ALIGN_LEFT);
+                    drawText(g_ren, "搜索后直接选择投屏、扩展或拼接",
+                             card.x + 82, card.y + 66, THEME.textDim, g_fontS);
+                    drawTextV(g_ren, "›", card.x + card.w - 22, card.y + card.h / 2,
+                              THEME.textDim, g_fontL, ALIGN_RIGHT);
+                }
             }
         }
 
         /* 接收状态栏 —低权重，但各种状态都可见、可操作。 */
         {
             const RecvView rv = recvView();
-            const SDL_Rect bar{BODY_X, RECV_BAR_Y, BODY_W, RECV_BAR_H};
+            const SDL_Rect bar{BODY_X, homeRecvBarY(), BODY_W, RECV_BAR_H};
             drawRoundRect(g_ren, bar, THEME.radiusCard - 6, THEME.surface,
                           THEME.border);
 
@@ -7290,8 +7524,10 @@ static void renderScreen(int mousex, int mousey)
         /* connection history — the card shrinks when there is nothing to list,
          * otherwise the empty state is a 288px box with one line in it */
         {
-            const SDL_Rect card{BODY_X, HIST_CARD_Y, BODY_W,
-                                g_hist.empty() ? HIST_CARD_H_EMPTY : HIST_CARD_H};
+            const SDL_Rect card{BODY_X, homeHistCardY(), BODY_W,
+                                g_hist.empty()
+                                    ? std::min(HIST_CARD_H_EMPTY, homeHistCardH())
+                                    : homeHistCardH()};
             drawCard(g_ren, card, CARD_R);
             drawText(g_ren, "最近连接", card.x + 16, card.y + 16, THEME.text,
                      g_fontBS);
@@ -7301,7 +7537,8 @@ static void renderScreen(int mousex, int mousey)
                 drawTextIn(g_ren, "暂无连接记录 · 真正开始一次会话后会自动出现在这里",
                            card, THEME.textDim, g_font, ALIGN_CENTER);
             } else {
-                for (int i = 0; i < HIST_VISIBLE; i++) {
+                const int visible = homeHistVisible();
+                for (int i = 0; i < visible; i++) {
                     const int idx = i + g_hist_scroll;
                     if (idx >= (int)g_hist.size()) break;
                     const HistEntry &e = g_hist[idx];
@@ -7333,10 +7570,10 @@ static void renderScreen(int mousex, int mousey)
                              row.y + 23,
                              THEME.textDim, g_fontS);
                 }
-                if ((int)g_hist.size() > HIST_VISIBLE) {
+                if ((int)g_hist.size() > visible) {
                     std::string pg = "第 " + std::to_string(g_hist_scroll + 1) + "–" +
                                      std::to_string(std::min((int)g_hist.size(),
-                                                             g_hist_scroll + HIST_VISIBLE)) +
+                                                             g_hist_scroll + visible)) +
                                      " 条 / 共 " + std::to_string(g_hist.size()) +
                                      " 条 · 滚轮翻页";
                     drawTextV(g_ren, pg, BODY_R, HIST_PAGER_Y, THEME.textDim,
@@ -7518,8 +7755,7 @@ static void renderScreen(int mousex, int mousey)
                 drawText(g_ren, fitText(g_status_note, g_fontS, BODY_W - 40),
                          cx, 292, statusToneColor(), g_fontS, true);
         }
-        const bool stitch = g_sender.active && g_child_mode == SEND_STITCH;
-        const int panelH = (stitch || g_details_open) ? ST_PANEL_H : 68;
+        const int panelH = g_details_open ? ST_PANEL_H : 68;
         drawStatPanel(g_ren, SDL_Rect{ST_PANEL_X, ST_PANEL_Y, ST_PANEL_W, panelH});
         break;
     }
@@ -7856,7 +8092,7 @@ static void onButton(int id, bool file_window = false)
     default:
         break;
     }
-    /* Live side switch on the session screen */
+    /* Live side switch on the home stitch card */
     if (id >= BTN_STITCH_SWITCH_BASE && id < BTN_STITCH_SWITCH_BASE + 4) {
         const int side = id - BTN_STITCH_SWITCH_BASE;
         const std::string key = kStitchSideKey[side];
@@ -7958,6 +8194,23 @@ static void onButton(int id, bool file_window = false)
         g_status_note = std::string("已停止") + g_child_label;
         g_status_tone = StatusTone::Info;
         setScreen(SCR_HOME);
+        break;
+    case BTN_HOME_SESSION_LOG:
+        toggleLogWindow();
+        break;
+    case BTN_HOME_SESSION_RETRY:
+        /* Reuse the normal entry point: 拼接 asks for the side again, so a
+         * retry after a peer-side fix is one click plus the known answer. */
+        startSendMode(g_last_ip, g_last_port, SEND_STITCH, g_last_name);
+        break;
+    case BTN_HOME_SESSION_DISMISS:
+        /* Return to the connect card; searching must stay reachable after a
+         * failed attempt. */
+        g_send_phase = SP_IDLE;
+        g_auth_wait_note.clear();
+        g_stitch_fail_reason.clear();
+        g_status_note.clear();
+        g_status_tone = StatusTone::Info;
         break;
 
     case BTN_RECV_STOP:
@@ -8517,7 +8770,7 @@ static void onButton(int id, bool file_window = false)
                     /* Clamp to the last full page, not to the entry count —
                      * otherwise deleting a middle entry leaves a blank list. */
                     const int maxScroll =
-                        std::max(0, (int)g_hist.size() - HIST_VISIBLE);
+                        std::max(0, (int)g_hist.size() - homeHistVisible());
                     if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
                 } else if (kind == 5) {
                     openFileTransfer(e.ip, e.name);
@@ -8755,7 +9008,8 @@ int main(int argc, char *argv[])
                     int dir = ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dir = -dir;
                     g_hist_scroll -= dir;
-                    int maxScroll = std::max(0, (int)g_hist.size() - HIST_VISIBLE);
+                    int maxScroll =
+                        std::max(0, (int)g_hist.size() - homeHistVisible());
                     if (g_hist_scroll < 0) g_hist_scroll = 0;
                     if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
                 }
@@ -9088,13 +9342,18 @@ int main(int argc, char *argv[])
             if (g_pw_ask.open && !g_pw_file_transfer)
                 closePasswordAsk(false);
             if (!err.empty()) {
-                g_status_note = (g_screen == SCR_STREAMING)
-                                    ? senderErrorText(err)
-                                    : "连接失败：" + senderErrorText(err);
+                const std::string msg = (g_screen == SCR_STREAMING)
+                                            ? senderErrorText(err)
+                                            : "连接失败：" + senderErrorText(err);
+                g_status_note = msg;
                 g_status_tone = StatusTone::Error;
+                /* The home card's failure reason must survive the settings
+                 * page clearing g_status_note. */
+                if (g_child_mode == SEND_STITCH) g_stitch_fail_reason = msg;
             } else {
                 g_status_note = "会话已结束";
                 g_status_tone = StatusTone::Info;
+                g_stitch_fail_reason.clear();
                 if (g_screen == SCR_STREAMING) setScreen(SCR_HOME);
             }
             if (g_hidden)
