@@ -262,7 +262,7 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 - 光标被系统钳制在虚拟桌面边缘时，钩子的坐标不再变化；因此用 `RIDEV_INPUTSINK` Raw Input 的设备增量判断"继续朝所选方向推"并驱动远端光标。越过所选边缘 3 像素即进入远程状态，本地输入被吞掉；朝其他方向移动会清零累计值。
 - 远程时把对方光标移出**进入时那条边**，或按 `Ctrl+Alt+Shift+Q`，即交还控制；进入/离开时重新同步物理按住的修饰键与鼠标键，避免对端卡键。四条边的对应关系：右侧→本机右缘出、对方左缘入/出；左侧→本机左缘出、对方右缘入/出；上方→本机上缘出、对方下缘入/出；下方→本机下缘出、对方上缘入/出。
 - 方向由 `--stitch-side left|right|top|bottom` 指定（默认 `right`）；GUI 在启动前弹窗选择并写入 `config.ini` 的 `stitch_side`，下次作为默认。会话中切换方向走 GUI→sender 的 stdin 行 `STITCH|side=…`：stdin 线程调用 `kvmSetControllerSide()` 排队，消息循环在 50 ms 定时器里应用——若此刻正在控制对方，会先交还并释放按键，再挂上新边。
-- 连接失败、握手失败、对方拒绝都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 的主页拼接卡片据此显示当前方向并提供四个切换选项（拼接从头到尾都在主页，没有单独的会话页）。已建立的会话因网卡切换/对端重启/Wi-Fi 漫游丢失连接时不会结束会话：`kvmRunControllerResilient` 以 1/2/4/8/16/30 秒退避自动重连，期间输出 `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`，GUI 保持该卡片和「停止拼接」按钮；断线期间的 `STITCH|side=…` 会应用到下一次连接。首次连接失败（拒绝连接、对方忙、授权拒绝）仍按原样报错，不进入重试。
+- 连接失败、握手失败、对方拒绝都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 的主页拼接卡片据此显示当前方向并提供四个切换选项（投屏、扩展、拼接都在主页，没有单独的会话页）。已建立的会话因网卡切换/对端重启/Wi-Fi 漫游丢失连接时不会结束会话：`kvmRunControllerResilient` 以 1/2/4/8/16/30 秒退避自动重连，期间输出 `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`，GUI 保持该卡片和「停止拼接」按钮；断线期间的 `STITCH|side=…` 会应用到下一次连接。首次连接失败（拒绝连接、对方忙、授权拒绝）仍按原样报错，不进入重试。
 - 非 Windows 平台直接返回错误（拼接暂只支持 Windows）。
 
 **目标侧（receiver 的 8084 服务）**
