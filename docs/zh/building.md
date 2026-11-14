@@ -2,7 +2,7 @@
 
 > [文档索引](../README.md) · [返回 README](../../README.md) · [English](../en/building.md)
 
-本页说明如何在 Linux、Windows 与 macOS 上从源码构建 Mivara、各构建目标的用途，以及在 Windows 上打包安装程序。扩展模式所需的虚拟显示器驱动安装见[虚拟显示器驱动](virtual-display.md)。
+本页说明如何在 Linux、Windows 与 macOS 上从源码构建 Mivara、各构建目标的用途，以及在 Linux 上打包 tar.gz / deb、在 Windows 上打包安装程序。扩展模式所需的虚拟显示器驱动安装见[虚拟显示器驱动](virtual-display.md)。
 
 ## 环境要求
 
@@ -75,6 +75,34 @@ make run          # 构建并启动图形启动器（另有 run-sender / run-rec
 ```
 
 构建使用 `-O3 -march=native -flto` 优化，产物输出到 `bin/`。
+
+## Linux 预编译包
+
+每次发布由 CI 在 Ubuntu 22.04 上构建两种 Linux 产物：
+
+| 文件 | 适用系统 | 说明 |
+|------|----------|------|
+| `Mivara-linux-x86_64.tar.gz` | glibc 2.35+ 的 X11 桌面 | 便携包；内置 FFmpeg/SDL/编解码运行时，解压后运行 `./install.sh` |
+| `Mivara-linux-amd64.deb` | Ubuntu 22.04（FFmpeg 4.4 ABI） | Debian 包；`sudo apt install ./Mivara-linux-amd64.deb` |
+| `SHA256SUMS-linux.txt` | — | 上述文件的 SHA-256 |
+
+便携包安装脚本默认把文件放到 `~/.local`（`sudo ./install.sh` 则用 `/usr/local`），并创建 `mivara` 启动器、桌面入口和图标；`./install.sh --uninstall` 可卸载。`.deb` 安装到 `/usr/lib/mivara`，命令为 `mivara`（另有 `mivara-sender` / `mivara-receiver`）。
+
+本地构建：
+
+```bash
+make install-deps                        # 编译器与 SDL2/FFmpeg/X11 开发包
+sudo apt-get install patchelf dpkg-dev   # 打包工具（Debian/Ubuntu）
+make package-linux                       # portable 构建 + tar.gz + .deb → dist/
+```
+
+打包脚本是 `scripts/release/package-linux.sh`：它先执行 `make clean` 与 portable 构建（`-O3 -march=x86-64 -flto`），再把非系统运行时库复制进 tar 包并写入 `$ORIGIN` RPATH；`.deb` 反过来依赖发行版的 FFmpeg/SDL 包，依赖项由 `dpkg-shlibdeps` 计算。已有 `bin/` 时可加 `--skip-build`。产物：
+
+- `dist/Mivara-linux-x86_64-<版本>.tar.gz`（以及固定名副本 `dist/Mivara-linux-x86_64.tar.gz`）
+- `dist/mivara_<版本>_amd64.deb`（以及固定名副本 `dist/Mivara-linux-amd64.deb`）
+- `dist/SHA256SUMS-linux.txt`
+
+正式发布由 `release.sh` 在推送 tag 后触发 `.github/workflows/release-linux.yml`，下载产物并连同 Windows 安装包一起上传；`--no-linux` 可只发 Windows。CI 失败时仍会发布 Windows 资产，之后用 `bash scripts/release/linux.sh <版本>` 补齐 Linux 包。
 
 ## Windows 控制台说明
 

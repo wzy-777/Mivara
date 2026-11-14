@@ -2,13 +2,14 @@
 # ============================================================================
 # Mivara (幻屏) — one-shot release
 # ============================================================================
-#   build (portable) → artifacts → commit → push → tag → GitHub Release →
-#   winget PR → verify
+#   build (portable) → Windows installer → commit → push → tag → Linux CI →
+#   GitHub Release → winget PR → verify
 #
 # The individual stages live in scripts/release/ and can be run on their own:
 #   bump.sh <ver>      version.h + README badges + winget/<ver>/
 #   build.sh           portable build + binary version check
 #   package.sh         Inno Setup installer + SHA256SUMS.txt (no git/GitHub)
+#   linux.sh <ver>     Linux tar.gz + .deb via GitHub Actions, upload them
 #   winget.sh <ver>    finalize winget/<ver>/ after packaging
 #   verify.sh <ver>    re-check a published release (no build/commit/push)
 # This file composes them and adds preflight, commit/push/tag/release.
@@ -19,6 +20,7 @@
 #   ./release.sh 0.9.3 --dry-run    # everything except commit/push/tag/release
 #   ./release.sh 0.9.3 --yes        # no confirmation prompt (CI-like use)
 #   ./release.sh 0.9.3 --skip-build # reuse dist/ artifacts from a previous run
+#   ./release.sh 0.9.3 --no-linux   # Windows-only release (no Linux packages)
 #   ./release.sh 0.9.3 --no-winget  # do not create/update winget/<ver>/
 #   ./release.sh 0.9.3 --no-winget-pr  # keep winget/<ver>/ but do not submit the PR
 #   ./release.sh 0.9.3 --verify-only   # re-check an already published release
@@ -40,6 +42,7 @@ source "$RELEASE_ROOT/scripts/release/lib.sh"
 source "$RELEASE_SCRIPTS_DIR/bump.sh"
 source "$RELEASE_SCRIPTS_DIR/build.sh"
 source "$RELEASE_SCRIPTS_DIR/package.sh"
+source "$RELEASE_SCRIPTS_DIR/linux.sh"
 source "$RELEASE_SCRIPTS_DIR/winget.sh"
 source "$RELEASE_SCRIPTS_DIR/verify.sh"
 
@@ -55,6 +58,7 @@ VER=""
 DRY_RUN=0
 YES=0
 SKIP_BUILD=0
+DO_LINUX=1
 DO_WINGET=1
 DO_WINGET_PR=1
 VERIFY_DOWNLOAD=auto   # auto | full | none
@@ -68,6 +72,7 @@ while [ $# -gt 0 ]; do
     --dry-run)        DRY_RUN=1 ;;
     --yes|-y)         YES=1 ;;
     --skip-build)     SKIP_BUILD=1 ;;
+    --no-linux)       DO_LINUX=0 ;;
     --no-winget)      DO_WINGET=0 ;;
     --no-winget-pr)   DO_WINGET_PR=0 ;;
     --verify-only)    VERIFY_ONLY=1 ;;
@@ -123,6 +128,19 @@ step "预检"
 
 [ -x "$MSYS_BASH" ] || die "找不到 MSYS2 bash: $MSYS_BASH（构建需要它）"
 [ -n "$(detect_gh)" ] || die "找不到 gh CLI（设置 GH=/path/to/gh.exe）"
+
+# Linux packages are built by GitHub Actions on the pushed tag. The workflow
+# and its packaging script must be part of the release commit, or the tag
+# cannot build them.
+if [ "$DO_LINUX" = 1 ]; then
+  [ -f ".github/workflows/release-linux.yml" ] \
+    || die "缺少 .github/workflows/release-linux.yml（Linux 打包 CI）"
+  [ -f "scripts/release/package-linux.sh" ] \
+    || die "缺少 scripts/release/package-linux.sh"
+  ok "Linux 打包已启用（CI · ubuntu-22.04）"
+else
+  warn "已禁用 Linux 打包（--no-linux）"
+fi
 
 # src/version.h must stay comment-free — ISPP aborts on an inline comment
 grep -Eq 'MIVARA_VERSION.*//' src/version.h && die "src/version.h 的 MIVARA_VERSION 行不能有 // 注释（ISCC 会中止）"
@@ -206,6 +224,9 @@ if [ "$DRY_RUN" = 1 ]; then
     ok "版本号改动已还原（工作区回到 $CUR_VER）"
   fi
   echo "  构建与校验全部通过。未做任何提交/推送/发布。"
+  if [ "$DO_LINUX" = 1 ]; then
+    echo "  注意：Linux 包由 tag 推送后的 CI 构建，dry-run 无法演练；正式发布时会一并生成。"
+  fi
   echo "  复核后去掉 --dry-run 即可正式发布。"
   exit 0
 fi
@@ -241,17 +262,51 @@ git_net push "$REMOTE" "$BRANCH" || die "推送分支失败"
 ok "已推送 $BRANCH"
 
 # ---------------------------------------------------------------------------
-# 10. Tag + release
+# 10. Tag + Linux CI + release
 # ---------------------------------------------------------------------------
-step "打 tag 并创建 Release"
+step "打 tag"
 git tag "$TAG"                       # lightweight, matching v0.8.0 … v0.9.2
 git_net push "$REMOTE" "$TAG" || die "推送 tag 失败"
 ok "tag $TAG 已推送"
 
+# Linux packages are built from the pushed tag (so src/version.h is exactly
+# the released source) and downloaded into dist/ before the release is
+# created. A Linux failure must not strand the Windows installer: create the
+# release with the Windows assets, then report the recovery command at the
+# end. The stage uses die internally; the subshell keeps that from killing
+# this script.
+LINUX_FAILED=0
+LINUX_ASSETS=()
+if [ "$DO_LINUX" = 1 ]; then
+  step "构建 Linux 安装包（GitHub Actions · $TAG）"
+  if ( linux_stage "$VER" "$TAG" "$SKIP_BUILD" ); then
+    if ! linux_update_notes "$NOTES" "$VER"; then
+      warn "发行说明的 Linux 哈希写入失败（继续发布）"
+    fi
+    while IFS= read -r asset; do
+      LINUX_ASSETS+=("dist/$asset")
+    done < <(linux_asset_names "$VER")
+  else
+    LINUX_FAILED=1
+    warn "Linux 打包失败——仍会发布 Windows 安装包"
+    warn "修复后补齐：bash scripts/release/linux.sh $VER"
+    if [ -f "$NOTES" ]; then linux_strip_notes "$NOTES"; fi
+  fi
+else
+  # A notes template copied from an older release may still carry the block;
+  # never advertise assets this release will not upload.
+  if [ -f "$NOTES" ]; then linux_strip_notes "$NOTES"; fi
+fi
+
+step "创建 Release"
+release_assets=("$SETUP" dist/Mivara-Setup.exe dist/SHA256SUMS.txt)
+if [ "${#LINUX_ASSETS[@]}" -gt 0 ]; then
+  release_assets+=("${LINUX_ASSETS[@]}")
+fi
 gh_net release create "$TAG" \
   --title "$TITLE" \
   --notes-file "$NOTES" \
-  "$SETUP" dist/Mivara-Setup.exe dist/SHA256SUMS.txt >/dev/null \
+  "${release_assets[@]}" >/dev/null \
   || die "gh release create 失败。
   如果 release 已被部分创建（例如只传上去一个资产），先删掉再重跑：
   gh release delete $TAG --yes --cleanup-tag"
@@ -286,11 +341,28 @@ fi
 # ---------------------------------------------------------------------------
 # 11. Live verification (against the published bytes, not the local files)
 # ---------------------------------------------------------------------------
+# A failed Linux stage (or --no-linux) must not make verify_release demand
+# Linux assets from a Windows-only release; a partial download or an earlier
+# run may have left a checksum file for this version behind. The final error
+# below is the actionable one.
+if [ "$LINUX_FAILED" = 1 ] || [ "$DO_LINUX" = 0 ]; then
+  mv -f dist/SHA256SUMS-linux.txt dist/SHA256SUMS-linux.txt.skipped 2>/dev/null || true
+fi
 verify_release
+
+if [ "$LINUX_FAILED" = 1 ]; then
+  die "Release $TAG 已发布 Windows 资产，但 Linux 安装包缺失。
+  恢复（不重建 Windows）：bash scripts/release/linux.sh $VER"
+fi
 
 step "完成"
 printf '  Release : %s/releases/tag/%s\n' "$REPO_URL" "$TAG"
 printf '  SHA-256 : %s\n' "$HASH"
+if [ "$DO_LINUX" = 1 ]; then
+  printf '  Linux   : tar.gz + .deb 已上传（%s/%s）\n' "$LINUX_ARCH" "$DEB_ARCH"
+else
+  printf '  Linux   : 已跳过（--no-linux）\n'
+fi
 if [ "$DO_WINGET" = 1 ] && [ "$DO_WINGET_PR" = 1 ]; then
   printf '\n  winget  : PR 已提交/更新，等待自动校验与社区版主合并\n'
 else

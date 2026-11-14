@@ -206,7 +206,7 @@ OBJ_CAPTURE_DDA := $(BUILDDIR)/capture_dda.o
 # PHONY TARGET DECLARATIONS
 # ============================================================================
 
-.PHONY: all clean debug sender receiver app run run-sender run-receiver check install-deps help copy-dlls
+.PHONY: all clean debug sender receiver app run run-sender run-receiver check install-deps help copy-dlls package-linux
 
 # Default Target
 all: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(STITCHCAP_BIN) $(DLL_TARGET)
@@ -378,7 +378,8 @@ check:
 	@for f in res/admin.rc res/admin.manifest \
 	           res/mivara-mark.svg res/mivara-app.svg \
 	           res/mivara-16.png res/mivara-32.png \
-	           res/mivara-48.png res/mivara-256.png res/mivara.ico; do \
+	           res/mivara-48.png res/mivara-256.png res/mivara.ico \
+	           res/mivara.desktop; do \
         if [ -f $$f ]; then \
             echo "    OK  $$f"; \
         else \
@@ -398,6 +399,17 @@ check:
         echo "    NOT FOUND  SDL2_ttf  <-- required for the GUI (app)"; \
     fi
 	@echo "========================================="
+
+# Linux release packages: portable rebuild + tar.gz + .deb + SHA256SUMS.
+# Deliberately has no prerequisites: the script runs "make clean" itself so a
+# host-specific -march=native build can never leak into a package.
+ifeq ($(PLATFORM),linux)
+package-linux:
+	bash scripts/release/package-linux.sh
+else
+package-linux:
+	@echo "package-linux is Linux-only (needs patchelf + dpkg-deb); use the release CI on Windows"; exit 1
+endif
 
 install-deps:
 	@echo "Installing dependencies..."
@@ -456,6 +468,9 @@ help:
 	@echo "  make check        Verify environment, sources"
 	@echo "  make install-deps Install all system dependencies"
 	@echo "  make help         Show this message"
+	@echo ""
+	@echo "PACKAGE (Linux host only):"
+	@echo "  make package-linux  Build portable tar.gz + .deb in dist/"
 	@echo ""
 	@echo "SENDER CLI:"
 	@echo "  bin/sender [ip] [port] [--mode mirror|extend|stitch]"

@@ -1,0 +1,74 @@
+# ============================================================================
+# Mivara – build the Linux release packages in CI
+# ============================================================================
+# Why CI:
+#   - the portable build flags (-O3 -march=x86-64 -flto) must never be
+#     replaced by a host-specific -march=native build;
+#   - a single, known glibc baseline: ubuntu-22.04 (glibc 2.35). The .deb
+#     depends on that release's FFmpeg ABI; the tar.gz bundles the
+#     FFmpeg/SDL/codec closure and only relies on the host for glibc, X11 and
+#     the desktop stack.
+#
+# What it does: ubuntu-22.04 build → dist/Mivara-linux-x86_64-<ver>.tar.gz,
+#   its fixed-name copy, mivara_<ver>_amd64.deb, its fixed-name copy and
+#   SHA256SUMS-linux.txt, uploaded as the `linux-packages` artifact.
+#
+# release.sh dispatches this workflow on the pushed release tag and uploads
+# the artifact to the GitHub Release. Dispatch it by hand only to repair a
+# release:
+#   gh workflow run release-linux.yml --ref v0.13.0 -f version=0.13.0
+#   bash scripts/release/linux.sh 0.13.0
+# ============================================================================
+
+name: Release Linux packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version X.Y.Z (empty = src/version.h)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libx11-dev libsdl2-dev libsdl2-ttf-dev \
+            libavcodec-dev libavutil-dev libswscale-dev dpkg-dev patchelf
+
+      - name: Build and package
+        env:
+          # Never interpolate a workflow input directly into the shell; the
+          # script validates it, but the substitution happens before bash runs.
+          MIVARA_VERSION: ${{ inputs.version }}
+        run: |
+          # Reproducible tar/deb timestamps. The checkout is exactly the tag
+          # release.sh dispatched, so src/version.h already carries the
+          # release version.
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          bash scripts/release/package-linux.sh --ver "$MIVARA_VERSION"
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages
+          path: |
+            dist/Mivara-linux-*.tar.gz
+            dist/mivara_*.deb
+            dist/Mivara-linux-*.deb
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error

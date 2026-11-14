@@ -8700,6 +8700,17 @@ int main(int argc, char *argv[])
     /* Auxiliary windows (log, detached file page) may be the last one closed
      * while the main window is hidden to the tray; that must not quit. */
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+#ifndef _WIN32
+    /* Linux desktop entry association: without an explicit X11 WM_CLASS the
+     * window is reported under the internal binary name ("app"), so the
+     * taskbar and the mivara.desktop StartupWMClass do not match. */
+#  ifdef SDL_HINT_VIDEO_X11_WMCLASS
+    SDL_SetHint(SDL_HINT_VIDEO_X11_WMCLASS, "Mivara");
+#  endif
+#  ifdef SDL_HINT_APP_NAME
+    SDL_SetHint(SDL_HINT_APP_NAME, "Mivara");
+#  endif
+#endif
     if (TTF_Init() < 0) {
         std::cerr << "TTF_Init: " << TTF_GetError() << "\n";
         SDL_Quit();

@@ -13,6 +13,9 @@
 #
 # This is also the recovery path for an aborted release: it never builds,
 # commits or pushes, so it can be rerun after a network failure.
+#
+# When dist/SHA256SUMS-linux.txt lists the version being verified, the four
+# Linux assets and their server digests are checked as well.
 # ============================================================================
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -56,7 +59,43 @@ verify_release() {
   for a in "Mivara-Setup-$VER.exe" "Mivara-Setup.exe" "SHA256SUMS.txt"; do
     [ -n "$(asset_field "$a" 1)" ] || die "Release 缺少资产: $a（现有: $ASSETS）"
   done
-  ok "三个资产齐全: $ASSETS"
+
+  # Linux assets are optional for older releases and --no-linux, but when the
+  # local SHA256SUMS-linux.txt lists THIS version they are part of this
+  # release and must be checked like the Windows ones. (dist/ can still hold
+  # the previous release's checksum file, so never trust its mere presence.)
+  LINUX_ARCH="${LINUX_ARCH:-x86_64}"
+  DEB_ARCH="${DEB_ARCH:-amd64}"
+  LINUX_NAMES=()
+  LINUX_SUMS_DIGEST=""
+  LINUX_SUMS_CURRENT=0
+  if [ -f dist/SHA256SUMS-linux.txt ]; then
+    if grep -q "  Mivara-linux-${LINUX_ARCH}-${VER}.tar.gz$" dist/SHA256SUMS-linux.txt; then
+      LINUX_SUMS_CURRENT=1
+    else
+      warn "dist/SHA256SUMS-linux.txt 不是 $VER 的产物，跳过 Linux 校验"
+    fi
+  fi
+  if [ "$LINUX_SUMS_CURRENT" = 1 ]; then
+    # Default IFS splits the sha256sum line into hash + name (IFS= would keep
+    # the whole line in $lh and leave $ln empty).
+    while read -r lh ln; do
+      [ -n "${ln:-}" ] || continue
+      case "$lh" in
+        *[!0-9a-fA-F]*) die "dist/SHA256SUMS-linux.txt 行格式异常: $lh $ln" ;;
+      esac
+      LINUX_NAMES+=("$ln")
+    done < dist/SHA256SUMS-linux.txt
+    [ "${#LINUX_NAMES[@]}" -gt 0 ] || die "dist/SHA256SUMS-linux.txt 为空"
+    [ -n "$(asset_field SHA256SUMS-linux.txt 1)" ] \
+      || die "Release 缺少 Linux 资产: SHA256SUMS-linux.txt（现有: $ASSETS）"
+    for a in "${LINUX_NAMES[@]}"; do
+      [ -n "$(asset_field "$a" 1)" ] || die "Release 缺少 Linux 资产: $a（现有: $ASSETS）"
+    done
+    ok "Windows + Linux 资产齐全: $ASSETS"
+  else
+    ok "三个 Windows 资产齐全: $ASSETS"
+  fi
 
   SUMS_LOCAL_HASH="$(sha256sum dist/SHA256SUMS.txt | awk '{print $1}')"
   SUMS_DIGEST="$(asset_field SHA256SUMS.txt 3)"
@@ -76,8 +115,36 @@ verify_release() {
   else
     DIGEST_OK=0
   fi
+
+  if [ "${#LINUX_NAMES[@]}" -gt 0 ]; then
+    for a in "${LINUX_NAMES[@]}"; do
+      case "$a" in SHA256SUMS-linux.txt) continue ;; esac
+      want="$(awk -v n="$a" '$2 == n { print $1; exit }' dist/SHA256SUMS-linux.txt)"
+      [ -n "$want" ] || die "SHA256SUMS-linux.txt 缺少 $a 的哈希"
+      d="$(asset_field "$a" 3)"
+      if [ -n "$d" ]; then
+        [ "$d" = "sha256:$want" ] \
+          || die "$a 的服务端摘要不符（$d ≠ sha256:$want）"
+      else
+        DIGEST_OK=0
+      fi
+    done
+    LINUX_SUMS_DIGEST="$(asset_field SHA256SUMS-linux.txt 3)"
+    if [ -n "$LINUX_SUMS_DIGEST" ]; then
+      LINUX_SUMS_HASH="$(sha256sum dist/SHA256SUMS-linux.txt | awk '{print $1}')"
+      [ "$LINUX_SUMS_DIGEST" = "sha256:$LINUX_SUMS_HASH" ] \
+        || die "SHA256SUMS-linux.txt 的服务端摘要不符（$LINUX_SUMS_DIGEST ≠ sha256:$LINUX_SUMS_HASH）"
+    else
+      DIGEST_OK=0
+    fi
+  fi
+
   if [ "$DIGEST_OK" = 1 ]; then
-    ok "GitHub 服务端摘要与本地构建一致（两个安装包 + SHA256SUMS.txt）"
+    if [ "${#LINUX_NAMES[@]}" -gt 0 ]; then
+      ok "GitHub 服务端摘要与本地构建一致（Windows + Linux 资产）"
+    else
+      ok "GitHub 服务端摘要与本地构建一致（Windows 资产）"
+    fi
   else
     warn "GitHub 未返回完整的资产摘要，线上字节只能靠下载复验"
   fi
@@ -110,8 +177,21 @@ verify_release() {
     die "下载已发布的 SHA256SUMS.txt 失败，且服务端没有摘要可校验"
   fi
 
+  if [ "${#LINUX_NAMES[@]}" -gt 0 ]; then
+    if curl_net -fsSL -o "$TMP/SHA256SUMS-linux.txt" \
+         "$REPO_URL/releases/download/$TAG/SHA256SUMS-linux.txt"; then
+      diff -q "$TMP/SHA256SUMS-linux.txt" dist/SHA256SUMS-linux.txt >/dev/null \
+        || die "已发布的 SHA256SUMS-linux.txt 与本地不一致"
+      ok "已发布的 SHA256SUMS-linux.txt 与本地一致"
+    elif [ -n "$LINUX_SUMS_DIGEST" ]; then
+      warn "本机无法直接下载 SHA256SUMS-linux.txt；服务端摘要已校验，下载复验跳过"
+    else
+      die "下载已发布的 SHA256SUMS-linux.txt 失败，且服务端没有摘要可校验"
+    fi
+  fi
+
   if [ "$FULL_DL" = 0 ]; then
-    ok "服务端摘要已覆盖安装包字节，跳过 70 MB 下载（--verify-download 可强制复验）"
+    ok "服务端摘要已覆盖资产字节，跳过下载（--verify-download 可强制复验）"
     return 0
   fi
 
@@ -126,6 +206,24 @@ verify_release() {
   else
     die "从固定名永久直链下载失败，且服务端没有摘要可校验"
   fi
+
+  # Linux assets are small compared with the Windows installer; --verify-download
+  # re-fetches every one of them.
+  local n want got
+  for n in "${LINUX_NAMES[@]}"; do
+    case "$n" in SHA256SUMS-linux.txt) continue ;; esac
+    want="$(awk -v x="$n" '$2 == x { print $1; exit }' dist/SHA256SUMS-linux.txt)"
+    if curl_net -fsSL -o "$TMP/$n" "$REPO_URL/releases/download/$TAG/$n"; then
+      got="$(sha256sum "$TMP/$n" | awk '{print $1}')"
+      [ "$got" = "$want" ] \
+        || die "下载回来的 $n 哈希不符（线上 $got ≠ 本地 $want）"
+      ok "$n 下载复验通过"
+    elif [ -n "$(asset_field "$n" 3)" ]; then
+      warn "本机无法直接下载 $n；服务端摘要已校验，下载复验跳过"
+    else
+      die "下载 $n 失败，且服务端没有摘要可校验"
+    fi
+  done
 }
 
 main_verify() {

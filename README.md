@@ -43,6 +43,16 @@
 
 > 扩展模式需要安装一次虚拟显示器驱动，详见[虚拟显示器驱动](docs/zh/virtual-display.md)。
 
+### Linux
+
+1. 下载 [Mivara-linux-x86_64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-x86_64.tar.gz)（通用包）或 [Mivara-linux-amd64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-amd64.deb)（Ubuntu 22.04）。
+2. 安装（二选一）：
+   - Ubuntu：`sudo apt install ./Mivara-linux-amd64.deb`
+   - 其他发行版：解压后进入目录运行 `./install.sh`（默认安装到 `~/.local`；`sudo ./install.sh` 安装到 `/usr/local`）
+3. 从应用菜单启动「Mivara」，或在终端运行 `mivara`。Linux 端支持投屏、接收和文件传输；扩展模式需要 Windows 发送端，拼接需要两端都是 Windows。
+
+> 通用包已内置 FFmpeg/SDL 等运行时库，只需系统提供 glibc 2.35+ 与 X11 桌面；`.deb` 按 Ubuntu 22.04 的 FFmpeg ABI 构建。详见[构建与打包](docs/zh/building.md#linux-预编译包)。
+
 ### 从源码运行
 
 ```bash
@@ -65,6 +75,7 @@ make                 # 构建 bin/app、bin/sender、bin/receiver
 
 - `sender` / `app` 内嵌 `requireAdministrator` 清单，启动时需确认一次 UAC；`receiver` 不需要管理员权限。
 - 扩展模式依赖 Windows 间接显示驱动，只需安装一次，见[虚拟显示器驱动](docs/zh/virtual-display.md)。
+- Linux 预编译包：通用 `.tar.gz` 需要 glibc 2.35+（X11 桌面）；`.deb` 面向 Ubuntu 22.04。更旧的发行版请从源码构建。
 
 ## 文档
 
@@ -72,7 +83,7 @@ make                 # 构建 bin/app、bin/sender、bin/receiver
 |------|------|
 | [使用指南](docs/zh/usage.md) | 显示模式、界面流程、快捷键、设置与连接历史 |
 | [架构与协议](docs/zh/architecture.md) | 目录结构、工作流程、协议 v3 与连接授权、编解码与附加服务 |
-| [构建与打包](docs/zh/building.md) | 环境要求、依赖安装、编译、Windows 安装包 |
+| [构建与打包](docs/zh/building.md) | 环境要求、依赖安装、编译、Windows 与 Linux 安装包 |
 | [虚拟显示器驱动](docs/zh/virtual-display.md) | MttVDD 驱动安装与分辨率配置 |
 | [网络与防火墙](docs/zh/network.md) | 端口、防火墙规则、网络要求 |
 | [性能](docs/zh/performance.md) | 带宽、延迟与统计输出 |
@@ -107,7 +118,7 @@ Mivara 面向**可信局域网**设计。接收端可要求每次手动授权、
 
 ## 许可证
 
-**源码**以 [MIT](LICENSE) 发布 © 2026 wzy-777。发布版的 `sender` / `receiver` 链接了 GPL-3.0-or-later 的 FFmpeg，因此这两个二进制按 **GPL-3.0-or-later** 分发（全文见 [LICENSES/GPL-3.0-or-later](LICENSES/GPL-3.0-or-later)）；`app` 不链接 FFmpeg。第三方组件清单与 FFmpeg 对应源码的获取方式见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+**源码**以 [MIT](LICENSE) 发布 © 2026 wzy-777。发布版的 `sender` / `receiver` 链接了 GPL 系列 FFmpeg（Windows 为 GPL-3.0-or-later；Linux 发行版为 GPL-2.0-or-later），因此这两个二进制统一按 **GPL-3.0-or-later** 分发（全文见 [LICENSES/GPL-3.0-or-later](LICENSES/GPL-3.0-or-later)）；`app` 不链接 FFmpeg。第三方组件清单与 FFmpeg 对应源码的获取方式见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ---
 

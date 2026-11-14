@@ -43,6 +43,16 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 > Extend mode requires the virtual display driver to be installed once — see [Virtual Display Driver](docs/en/virtual-display.md).
 
+### Linux
+
+1. Download [Mivara-linux-x86_64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-x86_64.tar.gz) (portable) or [Mivara-linux-amd64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-amd64.deb) (Ubuntu 22.04).
+2. Install one of:
+   - Ubuntu: `sudo apt install ./Mivara-linux-amd64.deb`
+   - Other distros: extract the tarball, enter the directory and run `./install.sh` (defaults to `~/.local`; `sudo ./install.sh` uses `/usr/local`)
+3. Launch "Mivara" from the application menu or run `mivara`. Linux supports mirroring, receiving and file transfer; extend needs a Windows sender, and stitch needs Windows on both ends.
+
+> The portable bundle ships the FFmpeg/SDL runtime and needs glibc 2.35+ with an X11 desktop; the `.deb` is built against Ubuntu 22.04's FFmpeg ABI. See [Building & Packaging](docs/en/building.md#prebuilt-linux-packages).
+
 ### Build from source
 
 ```bash
@@ -65,6 +75,7 @@ Other platforms and packaging: [Building & Packaging](docs/en/building.md).
 
 - `sender` / `app` embed a `requireAdministrator` manifest and need one UAC confirmation at launch; `receiver` does not run elevated.
 - Extend mode relies on a Windows indirect display driver, installed once — see [Virtual Display Driver](docs/en/virtual-display.md).
+- Linux prebuilt packages: the portable `.tar.gz` needs glibc 2.35+ (X11 desktop); the `.deb` targets Ubuntu 22.04. Build from source on older distros.
 
 ## Documentation
 
@@ -72,7 +83,7 @@ Other platforms and packaging: [Building & Packaging](docs/en/building.md).
 |----------|----------|
 | [User Guide](docs/en/usage.md) | Display modes, GUI flow, shortcuts, settings and history |
 | [Architecture & Protocol](docs/en/architecture.md) | Directory layout, data flow, protocol v3 and connection authorization, codecs and sidecar services |
-| [Building & Packaging](docs/en/building.md) | Requirements, dependencies, build targets, Windows installer |
+| [Building & Packaging](docs/en/building.md) | Requirements, dependencies, build targets, Windows and Linux packages |
 | [Virtual Display Driver](docs/en/virtual-display.md) | MttVDD installation and resolution configuration |
 | [Network & Firewall](docs/en/network.md) | Ports, firewall rules, network requirements |
 | [Performance](docs/en/performance.md) | Bandwidth, latency and statistics |
@@ -107,7 +118,7 @@ Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.md]
 
 ## License
 
-The **source code** is released under the [MIT License](LICENSE) © 2026 wzy-777. The released `sender` / `receiver` binaries link FFmpeg under GPL-3.0-or-later, so **those two binaries are distributed under GPL-3.0-or-later** (full text: [LICENSES/GPL-3.0-or-later](LICENSES/GPL-3.0-or-later)); `app` does not link FFmpeg. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the component list and how to obtain FFmpeg's corresponding source.
+The **source code** is released under the [MIT License](LICENSE) © 2026 wzy-777. The released `sender` / `receiver` binaries link GPL-licensed FFmpeg (GPL-3.0-or-later on Windows; the distribution's GPL-2.0-or-later build on Linux), so **those two binaries are distributed under GPL-3.0-or-later** (full text: [LICENSES/GPL-3.0-or-later](LICENSES/GPL-3.0-or-later)); `app` does not link FFmpeg. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the component list and how to obtain FFmpeg's corresponding source.
 
 ---
 

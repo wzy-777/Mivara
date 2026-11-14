@@ -20,7 +20,10 @@ make check            # env/source self-check (the only "verification" step)
 make install-deps     # apt/dnf/pacman/brew + MSYS2
 # On Windows, make also runs copy-dlls, which copies the mingw64 runtime DLL closure into bin/.
 make OPT_FLAGS="-O3 -march=x86-64 -flto"   # portable build for releases/installer
+make package-linux    # Linux host only: portable tar.gz + .deb + SHA256SUMS-linux.txt
 ```
+
+Linux release packages are built by CI (`release-linux.yml`) from the pushed tag and uploaded together with the Windows installer; `release.sh` drives this automatically (`--no-linux` opts out). Details: [installer guide](docs/agents/installer.md).
 
 - Default release flags: `-O3 -march=native -flto` — host-specific, do not redistribute. **Release/installer builds must override OPT_FLAGS** with `-march=x86-64` (see above).
 - Binaries + runtime DLL closure output to `bin/`; objects go to `build/`.

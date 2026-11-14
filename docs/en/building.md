@@ -2,7 +2,7 @@
 
 > [Docs index](../README.md) · [Back to README](../../README_EN.md) · [中文](../zh/building.md)
 
-This page covers building Mivara from source on Linux, Windows and macOS, what each build target does, and how to package the Windows installer. Installing the virtual display driver required by extend mode is covered in [Virtual Display Driver](virtual-display.md).
+This page covers building Mivara from source on Linux, Windows and macOS, what each build target does, and how to package the Linux tar.gz/deb and the Windows installer. Installing the virtual display driver required by extend mode is covered in [Virtual Display Driver](virtual-display.md).
 
 ## Requirements
 
@@ -76,6 +76,34 @@ make run          # build and launch the GUI (also run-sender / run-receiver)
 ```
 
 Builds use `-O3 -march=native -flto`; output goes to `bin/`.
+
+## Prebuilt Linux Packages
+
+Each release publishes two Linux artifacts built by CI on Ubuntu 22.04:
+
+| File | Target | Notes |
+|------|--------|-------|
+| `Mivara-linux-x86_64.tar.gz` | X11 desktops with glibc 2.35+ | Portable bundle; ships the FFmpeg/SDL/codec runtime, run `./install.sh` after extracting |
+| `Mivara-linux-amd64.deb` | Ubuntu 22.04 (FFmpeg 4.4 ABI) | Debian package; `sudo apt install ./Mivara-linux-amd64.deb` |
+| `SHA256SUMS-linux.txt` | — | SHA-256 for the files above |
+
+The portable installer defaults to `~/.local` (`sudo ./install.sh` uses `/usr/local`) and creates the `mivara` launcher, desktop entry and icon; `./install.sh --uninstall` removes it. The `.deb` installs to `/usr/lib/mivara`; the command is `mivara` (also `mivara-sender` / `mivara-receiver`).
+
+Build locally:
+
+```bash
+make install-deps                        # compiler + SDL2/FFmpeg/X11 development packages
+sudo apt-get install patchelf dpkg-dev   # packaging tools (Debian/Ubuntu)
+make package-linux                       # portable build + tar.gz + .deb → dist/
+```
+
+The packaging script is `scripts/release/package-linux.sh`: it runs `make clean` and a portable build (`-O3 -march=x86-64 -flto`), copies the non-system runtime libraries into the tarball and writes an `$ORIGIN` RPATH; the `.deb` instead depends on the distribution's FFmpeg/SDL packages, with dependencies computed by `dpkg-shlibdeps`. Pass `--skip-build` to reuse an existing `bin/`. Output:
+
+- `dist/Mivara-linux-x86_64-<version>.tar.gz` (and the fixed-name copy `dist/Mivara-linux-x86_64.tar.gz`)
+- `dist/mivara_<version>_amd64.deb` (and the fixed-name copy `dist/Mivara-linux-amd64.deb`)
+- `dist/SHA256SUMS-linux.txt`
+
+For releases, `release.sh` dispatches `.github/workflows/release-linux.yml` on the pushed tag, downloads the artifacts and uploads them together with the Windows installer; `--no-linux` produces a Windows-only release. If CI fails, the Windows assets are still published and `bash scripts/release/linux.sh <version>` adds the Linux packages afterwards.
 
 ## Windows Console Notes
 

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Mivara
+Name[zh_CN]=幻屏
+GenericName=Screen Mirroring
+GenericName[zh_CN]=投屏与扩展屏
+Comment=LAN screen mirroring and wireless second display
+Comment[zh_CN]=局域网投屏与无线扩展屏
+Exec=mivara
+Icon=mivara
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=screen;mirror;extend;cast;lan;
+Keywords[zh_CN]=投屏;扩展;副屏;局域网;
+StartupNotify=true
+StartupWMClass=Mivara
