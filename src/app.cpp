@@ -8698,8 +8698,12 @@ int main(int argc, char *argv[])
         return 1;
     }
     /* Auxiliary windows (log, detached file page) may be the last one closed
-     * while the main window is hidden to the tray; that must not quit. */
+     * while the main window is hidden to the tray; that must not quit.
+     * The hint only exists since SDL 2.24 (Ubuntu 22.04 ships 2.0.20), where
+     * the old behaviour already keeps the app alive. */
+#ifdef SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+#endif
 #ifndef _WIN32
     /* Linux desktop entry association: without an explicit X11 WM_CLASS the
      * window is reported under the internal binary name ("app"), so the
