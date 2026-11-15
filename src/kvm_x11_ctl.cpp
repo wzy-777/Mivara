@@ -21,10 +21,12 @@
 #include "kvm.h"
 #include "kvm_core.h"
 #include "kvm_event_queue.h"
+#include "drop.h"
 #include "proto.h"
 
 #ifdef __linux__
 
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/XInput2.h>
 #include <X11/extensions/Xfixes.h>
@@ -86,6 +88,34 @@ uint64_t          g_ctrl_session_start = 0;
 std::atomic<int>  g_side_req{-1};
 int               g_side = KVM_SIDE_RIGHT;
 
+/* ── file drop (8085 + XDND on the shared edge) ─────────────────────────── */
+bool        g_drop_enabled = false;
+bool        g_drop_ready = false;
+uint8_t     g_drop_token[DROP_TOKEN_BYTES] = {};
+std::string g_peer_ip;
+std::atomic<bool> g_drop_run{false};
+std::thread g_drop_thread;
+
+Window g_drop_strip = 0;
+Atom   A_XdndAware = 0, A_XdndEnter = 0, A_XdndPosition = 0;
+Atom   A_XdndStatus = 0, A_XdndLeave = 0, A_XdndDrop = 0;
+Atom   A_XdndFinished = 0, A_XdndSelection = 0, A_XdndTypeList = 0;
+Atom   A_XdndActionCopy = 0, A_text_uri_list = 0, A_drop_prop = 0;
+
+Window g_drag_source = 0;
+bool   g_file_drag = false;
+bool   g_drag_uri_ok = false;
+bool   g_drag_ghost_sent = false;
+bool   g_drop_waiting = false;
+bool   g_early_requested = false;
+int    g_drag_count = 0;
+int    g_drop_root_x = 0, g_drop_root_y = 0;
+std::string g_drag_name;
+std::vector<std::string> g_drag_paths;
+
+void dropStripSetSide(int side);
+void dropResetDrag();
+
 int g_wake[2] = {-1, -1};
 
 /* ── X state ─────────────────────────────────────────────────────────────── */
@@ -141,6 +171,19 @@ int g_dev_count = 0;
 bool g_allow_abs = false;
 bool g_force_abs_motion = false;
 bool g_trace = false;
+bool g_root_input_ok = true;
+bool g_x_error = false;
+
+int kvmXErrorHandler(Display *display, XErrorEvent *e)
+{
+    (void)display;
+    g_x_error = true;
+    if (g_trace)
+        std::cerr << "[kvm-trace] X error code=" << (int)e->error_code
+                  << " request=" << (int)e->request_code
+                  << " resource=" << (unsigned long)e->resourceid << "\n";
+    return 0;
+}
 
 DevMode *deviceMode(int id)
 {
@@ -485,13 +528,16 @@ void syncHeldInput()
         if (translateKey(kc, vk, scan, ext))
             queueKey(true, vk, scan, ext);
     }
-    for (int b = 1; b < 6; b++)
+    for (int b = 1; b < 6; b++) {
+        if (b == 1 && g_file_drag) continue;
         if (g_btn_down[b]) queueButton((uint32_t)b, true);
+    }
 }
 
 void enterRemote(int local_x, int local_y)
 {
     if (g_state == ControlState::Remote) return;
+    if (!g_root_input_ok) return;
     if (kvmNowMs() - g_grab_fail_tick < 500) return;
 
     /* Any key/button the local desktop already saw as down must be released to
@@ -601,9 +647,394 @@ void applySide(int side)
         return;
     if (g_state == ControlState::Remote) leaveRemote(true);
     g_side = side;
+    dropStripSetSide(g_side);
     g_edge_overshoot = 0;
     emitStitchState("local");
     emitLog(std::string("stitch side -> ") + kvmSideKey(g_side));
+}
+
+/* ── file drop: XDND capture on the shared edge ────────────────────────────
+ * A 3-pixel InputOnly strip on the chosen edge advertises XdndAware. When the
+ * user drags a local selection onto it, we take the text/uri-list, forward the
+ * paths over 8085 with the token obtained from the 8084 handshake, and show a
+ * small ghost on the peer. The strip never grabs input, so normal edge
+ * crossing and the drag source's own pointer grab are unaffected. */
+
+std::string dropStatSafe(const std::string &s)
+{
+    std::string out;
+    out.reserve(std::min<size_t>(s.size(), 200));
+    for (unsigned char c : s) {
+        if (out.size() >= 200) break;
+        out.push_back((c < 0x20 || c == 0x7f || c == '|') ? ' ' : (char)c);
+    }
+    return out;
+}
+
+std::string percentDecode(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            const int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back((char)((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+bool uriListToPaths(const std::string &data, std::vector<std::string> &out)
+{
+    size_t pos = 0;
+    while (pos <= data.size()) {
+        const size_t nl = data.find('\n', pos);
+        std::string line = data.substr(
+            pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        pos = nl == std::string::npos ? data.size() + 1 : nl + 1;
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("file://", 0) != 0) continue;
+        std::string rest = line.substr(7);
+        if (rest.rfind("localhost/", 0) == 0) rest = rest.substr(9);
+        else if (!rest.empty() && rest[0] != '/') continue;  /* remote host */
+        std::string path = percentDecode(rest);
+        if (path.empty() || path[0] != '/' ||
+            path.find('\0') != std::string::npos)
+            continue;
+        out.push_back(path);
+    }
+    return !out.empty();
+}
+
+std::string pathBaseName(const std::string &p)
+{
+    size_t end = p.size();
+    while (end > 0 && p[end - 1] == '/') end--;
+    if (end == 0) return std::string();
+    const size_t b = p.find_last_of('/', end - 1);
+    return p.substr(b == std::string::npos ? 0 : b + 1,
+                    end - (b == std::string::npos ? 0 : b + 1));
+}
+
+void dropSendGhost(bool begin)
+{
+    if (!g_drop_ready) return;
+    KvmEvent info = {};
+    info.type = KVM_EV_DRAG_INFO;
+    info.a = begin ? 1u : 0u;
+    info.b = (uint32_t)g_drag_count;
+    info.c = begin && !g_drag_name.empty() ? 4u : 0u;
+    pushEvent(info);
+    if (!begin || g_drag_name.empty()) {
+        if (!begin) g_drag_ghost_sent = false;
+        return;
+    }
+    std::string text = g_drag_name;
+    size_t cut = std::min<size_t>(text.size(), 4 * 12);
+    while (cut > 0 && ((unsigned char)text[cut] & 0xC0) == 0x80) cut--;
+    text.resize(cut);
+    for (int i = 0; i < 4; i++) {
+        char chunk[12] = {};
+        const size_t off = (size_t)i * 12;
+        if (off < text.size())
+            std::memcpy(chunk, text.data() + off,
+                        std::min<size_t>(12, text.size() - off));
+        KvmEvent t = {};
+        t.type = KVM_EV_DRAG_TEXT;
+        std::memcpy(&t.a, chunk, 4);
+        std::memcpy(&t.b, chunk + 4, 4);
+        std::memcpy(&t.c, chunk + 8, 4);
+        pushEvent(t);
+    }
+    g_drag_ghost_sent = true;
+}
+
+void dropRequestUris(Time when)
+{
+    if (!g_dpy || !g_drop_strip) return;
+    XConvertSelection(g_dpy, A_XdndSelection, A_text_uri_list, A_drop_prop,
+                      g_drop_strip, when);
+    XFlush(g_dpy);
+}
+
+void dropStripInit()
+{
+    if (!g_dpy || g_drop_strip) return;
+    A_XdndAware = XInternAtom(g_dpy, "XdndAware", False);
+    A_XdndEnter = XInternAtom(g_dpy, "XdndEnter", False);
+    A_XdndPosition = XInternAtom(g_dpy, "XdndPosition", False);
+    A_XdndStatus = XInternAtom(g_dpy, "XdndStatus", False);
+    A_XdndLeave = XInternAtom(g_dpy, "XdndLeave", False);
+    A_XdndDrop = XInternAtom(g_dpy, "XdndDrop", False);
+    A_XdndFinished = XInternAtom(g_dpy, "XdndFinished", False);
+    A_XdndSelection = XInternAtom(g_dpy, "XdndSelection", False);
+    A_XdndTypeList = XInternAtom(g_dpy, "XdndTypeList", False);
+    A_XdndActionCopy = XInternAtom(g_dpy, "XdndActionCopy", False);
+    A_text_uri_list = XInternAtom(g_dpy, "text/uri-list", False);
+    A_drop_prop = XInternAtom(g_dpy, "MivaraXdndData", False);
+
+    XSetWindowAttributes attrs = {};
+    attrs.override_redirect = True;
+    attrs.event_mask = EnterWindowMask | LeaveWindowMask |
+                       StructureNotifyMask;
+    g_drop_strip = XCreateWindow(
+        g_dpy, DefaultRootWindow(g_dpy), 0, 0, 3, 1, 0, 0, InputOnly,
+        CopyFromParent, CWOverrideRedirect | CWEventMask, &attrs);
+    if (!g_drop_strip) return;
+    long version = 5;
+    XChangeProperty(g_dpy, g_drop_strip, A_XdndAware, XA_ATOM, 32,
+                    PropModeReplace, (unsigned char *)&version, 1);
+    XMapRaised(g_dpy, g_drop_strip);
+    XFlush(g_dpy);
+}
+
+void dropStripSetSide(int side)
+{
+    if (!g_dpy || !g_drop_strip) return;
+    const int scr = DefaultScreen(g_dpy);
+    const int sw = DisplayWidth(g_dpy, scr);
+    const int sh = DisplayHeight(g_dpy, scr);
+    int x = 0, y = 0, w = 3, h = sh;
+    switch (side) {
+    case KVM_SIDE_LEFT:   x = 0;      y = 0;      w = 3; h = sh; break;
+    case KVM_SIDE_TOP:    x = 0;      y = 0;      w = sw; h = 3; break;
+    case KVM_SIDE_BOTTOM: x = 0;      y = sh - 3; w = sw; h = 3; break;
+    default:              x = sw - 3; y = 0;      w = 3; h = sh; break;
+    }
+    XMoveResizeWindow(g_dpy, g_drop_strip, x, y, (unsigned)w, (unsigned)h);
+    XRaiseWindow(g_dpy, g_drop_strip);
+    XFlush(g_dpy);
+}
+
+void sendXdndFinished(bool ok)
+{
+    if (!g_dpy || !g_drag_source || !A_XdndFinished) return;
+    XEvent ev = {};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.display = g_dpy;
+    ev.xclient.window = g_drag_source;
+    ev.xclient.message_type = A_XdndFinished;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = (long)g_drop_strip;
+    ev.xclient.data.l[1] = ok ? 1 : 0;
+    ev.xclient.data.l[2] = (long)A_XdndActionCopy;
+    XSendEvent(g_dpy, g_drag_source, False, NoEventMask, &ev);
+    XFlush(g_dpy);
+}
+
+void dropResetDrag()
+{
+    g_drag_source = 0;
+    g_file_drag = false;
+    g_drag_uri_ok = false;
+    g_drag_ghost_sent = false;
+    g_drop_waiting = false;
+    g_early_requested = false;
+    g_drag_count = 0;
+    g_drag_name.clear();
+    g_drag_paths.clear();
+}
+
+void dropStripDestroy()
+{
+    if (!g_dpy) return;
+    if (g_drag_ghost_sent) dropSendGhost(false);
+    if (g_drop_strip) {
+        XDestroyWindow(g_dpy, g_drop_strip);
+        g_drop_strip = 0;
+    }
+    dropResetDrag();
+    XFlush(g_dpy);
+}
+
+void dropStartTransfer()
+{
+    if (!g_drop_ready || g_drag_paths.empty()) return;
+    if (g_drop_run.exchange(true)) {
+        emitStat("event=drop|state=busy|msg=another transfer is running");
+        return;
+    }
+    if (g_drop_thread.joinable()) g_drop_thread.join();
+
+    std::vector<std::string> paths = g_drag_paths;
+    const std::string peer = g_peer_ip;
+    uint8_t token[DROP_TOKEN_BYTES];
+    std::memcpy(token, g_drop_token, sizeof(token));
+    const int tx = g_remote_x, ty = g_remote_y;
+    emitStat("event=drop|state=sending|items=" +
+             std::to_string(paths.size()) + "|x=" + std::to_string(tx) +
+             "|y=" + std::to_string(ty));
+    g_drop_thread = std::thread([paths, peer, token, tx, ty]() mutable {
+        DropOptions opt;
+        opt.peer_ip = peer.c_str();
+        opt.port = (uint16_t)DROP_PORT;
+        opt.x = tx;
+        opt.y = ty;
+        opt.transfer_id = (uint32_t)(kvmNowMs() ^
+                                     (uint64_t)getpid());
+        DropResult r =
+            dropSendFiles(opt, paths, token, g_drop_run);
+        std::string line = "event=drop|state=";
+        line += (r.status == DROP_OK) ? "done" : "error";
+        line += "|items=" + std::to_string(r.committed);
+        line += "|failed=" + std::to_string(r.failed);
+        line += "|fallback=" + std::string(r.fallback ? "1" : "0");
+        line += "|code=" + std::to_string(r.status);
+        if (!r.message.empty())
+            line += "|msg=" + dropStatSafe(r.message);
+        emitStat(line);
+        mivaraSecureZero(token, sizeof(token));
+        g_drop_run.store(false);
+    });
+}
+
+void dropClientMessage(XClientMessageEvent &c)
+{
+    if (!g_drop_strip || c.window != g_drop_strip) return;
+
+    if (c.message_type == A_XdndEnter) {
+        g_drag_source = (Window)c.data.l[0];
+        g_file_drag = true;
+        g_drag_paths.clear();
+        g_drag_name.clear();
+        g_drag_count = 0;
+        g_drag_ghost_sent = false;
+        g_drop_waiting = false;
+        g_early_requested = false;
+        bool uri = false;
+        if (c.data.l[1] & 1) {
+            Atom actual = 0;
+            int fmt = 0;
+            unsigned long n = 0, rem = 0;
+            unsigned char *prop = nullptr;
+            if (XGetWindowProperty(g_dpy, g_drag_source, A_XdndTypeList, 0,
+                                   64, False, XA_ATOM, &actual, &fmt, &n,
+                                   &rem, &prop) == Success && prop) {
+                const Atom *types = (const Atom *)prop;
+                for (unsigned long i = 0; i < n; i++)
+                    if (types[i] == A_text_uri_list) uri = true;
+                XFree(prop);
+            }
+        } else {
+            for (int i = 2; i <= 4; i++)
+                if ((Atom)c.data.l[i] == A_text_uri_list) uri = true;
+        }
+        g_drag_uri_ok = uri && g_drop_ready;
+        if (g_drag_uri_ok && !g_early_requested) {
+            g_early_requested = true;
+            dropRequestUris(CurrentTime);
+        }
+        return;
+    }
+
+    if (c.message_type == A_XdndPosition) {
+        if ((Window)c.data.l[0] != g_drag_source) return;
+        g_drop_root_x = (int)((c.data.l[2] >> 16) & 0xFFFF);
+        g_drop_root_y = (int)(c.data.l[2] & 0xFFFF);
+        XEvent ev = {};
+        ev.xclient.type = ClientMessage;
+        ev.xclient.display = g_dpy;
+        ev.xclient.window = g_drag_source;
+        ev.xclient.message_type = A_XdndStatus;
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = (long)g_drop_strip;
+        ev.xclient.data.l[1] = g_drag_uri_ok ? 1 : 0;
+        ev.xclient.data.l[2] = 0;
+        ev.xclient.data.l[3] = 0;
+        ev.xclient.data.l[4] = g_drag_uri_ok ? (long)A_XdndActionCopy : 0;
+        XSendEvent(g_dpy, g_drag_source, False, NoEventMask, &ev);
+        XFlush(g_dpy);
+        if (g_drag_uri_ok && !g_drag_ghost_sent) dropSendGhost(true);
+        return;
+    }
+
+    if (c.message_type == A_XdndLeave) {
+        if (g_drag_ghost_sent) dropSendGhost(false);
+        dropResetDrag();
+        return;
+    }
+
+    if (c.message_type == A_XdndDrop) {
+        if (!g_drag_uri_ok || !g_drop_ready) {
+            sendXdndFinished(false);
+            dropResetDrag();
+            return;
+        }
+        g_drop_waiting = true;
+        if (!g_drag_paths.empty()) {
+            sendXdndFinished(true);
+            dropStartTransfer();
+            if (g_drag_ghost_sent) dropSendGhost(false);
+            dropResetDrag();
+        } else {
+            dropRequestUris((Time)c.data.l[2]);
+        }
+        return;
+    }
+}
+
+void dropSelectionNotify(XSelectionEvent &e)
+{
+    if (!g_drop_strip || e.requestor != g_drop_strip) return;
+    if (e.property == None) {
+        if (g_drop_waiting) {
+            sendXdndFinished(false);
+            dropResetDrag();
+        }
+        return;
+    }
+    Atom actual = 0;
+    int fmt = 0;
+    unsigned long n = 0, rem = 0;
+    unsigned char *prop = nullptr;
+    if (XGetWindowProperty(g_dpy, g_drop_strip, e.property, 0, 1 << 20,
+                           False, AnyPropertyType, &actual, &fmt, &n, &rem,
+                           &prop) != Success || !prop) {
+        if (g_drop_waiting) {
+            sendXdndFinished(false);
+            dropResetDrag();
+        }
+        return;
+    }
+    std::string data;
+    if (fmt == 8)
+        data.assign((const char *)prop, n);
+    else if (fmt == 32)
+        data.assign((const char *)prop, n * 4);
+    XFree(prop);
+    XDeleteProperty(g_dpy, g_drop_strip, e.property);
+
+    std::vector<std::string> paths;
+    if (!uriListToPaths(data, paths)) {
+        if (g_drop_waiting) {
+            sendXdndFinished(false);
+            dropResetDrag();
+        }
+        return;
+    }
+    g_drag_paths = paths;
+    g_drag_count = (int)paths.size();
+    g_drag_name = pathBaseName(paths.front());
+    dropSendGhost(true);
+
+    if (g_drop_waiting) {
+        sendXdndFinished(true);
+        dropStartTransfer();
+        dropSendGhost(false);
+        dropResetDrag();
+    }
 }
 
 /* ── raw input ───────────────────────────────────────────────────────────── */
@@ -627,6 +1058,13 @@ void onMotion(int dx, int dy)
             std::cerr << "[kvm-trace] remote motion dx=" << dx << " dy=" << dy
                       << "\n";
         moveRemote(dx, dy);
+        return;
+    }
+
+    /* A local file drag is handled by the XDND strip. Do not grab the
+     * keyboard/pointer or replay the held left button mid-drag. */
+    if (g_file_drag) {
+        g_edge_overshoot = 0;
         return;
     }
 
@@ -736,6 +1174,7 @@ void onKey(int keycode, bool down, bool grabbed)
     /* Ctrl+Alt+Shift+Q is the local panic key: swallowed, never forwarded. */
     if (down && keycode == g_q_key && g_ctrl && g_alt && g_shift) {
         g_panic_key = keycode;
+        g_drop_run.store(false);
         leaveRemote(true);
         return;
     }
@@ -763,6 +1202,14 @@ void onKey(int keycode, bool down, bool grabbed)
 
 void handleEvent(XEvent &ev)
 {
+    if (ev.type == ClientMessage) {
+        dropClientMessage(ev.xclient);
+        return;
+    }
+    if (ev.type == SelectionNotify) {
+        dropSelectionNotify(ev.xselection);
+        return;
+    }
     /* An active XGrabKeyboard reports keys here (raw key events are not
      * delivered while it is active). */
     if (ev.type == KeyPress || ev.type == KeyRelease) {
@@ -862,6 +1309,7 @@ void handleEvent(XEvent &ev)
 bool initX11(std::string &why)
 {
     XInitThreads();
+    XSetErrorHandler(kvmXErrorHandler);
     g_dpy = XOpenDisplay(nullptr);
     if (!g_dpy) {
         why = "无法打开 X11 显示";
@@ -907,10 +1355,20 @@ bool initX11(std::string &why)
     XISelectEvents(g_dpy, DefaultRootWindow(g_dpy), &em, 1);
     /* An active XGrabKeyboard delivers key events to the grab window; select
      * them so the Remote path can forward keys while raw key events are
-     * suppressed by the grab. */
+     * suppressed by the grab. Another client holding a passive button grab on
+     * the root can make this selection fail (BadAccess); do not let that kill
+     * the process, but do not enter Remote either — key/button delivery would
+     * be incomplete. */
+    g_x_error = false;
     XSelectInput(g_dpy, DefaultRootWindow(g_dpy),
                  KeyPressMask | KeyReleaseMask | ButtonPressMask |
                      ButtonReleaseMask);
+    XSync(g_dpy, False);
+    if (g_x_error) {
+        g_root_input_ok = false;
+        emitLog("cannot select root input events (another client holds a "
+                "root grab); remote input disabled, file drop still works");
+    }
 
     localMetrics(g_screen_w, g_screen_h);
     XSync(g_dpy, False);
@@ -1046,6 +1504,39 @@ void drainLoop(kvm_sock_t sock, bool heartbeat,
 
 /* ── connect / authorization ─────────────────────────────────────────────── */
 
+/* The target sends the 8085 token as one fixed marker frame plus eight data
+ * frames immediately after KvmReply, before any event-stream parser runs. */
+bool readDropToken(kvm_sock_t sock, const KvmReply &reply,
+                   const std::atomic<bool> &running)
+{
+    g_drop_ready = g_drop_enabled &&
+                   (ntohl(reply.reserved) & KVM_FEATURE_FILE_DROP) != 0;
+    if (!g_drop_ready) return true;
+    KvmEvent ev = {};
+    const auto read = [&] {
+        return kvmRecvAllPoll(sock, &ev, sizeof(ev), running, 35000) == 1;
+    };
+    if (!read() || ntohl(ev.type) != KVM_EV_DROP_INFO ||
+        ntohl(ev.a) != 0x4D564B58u || ntohl(ev.b) != 1u ||
+        ntohl(ev.c) != 8u) {
+        g_drop_ready = false;
+        return false;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!read() || ntohl(ev.type) != KVM_EV_DROP_INFO ||
+            ntohl(ev.a) != (uint32_t)i) {
+            mivaraSecureZero(g_drop_token, sizeof(g_drop_token));
+            g_drop_ready = false;
+            return false;
+        }
+        const uint32_t word = ntohl(ev.b);
+        std::memcpy(g_drop_token + i * 4, &word, 4);
+    }
+    emitStat("event=drop|state=ready|port=" +
+             std::to_string((int)DROP_PORT));
+    return true;
+}
+
 int connectHandshake(const char *peer_ip, int peer_port, int side,
                      const std::atomic<bool> &running,
                      const KvmClientAuth *auth, kvm_sock_t &out_sock,
@@ -1075,10 +1566,11 @@ int connectHandshake(const char *peer_ip, int peer_port, int side,
         hello.magic = htonl(KVM_MAGIC);
         hello.version = htonl(KVM_VERSION);
         hello.reserved[0] = htonl((uint32_t)side + 1u);
-        /* Heartbeat only: file drop, reverse drop and drag visuals are
-         * Windows-only capabilities, and we do not advertise bits we cannot
-         * consume. */
-        hello.reserved[1] = htonl(KVM_FEATURE_HEARTBEAT);
+        /* Reverse drop and drag images are not implemented here; file drop
+         * is advertised only when the GUI/CLI enabled it. */
+        hello.reserved[1] = htonl(
+            KVM_FEATURE_HEARTBEAT |
+            (g_drop_enabled ? KVM_FEATURE_FILE_DROP : 0u));
         if (!kvmSendAll(sock, &hello, sizeof(hello))) {
             if (running.load()) emitStatError("拼接握手发送失败");
             kvmClose(sock);
@@ -1120,6 +1612,11 @@ int connectHandshake(const char *peer_ip, int peer_port, int side,
                 continue;
             }
             if (status == KVM_OK) {
+                if (!readDropToken(sock, reply, running)) {
+                    emitStatError("拼接文件通道握手失败");
+                    kvmClose(sock);
+                    return KVM_RUN_TRANSPORT;
+                }
                 out_sock = sock;
                 out_reply = reply;
                 heartbeat =
@@ -1231,6 +1728,11 @@ int connectHandshake(const char *peer_ip, int peer_port, int side,
         }
         if (auth && auth->report) auth->report("granted", nullptr, auth->ctx);
 
+        if (!readDropToken(sock, reply, running)) {
+            emitStatError("拼接文件通道握手失败");
+            kvmClose(sock);
+            return KVM_RUN_TRANSPORT;
+        }
         out_sock = sock;
         out_reply = reply;
         heartbeat = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
@@ -1280,6 +1782,14 @@ void resetSessionState(int side)
     g_dev_count = 0;
     std::memset(g_btn_grabbed, 0, sizeof(g_btn_grabbed));
     g_btn_grab_warned = false;
+    g_root_input_ok = true;
+    g_x_error = false;
+    g_drop_enabled = false;
+    g_drop_ready = false;
+    std::memset(g_drop_token, 0, sizeof(g_drop_token));
+    g_peer_ip.clear();
+    g_drop_run.store(false);
+    dropResetDrag();
     g_wake[0] = g_wake[1] = -1;
 }
 
@@ -1292,6 +1802,8 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     if (!peer_ip || !*peer_ip) return KVM_RUN_PROTOCOL;
 
     resetSessionState(side);
+    g_drop_enabled = auth && auth->file_drop;
+    g_peer_ip = peer_ip;
 
     kvm_sock_t sock = KVM_INVALID_SOCK;
     KvmReply reply = {};
@@ -1316,8 +1828,14 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         return KVM_RUN_UNSUPPORTED;
     }
 
+    if (g_drop_ready) {
+        dropStripInit();
+        dropStripSetSide(g_side);
+    }
+
     if (pipe(g_wake) != 0) {
         emitStatError("拼接初始化失败（唤醒管道）");
+        dropStripDestroy();
         closeX11();
         kvmClose(sock);
         return KVM_RUN_TRANSPORT;
@@ -1363,6 +1881,11 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         }
     }
 
+    g_drop_run.store(false);
+    if (g_drop_thread.joinable()) g_drop_thread.join();
+    dropStripDestroy();
+    mivaraSecureZero(g_drop_token, sizeof(g_drop_token));
+    g_drop_ready = false;
     leaveRemote(false);
     g_drainQuit = true;
     shutdown(sock, SHUT_RDWR);

@@ -33,6 +33,10 @@ namespace {
 
 Display *g_dpy = nullptr;
 
+void ghostMoveX11(int x, int y);
+void ghostPumpX11();
+void ghostEndX11();
+
 typedef int (*XTestFakeMotionEventFn)(Display *, int, int, int, unsigned long);
 typedef int (*XTestFakeButtonEventFn)(Display *, unsigned int, Bool,
                                       unsigned long);
@@ -247,6 +251,8 @@ void injectMoveX11(int x, int y, uint32_t w, uint32_t h, int sx, int sy)
     if ((uint32_t)x >= w) x = (int)w - 1;
     if ((uint32_t)y >= h) y = (int)h - 1;
     g_fakeMotion(d, DefaultScreen(d), x, y, CurrentTime);
+    ghostMoveX11(x + sx, y + sy);
+    ghostPumpX11();
     XFlush(d);
 }
 
@@ -291,6 +297,192 @@ void injectKeyX11(bool down, uint32_t vk, uint32_t scan, bool ext)
     XFlush(d);
 }
 
+/* ── drag ghost (visual only) ─────────────────────────────────────────────
+ * While a file drag crosses the shared edge the source's drag image stays on
+ * the controller's desktop. Draw a small opaque card next to the injected
+ * cursor on this screen. It is deliberately simple Xlib drawing (no compositor
+ * / ARGB requirement); text is best-effort and a long or non-ASCII name still
+ * gets a visible card. */
+struct GhostStateX11 {
+    Window win = 0;
+    GC gc = 0;
+    XFontStruct *font = nullptr;
+    int x = 0, y = 0, w = 0, h = 0;
+    int count = 0;
+    int frames_left = 0;
+    bool visible = false;
+    std::string name;
+};
+GhostStateX11 g_ghost_x11;
+
+std::string ghostLabel()
+{
+    std::string label = g_ghost_x11.name;
+    if (label.empty()) label = "Files";
+    if (g_ghost_x11.count > 1)
+        label += "  +" + std::to_string(g_ghost_x11.count - 1);
+    return label;
+}
+
+bool ghostCreateX11()
+{
+    if (g_ghost_x11.win) return true;
+    Display *d = display();
+    if (!d) return false;
+    const int scr = DefaultScreen(d);
+    XSetWindowAttributes a = {};
+    a.override_redirect = True;
+    a.background_pixel = BlackPixel(d, scr);
+    a.border_pixel = WhitePixel(d, scr);
+    a.event_mask = ExposureMask;
+    g_ghost_x11.win = XCreateWindow(
+        d, DefaultRootWindow(d), 0, 0, 240, 48, 1, CopyFromParent,
+        InputOutput, CopyFromParent,
+        CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &a);
+    if (!g_ghost_x11.win) return false;
+    g_ghost_x11.gc = XCreateGC(d, g_ghost_x11.win, 0, nullptr);
+    g_ghost_x11.font = XLoadQueryFont(d, "9x15");
+    if (!g_ghost_x11.font) g_ghost_x11.font = XLoadQueryFont(d, "fixed");
+    if (g_ghost_x11.font)
+        XSetFont(d, g_ghost_x11.gc, g_ghost_x11.font->fid);
+    return true;
+}
+
+void ghostPaintX11()
+{
+    Display *d = display();
+    if (!d || !g_ghost_x11.win) return;
+    const int scr = DefaultScreen(d);
+    XClearWindow(d, g_ghost_x11.win);
+    XSetForeground(d, g_ghost_x11.gc, WhitePixel(d, scr));
+    /* A tiny page glyph. */
+    const int ix = 10, iy = 10;
+    XDrawRectangle(d, g_ghost_x11.win, g_ghost_x11.gc, ix, iy, 18, 26);
+    XDrawLine(d, g_ghost_x11.win, g_ghost_x11.gc, ix + 18, iy + 7,
+              ix + 11, iy);
+    XDrawLine(d, g_ghost_x11.win, g_ghost_x11.gc, ix + 11, iy,
+              ix + 11, iy + 7);
+    XDrawLine(d, g_ghost_x11.win, g_ghost_x11.gc, ix + 11, iy + 7,
+              ix + 18, iy + 7);
+    std::string label = ghostLabel();
+    size_t cut = std::min<size_t>(label.size(), 96);
+    while (cut > 0 && ((unsigned char)label[cut] & 0xC0) == 0x80) cut--;
+    label.resize(cut);
+    XDrawString(d, g_ghost_x11.win, g_ghost_x11.gc, 40, 31,
+                label.c_str(), (int)label.size());
+}
+
+void ghostPumpX11()
+{
+    Display *d = display();
+    if (!d || !g_ghost_x11.win) return;
+    XEvent ev;
+    while (XCheckWindowEvent(d, g_ghost_x11.win, ExposureMask, &ev)) {
+        if (ev.type == Expose && ev.xexpose.count == 0) ghostPaintX11();
+    }
+}
+
+void ghostPlaceX11()
+{
+    Display *d = display();
+    if (!d || !g_ghost_x11.win) return;
+    XMoveWindow(d, g_ghost_x11.win, g_ghost_x11.x + 16,
+                g_ghost_x11.y + 16);
+    XRaiseWindow(d, g_ghost_x11.win);
+    XFlush(d);
+}
+
+void ghostShowX11()
+{
+    if (!ghostCreateX11()) return;
+    Display *d = display();
+    std::string label = ghostLabel();
+    int tw = 240;
+    if (g_ghost_x11.font) {
+        tw = XTextWidth(g_ghost_x11.font, label.c_str(),
+                        (int)std::min<size_t>(label.size(), 96)) + 56;
+        if (tw < 160) tw = 160;
+        if (tw > 380) tw = 380;
+    }
+    g_ghost_x11.w = tw;
+    g_ghost_x11.h = 48;
+    XResizeWindow(d, g_ghost_x11.win, (unsigned)tw, 48);
+    ghostPlaceX11();
+    XMapRaised(d, g_ghost_x11.win);
+    XSync(d, False);
+    ghostPaintX11();
+    XFlush(d);
+    g_ghost_x11.visible = true;
+}
+
+void ghostHideX11()
+{
+    Display *d = display();
+    if (!d || !g_ghost_x11.win) return;
+    XUnmapWindow(d, g_ghost_x11.win);
+    XFlush(d);
+    g_ghost_x11.visible = false;
+}
+
+void ghostMoveX11(int x, int y)
+{
+    g_ghost_x11.x = x;
+    g_ghost_x11.y = y;
+    if (g_ghost_x11.visible) ghostPlaceX11();
+}
+
+void ghostEndX11()
+{
+    Display *d = display();
+    if (d && g_ghost_x11.win) {
+        XDestroyWindow(d, g_ghost_x11.win);
+        XFreeGC(d, g_ghost_x11.gc);
+        if (g_ghost_x11.font) XFreeFont(d, g_ghost_x11.font);
+        XFlush(d);
+    }
+    g_ghost_x11 = GhostStateX11{};
+}
+
+void dragEventX11(const KvmEvent &e)
+{
+    ghostPumpX11();
+    switch (e.type) {
+    case KVM_EV_DRAG_INFO:
+        if (e.a) {
+            g_ghost_x11.frames_left = (int)e.c;
+            g_ghost_x11.count = (int)e.b;
+            g_ghost_x11.name.clear();
+            ghostShowX11();
+        } else {
+            ghostHideX11();
+            g_ghost_x11.frames_left = 0;
+        }
+        break;
+    case KVM_EV_DRAG_TEXT:
+        if (g_ghost_x11.frames_left > 0) {
+            char chunk[12];
+            std::memcpy(chunk, &e.a, 4);
+            std::memcpy(chunk + 4, &e.b, 4);
+            std::memcpy(chunk + 8, &e.c, 4);
+            g_ghost_x11.name.append(chunk, 12);
+            if (--g_ghost_x11.frames_left == 0) {
+                while (!g_ghost_x11.name.empty() &&
+                       g_ghost_x11.name.back() == '\0')
+                    g_ghost_x11.name.pop_back();
+                ghostShowX11();
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void sessionEndX11(void *)
+{
+    ghostEndX11();
+}
+
 void releaseAllX11()
 {
     Display *d = display();
@@ -325,10 +517,10 @@ const KvmTargetOps &kvmTargetOps()
         injectWheelX11,
         injectKeyX11,
         releaseAllX11,
-        nullptr,           /* dragEvent */
+        dragEventX11,
         nullptr,           /* askConsent: receiver always supplies a hook */
         nullptr,           /* sessionBegin */
-        nullptr            /* sessionEnd */
+        sessionEndX11
     };
     return ops;
 }

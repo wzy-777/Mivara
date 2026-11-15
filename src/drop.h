@@ -18,7 +18,13 @@
  * reports the per-item counts and may leave a failed item's partial data in
  * the destination (the status is then an error, not "done").
  *
- * Windows only (like stitch itself). Non-Windows builds get no-op stubs.
+ * Windows and Linux/X11 are supported. A Windows target resolves the release
+ * point through the shell's OLE drop target; a Linux/X11 target offers the
+ * staged items to the XDND-aware window under the release point and falls back
+ * to a default receive directory when there is none. Linux does not implement
+ * the reverse (target -> controller) direction. Other POSIX builds compile the
+ * listener, but stitch itself is unsupported there, so no session token is
+ * installed and every connection is refused.
  */
 #ifndef MIVARA_DROP_H
 #define MIVARA_DROP_H
@@ -130,7 +136,10 @@ void dropSetStatSink(void (*sink)(const char *line));
 struct DropOptions {
     const char *peer_ip = nullptr;
     uint16_t    port = (uint16_t)DROP_PORT;
-    int         x = 0;             /* release point, target screen pixels */
+    int         x = 0;             /* release point, target screen pixels;
+                                    * (0,0) = the remote cursor was never
+                                    * moved, so Linux targets use the default
+                                    * receive directory instead of XDND */
     int         y = 0;
     uint32_t    transfer_id = 0;
     uint32_t    flags = 0;         /* DROP_FLAG_REVERSE for target→controller */
