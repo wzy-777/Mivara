@@ -19,6 +19,7 @@ Mivara/
 │   ├── kvm_core.cpp/.h       # Stitch core: sockets/time/auth/heartbeat
 │   ├── kvm_target.cpp/.h     # 8084 listener, receive policy and session loop (portable)
 │   ├── kvm_x11.cpp           # Linux/X11 target backend (XTest injection)
+│   ├── kvm_x11_ctl.cpp       # Linux/X11 controller (XInput2 + grabs)
 │   ├── kvm_stub.cpp          # Empty backend for other platforms
 │   ├── filexfer.cpp/.h       # Independent two-way file transfer (GUI client + receiver), TCP 8086
 │   ├── tray.cpp/.h           # Windows tray icon + single instance (no-ops elsewhere)
@@ -241,7 +242,7 @@ Actual bandwidth use per codec is covered in [Performance](performance.md).
 
 ### 6 — Stitch Channel (software KVM, 8084)
 
-Stitch is **not a display mode**: both ends keep their own physical monitor and desktop, and only keyboard/mouse events travel over TCP 8084, so capture, encoding, the virtual display and the 8081 video protocol are not involved (`HsRequestV2.mode` still only accepts 0/1; a stitch value never appears on 8081). The shared layer lives in `src/kvm_core.cpp` (sockets/time/auth/heartbeat) and `src/kvm_target.cpp` (8084 listener, receive policy, session loop); `src/kvm.cpp` holds the Windows controller and Windows target backend, `src/kvm_x11.cpp` the Linux/X11 target backend, and `src/kvm_stub.cpp` covers other platforms.
+Stitch is **not a display mode**: both ends keep their own physical monitor and desktop, and only keyboard/mouse events travel over TCP 8084, so capture, encoding, the virtual display and the 8081 video protocol are not involved (`HsRequestV2.mode` still only accepts 0/1; a stitch value never appears on 8081). The shared layer lives in `src/kvm_core.cpp` (sockets/time/auth/heartbeat) and `src/kvm_target.cpp` (8084 listener, receive policy, session loop); `src/kvm.cpp` holds the Windows controller and Windows target backend, `src/kvm_x11.cpp` the Linux/X11 target backend, `src/kvm_x11_ctl.cpp` the Linux/X11 controller, and `src/kvm_stub.cpp` covers other platforms.
 
 **Handshake (all network-byte-order `uint32`)**
 
@@ -273,7 +274,7 @@ The proof binds this connection with the stitch purpose (`purpose=2`): `HMAC-SHA
 - While remote, moving the peer's cursor back out of **the edge it entered from**, or `Ctrl+Alt+Shift+Q`, hands control back. Enter/leave re-syncs physically held modifiers and mouse buttons so the peer never holds a stuck key. The four layouts: right → leave the local right edge, enter/leave at the peer's left edge; left → local left edge, the peer's right edge; top → local top edge, the peer's bottom edge; bottom → local bottom edge, the peer's top edge.
 - The side is set by `--stitch-side left|right|top|bottom` (default `right`); the GUI asks before launching and stores the answer as `stitch_side` in `config.ini`, which preselects the next dialog. A live switch travels over the GUI→sender stdin channel as `STITCH|side=…`: the stdin thread calls `kvmSetControllerSide()`, which queues the request, and the message loop applies it on its 50 ms timer — handing control back and releasing held keys first if the peer currently has it.
 - Connection/handshake failure and refusal emit their own `STAT|event=error`; state changes emit `STAT|event=stitch|state=local|remote|waiting|…|side=…`, which the home session card renders and turns into the four-way switch (cast, extend and stitch all stay on Home — there is no separate session screen). An **established** session lost to a NIC switch, peer restart or Wi-Fi roam no longer ends the session: `kvmRunControllerResilient` reconnects with 1/2/4/8/16/30 s backoff and emits `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`, so the GUI keeps that card and its Stop stitch button; a `STITCH|side=…` switch made during the outage is applied to the next hello. A first-connection failure (refused, busy, denied) still reports an error and is not retried.
-- The controller is still Windows-only (the Linux XInput2 + grab backend is not implemented yet); the target works on Windows and Linux/X11, where injection uses XTest. Native Wayland sessions are not supported.
+- Linux/X11 controller (`kvm_x11_ctl.cpp`): XInput2 raw events supply relative motion; entering Remote installs an `XGrabKeyboard` and uses its KeyPress/KeyRelease events for forwarding (the active grab suppresses raw key events), while mouse buttons use passive `XGrabButton` grabs (an active `XGrabPointer` would also suppress raw motion, so it is not used). Before entering it releases keys/buttons the local desktop already saw as down (via XTest) and re-arms that physical state on the peer; leaving sends `RELEASE_ALL` and warps the local pointer back to the edge. XFixes hides the local cursor and Ctrl+Alt+Shift+Q works as on Windows. Native Wayland sessions are not supported.
 
 **Target side (receiver's 8084 service)**
 

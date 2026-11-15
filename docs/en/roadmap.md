@@ -24,7 +24,7 @@ The list below tracks shipped and planned features in order; `[x]` means shipped
 - [ ] Adaptive frame rate
 - [ ] Wayland support
 - [ ] Virtual display solutions for macOS/Linux
-- [x] Screen stitching (pure software KVM: one keyboard/mouse drives two PCs, each keeping its own monitor; Windows controller ↔ Windows/Linux-X11 target)
+- [x] Screen stitching (pure software KVM: one keyboard/mouse drives two PCs, each keeping its own monitor; Windows/Linux-X11 controller ↔ Windows/Linux-X11 target)
 - [x] Stitch file drop (drag to the edge, release over an Explorer/desktop folder; copy-only, never moves or deletes the source; off by default on both ends, Windows)
 - [x] Connection authorization (allow any / password only / manual approval, manual by default; one policy for 8081 and 8084, session tokens for 8082/8083)
 - [x] Receive status bar and independent "allow connections / auto-receive" switches

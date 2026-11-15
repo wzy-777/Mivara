@@ -452,7 +452,7 @@ AuthOutcome kvmClientAuthorize(kvm_sock_t s, const KvmHello &hello,
         return AuthOutcome::Protocol;
     }
     status = ntohl(res.status);
-    return status == HS_OK ? AuthOutcome::Ok : AuthOutcome::Status;
+    return status == HS_OK ? AuthOutcome::Ok : AuthOutcome::Rejected;
 }
 
 bool kvmRecvAll(kvm_sock_t s, void *buf, size_t len,

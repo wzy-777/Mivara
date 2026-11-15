@@ -25,7 +25,7 @@
 #
 # Requirements (Debian/Ubuntu host): g++ make pkg-config libx11-dev
 # libsdl2-dev libsdl2-ttf-dev libavcodec-dev libavutil-dev libswscale-dev
-# patchelf dpkg-dev; runtime libxtst6 (stitch target, loaded with dlopen).
+# libxi-dev libxfixes-dev patchelf dpkg-dev; runtime libxtst6 (stitch target, loaded with dlopen).
 # Run `make install-deps` first for the compiler libs.
 # ============================================================================
 

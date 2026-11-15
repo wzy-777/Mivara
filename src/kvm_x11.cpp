@@ -13,8 +13,8 @@
  * Native Wayland sessions have no global injection path; the project's Linux
  * capture is X11-only too, so that boundary is intentional.
  *
- * Controller support (XInput2 + grabs) is the next milestone; kvmRunController
- * stays an explicit "unsupported" stub until then.
+ * This file is the target (被控端) backend only; the Linux controller lives in
+ * kvm_x11_ctl.cpp (XInput2 raw events + grabs).
  */
 #include "kvm_core.h"
 #include "kvm_target.h"
@@ -331,34 +331,6 @@ const KvmTargetOps &kvmTargetOps()
         nullptr            /* sessionEnd */
     };
     return ops;
-}
-
-/* Controller support (XInput2 + XGrabPointer/Keyboard + XTest) is milestone 3;
- * until then the GUI's kvmSupported() keeps the mode hidden on Linux. */
-int kvmRunController(const char *peer_ip, int peer_port, int side,
-                     const std::atomic<bool> &running,
-                     const KvmClientAuth *auth)
-{
-    (void)peer_ip;
-    (void)peer_port;
-    (void)side;
-    (void)running;
-    (void)auth;
-    std::cout << "STAT|event=error|msg=拼接控制端暂未支持 Linux（被控端可用）\n"
-              << std::flush;
-    return KVM_RUN_UNSUPPORTED;
-}
-
-int kvmRunControllerResilient(const char *peer_ip, int peer_port, int side,
-                              const std::atomic<bool> &running,
-                              const KvmClientAuth *auth)
-{
-    return kvmRunController(peer_ip, peer_port, side, running, auth);
-}
-
-void kvmSetControllerSide(int side)
-{
-    (void)side;
 }
 
 #endif /* __linux__ */

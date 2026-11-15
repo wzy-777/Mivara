@@ -48,7 +48,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libx11-dev libsdl2-dev libsdl2-ttf-dev \
-            libavcodec-dev libavutil-dev libswscale-dev dpkg-dev patchelf
+            libavcodec-dev libavutil-dev libswscale-dev libxi-dev libxfixes-dev dpkg-dev patchelf
 
       - name: Build and package
         env:

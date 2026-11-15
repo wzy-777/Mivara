@@ -19,6 +19,7 @@ Mivara/
 │   ├── kvm_core.cpp/.h       # 拼接公共层：socket/时间/授权/心跳
 │   ├── kvm_target.cpp/.h     # 8084 监听、接收策略与会话循环（平台无关）
 │   ├── kvm_x11.cpp           # Linux/X11 被控端后端（XTest 注入）
+│   ├── kvm_x11_ctl.cpp       # Linux/X11 控制端（XInput2 + 抓取）
 │   ├── kvm_stub.cpp          # 其他平台的空实现
 │   ├── filexfer.cpp/.h       # 独立双向文件传输（GUI 客户端 + 接收服务），TCP 8086
 │   ├── tray.cpp/.h           # Windows 托盘图标 + 单实例（其他平台为空实现）
@@ -235,7 +236,7 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 
 ### 6 — 拼接通道（软件 KVM，8084）
 
-拼接**不是显示模式**：两端都保留自己的物理显示器和桌面，只有键盘/鼠标事件经 TCP 8084 传输，因此完全不走采集、编码、虚拟显示器与 8081 视频协议（`HsRequestV2.mode` 仍只有 0/1，拼接值不会出现在 8081 上）。公共层在 `src/kvm_core.cpp`（socket/时间/授权/心跳）与 `src/kvm_target.cpp`（8084 监听、接收策略、会话循环）；`src/kvm.cpp` 是 Windows 控制端与 Windows 目标后端，`src/kvm_x11.cpp` 是 Linux/X11 目标后端，`src/kvm_stub.cpp` 覆盖其他平台。
+拼接**不是显示模式**：两端都保留自己的物理显示器和桌面，只有键盘/鼠标事件经 TCP 8084 传输，因此完全不走采集、编码、虚拟显示器与 8081 视频协议（`HsRequestV2.mode` 仍只有 0/1，拼接值不会出现在 8081 上）。公共层在 `src/kvm_core.cpp`（socket/时间/授权/心跳）与 `src/kvm_target.cpp`（8084 监听、接收策略、会话循环）；`src/kvm.cpp` 是 Windows 控制端与 Windows 目标后端，`src/kvm_x11.cpp` 是 Linux/X11 目标后端，`src/kvm_x11_ctl.cpp` 是 Linux/X11 控制端，`src/kvm_stub.cpp` 覆盖其他平台。
 
 **握手（全部为网络字节序的 `uint32`）**
 
@@ -267,7 +268,7 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 - 远程时把对方光标移出**进入时那条边**，或按 `Ctrl+Alt+Shift+Q`，即交还控制；进入/离开时重新同步物理按住的修饰键与鼠标键，避免对端卡键。四条边的对应关系：右侧→本机右缘出、对方左缘入/出；左侧→本机左缘出、对方右缘入/出；上方→本机上缘出、对方下缘入/出；下方→本机下缘出、对方上缘入/出。
 - 方向由 `--stitch-side left|right|top|bottom` 指定（默认 `right`）；GUI 在启动前弹窗选择并写入 `config.ini` 的 `stitch_side`，下次作为默认。会话中切换方向走 GUI→sender 的 stdin 行 `STITCH|side=…`：stdin 线程调用 `kvmSetControllerSide()` 排队，消息循环在 50 ms 定时器里应用——若此刻正在控制对方，会先交还并释放按键，再挂上新边。
 - 连接失败、握手失败、对方拒绝都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 的主页拼接卡片据此显示当前方向并提供四个切换选项（投屏、扩展、拼接都在主页，没有单独的会话页）。已建立的会话因网卡切换/对端重启/Wi-Fi 漫游丢失连接时不会结束会话：`kvmRunControllerResilient` 以 1/2/4/8/16/30 秒退避自动重连，期间输出 `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`，GUI 保持该卡片和「停止拼接」按钮；断线期间的 `STITCH|side=…` 会应用到下一次连接。首次连接失败（拒绝连接、对方忙、授权拒绝）仍按原样报错，不进入重试。
-- 控制端仍仅支持 Windows（Linux 控制端的 XInput2 + 抓取后端尚未实现）；目标端在 Windows 与 Linux/X11 可用，Linux 通过 XTest 注入，Wayland 原生会话不支持。
+- Linux/X11 控制端（`kvm_x11_ctl.cpp`）：XInput2 raw events 提供相对位移；进入远程时用 `XGrabKeyboard` 吞键并改用其 KeyPress/KeyRelease 事件转发（活动键盘抓取会抑制 raw key），鼠标键用 `XGrabButton` 被动抓取（活动 `XGrabPointer` 会抑制 raw motion，因此不用）；进入前用 XTest 释放本机已按下的键/鼠标键并回放给对端，离开时发 `RELEASE_ALL` 并把本机光标 warp 回边缘；XFixes 隐藏本机光标，Ctrl+Alt+Shift+Q 同样生效。Wayland 原生会话不支持。
 
 **目标侧（receiver 的 8084 服务）**
 

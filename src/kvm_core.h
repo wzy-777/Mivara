@@ -86,11 +86,11 @@ std::string kvmDeviceNameFromWire(const HsRequestExtV3 &ext);
 bool kvmSendHsResponse(kvm_sock_t s, uint32_t status, uint32_t w, uint32_t h);
 void kvmAuthErrorText(uint32_t status, std::string &out);
 
-enum class AuthOutcome { Ok, Status, Cancelled, Transport, Protocol };
+enum class AuthOutcome { Ok, Rejected, Cancelled, Transport, Protocol };
 
 /* Controller half of the v2 authorization exchange: identity frame, optional
  * password proof, then the receiver's verdict. `status` is the receiver's
- * HS_* code for AuthOutcome::Status; `why` is a user-facing reason. */
+ * HS_* code for AuthOutcome::Rejected; `why` is a user-facing reason. */
 AuthOutcome kvmClientAuthorize(kvm_sock_t s, const KvmHello &hello,
                                const HsAuthStart &as,
                                const std::atomic<bool> &running,
