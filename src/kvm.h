@@ -64,9 +64,14 @@
  * name. A denied request gets HsResponseV2(HS_ERR_DENIED), an unanswered one
  * HS_ERR_AUTH_TIMEOUT, and the connection is closed.
  *
- * Windows only. On other platforms kvmRunController() reports an error and
- * kvmServiceRun() returns immediately, so the rest of the program is
- * unaffected.
+ * Platform support: the controller is Windows-only; the target (被控端) runs
+ * on Windows and Linux/X11. On any other platform kvmRunController() reports
+ * that 拼接 is unsupported and kvmServiceRun() returns immediately. The
+ * platform-neutral socket/auth helpers live in kvm_core.cpp, the shared 8084
+ * listener/handshake/session loop in kvm_target.cpp, the Windows backend in
+ * kvm.cpp, the Linux/X11 backend in kvm_x11.cpp, and the remaining stubs in
+ * kvm_stub.cpp. The controller half (kvmSupported() below) stays Windows-only
+ * until the XInput2/grab backend lands.
  */
 #ifndef MIVARA_KVM_H
 #define MIVARA_KVM_H
@@ -283,7 +288,9 @@ struct KvmClientAuth {
     void *ctx = nullptr;
 };
 
-/** True on platforms where 拼接 is implemented (currently Windows only). */
+/** True where the stitch CONTROLLER is implemented (currently Windows only).
+ *  The target side (kvmServiceRun) also runs on Linux/X11 — see kvm_x11.cpp
+ *  and kvm_target.cpp — but the GUI gates the "拼接" send mode on this. */
 inline bool kvmSupported()
 {
 #if defined(_WIN32)

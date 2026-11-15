@@ -15,7 +15,11 @@ Mivara/
 │   ├── receiver.cpp          # 全屏显示、SSDP 广播、计算服务、端口服务、拼接目标端
 │   ├── proto.h               # 协议 v3（握手 + 连接授权 + 控制包/编码枚举）
 │   ├── auth.cpp/.h           # SHA-256/HMAC/PBKDF2、密码记录、会话令牌、失败节流
-│   ├── kvm.cpp/.h            # 拼接（软件 KVM）控制器与目标端，TCP 8084
+│   ├── kvm.cpp/.h            # 拼接控制器（Windows：钩子 + Raw Input + SendInput）
+│   ├── kvm_core.cpp/.h       # 拼接公共层：socket/时间/授权/心跳
+│   ├── kvm_target.cpp/.h     # 8084 监听、接收策略与会话循环（平台无关）
+│   ├── kvm_x11.cpp           # Linux/X11 被控端后端（XTest 注入）
+│   ├── kvm_stub.cpp          # 其他平台的空实现
 │   ├── filexfer.cpp/.h       # 独立双向文件传输（GUI 客户端 + 接收服务），TCP 8086
 │   ├── tray.cpp/.h           # Windows 托盘图标 + 单实例（其他平台为空实现）
 │   ├── codec.cpp/.h          # FFmpeg 编解码（H.264/H.265/AV1，sender + receiver）
@@ -231,7 +235,7 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 
 ### 6 — 拼接通道（软件 KVM，8084）
 
-拼接**不是显示模式**：两端都保留自己的物理显示器和桌面，只有键盘/鼠标事件经 TCP 8084 传输，因此完全不走采集、编码、虚拟显示器与 8081 视频协议（`HsRequestV2.mode` 仍只有 0/1，拼接值不会出现在 8081 上）。实现位于 `src/kvm.cpp` / `src/kvm.h`。
+拼接**不是显示模式**：两端都保留自己的物理显示器和桌面，只有键盘/鼠标事件经 TCP 8084 传输，因此完全不走采集、编码、虚拟显示器与 8081 视频协议（`HsRequestV2.mode` 仍只有 0/1，拼接值不会出现在 8081 上）。公共层在 `src/kvm_core.cpp`（socket/时间/授权/心跳）与 `src/kvm_target.cpp`（8084 监听、接收策略、会话循环）；`src/kvm.cpp` 是 Windows 控制端与 Windows 目标后端，`src/kvm_x11.cpp` 是 Linux/X11 目标后端，`src/kvm_stub.cpp` 覆盖其他平台。
 
 **握手（全部为网络字节序的 `uint32`）**
 
@@ -263,14 +267,14 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 - 远程时把对方光标移出**进入时那条边**，或按 `Ctrl+Alt+Shift+Q`，即交还控制；进入/离开时重新同步物理按住的修饰键与鼠标键，避免对端卡键。四条边的对应关系：右侧→本机右缘出、对方左缘入/出；左侧→本机左缘出、对方右缘入/出；上方→本机上缘出、对方下缘入/出；下方→本机下缘出、对方上缘入/出。
 - 方向由 `--stitch-side left|right|top|bottom` 指定（默认 `right`）；GUI 在启动前弹窗选择并写入 `config.ini` 的 `stitch_side`，下次作为默认。会话中切换方向走 GUI→sender 的 stdin 行 `STITCH|side=…`：stdin 线程调用 `kvmSetControllerSide()` 排队，消息循环在 50 ms 定时器里应用——若此刻正在控制对方，会先交还并释放按键，再挂上新边。
 - 连接失败、握手失败、对方拒绝都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 的主页拼接卡片据此显示当前方向并提供四个切换选项（投屏、扩展、拼接都在主页，没有单独的会话页）。已建立的会话因网卡切换/对端重启/Wi-Fi 漫游丢失连接时不会结束会话：`kvmRunControllerResilient` 以 1/2/4/8/16/30 秒退避自动重连，期间输出 `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`，GUI 保持该卡片和「停止拼接」按钮；断线期间的 `STITCH|side=…` 会应用到下一次连接。首次连接失败（拒绝连接、对方忙、授权拒绝）仍按原样报错，不进入重试。
-- 非 Windows 平台直接返回错误（拼接暂只支持 Windows）。
+- 控制端仍仅支持 Windows（Linux 控制端的 XInput2 + 抓取后端尚未实现）；目标端在 Windows 与 Linux/X11 可用，Linux 通过 XTest 注入，Wayland 原生会话不支持。
 
 **目标侧（receiver 的 8084 服务）**
 
 - 独立线程监听 8084，与视频监听互不影响；空闲与会话中都会轮询停止标志，所有退出路径都会 join。
 - 会话在独立线程中执行，监听线程始终保持响应：会话进行中第二个控制端会立即收到 `KVM_ERR_BUSY`（先读取其 hello 再回复，避免关闭未读完的连接触发 RST）。控制器 drain 线程同时检查 EOF/错误，不让对端退出在空闲时无限漏检。两端以 `KvmHello.reserved[1]` / `KvmReply.reserved` 的 `KVM_FEATURE_HEARTBEAT` 协商心跳；都支持时每 3 秒双向 PING/PONG，9 秒未收到数据即断开并释放按键。两端还会识别本机休眠/卡顿造成的时钟跳变（循环间隔超过 3 秒时重置接收计时），避免笔记本唤醒被误判成对端失联。旧端不协商心跳，回退为 TCP 保活（空闲 15 s、间隔 3 s）。会话结束会在对端日志中写入稳定原因（`peer_closed`/`heartbeat_timeout`/`recv_error|send_error` 等），控制器侧由 `kvmRunControllerResilient` 自动重连。本地停止先 `shutdown` 唤醒发送，目标收到 EOF 后释放输入，不再重复阻塞发送。
 - 收到合法 `KvmHello` 后**先执行接收策略**（不再单独弹一次「拼接确认」）：`open` 直接放行；`password` 校验 HMAC 证明（失败按来源节流）；`manual` 复用 8081 的审批流程——GUI 模式下由 app 弹窗（显示设备名、IP 与「请求：拼接控制」，默认拒绝，30 秒超时，重复请求合并），单独运行 `bin/receiver` 时回退为置顶原生确认框（默认「否」，30 秒自动拒绝，进程退出时自动关闭，等待期间 `select` 连接以便控制端断开时立即释放）。授权通过后才返回目标虚拟桌面尺寸并开始注入；明确拒绝后 60 秒内同一来源直接拒绝。密码记录缺失或损坏时回 `HS_ERR_AUTH_CONFIG`（状态 10），绝不降级为任意连接。版本 1 的控制端收到 `KVM_ERR_VERSION`。
-- 事件用 `SendInput` 注入：鼠标为绝对坐标 + `MOUSEEVENTF_VIRTUALDESK`（0..65535 归一化），键盘优先用扫描码（`KEYEVENTF_SCANCODE`，必要时加扩展位）。会话结束、断开或进程正常退出都会对已按下的每个键/鼠标键发送一次释放（进程被强制终止时来不及执行，这是 GUI 默认隐藏控制台启动下「停止接收」的已知限制）。
+- 事件注入按平台后端执行：Windows 用 `SendInput`（鼠标为绝对坐标 + `MOUSEEVENTF_VIRTUALDESK`，0..65535 归一化；键盘优先用扫描码 `KEYEVENTF_SCANCODE`，必要时加扩展位）；Linux/X11 用 XTest（`XTestFakeMotionEvent`/`FakeButtonEvent`/`FakeKeyEvent`，运行时 `dlopen("libXtst.so.6")`，扫描码映射到 evdev 后取 X keycode = evdev + 8，E0 扩展键查表）。会话结束、断开或进程正常退出都会对已按下的每个键/鼠标键发送一次释放（进程被强制终止时来不及执行，这是 GUI 默认隐藏控制台启动下「停止接收」的已知限制）。
 - 注入在会话线程内串行执行；`SendInput` 不能跨 UIPI 注入**更高**完整性级别的窗口，也不会作用于安全桌面（因此无法模拟 Ctrl+Alt+Del）。单独运行的 `receiver` 是普通权限，管理员窗口收不到拼接输入；经 GUI 启动的接收端继承 GUI 的管理员权限，因此可以输入到管理员窗口。
 
 > 安全提示：8084 与 8081 使用同一授权策略（任意 / 密码 / 手动），但通道**没有加密**——授权只决定谁能接入，不保护键鼠事件内容。请只在可信局域网内使用。

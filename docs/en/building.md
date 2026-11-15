@@ -43,6 +43,7 @@ make install-deps          # Linux/macOS/MSYS2 automatic install
 |-----------|---------|
 | g++ / make | C++17 build |
 | libX11-dev | Linux screen capture |
+| libXtst (runtime) | XTest injection for the Linux stitch target (loaded with `dlopen`; the dev package is not needed) |
 | SDL2 / SDL2_ttf | Receiver rendering + GUI (CJK fonts) |
 | **FFmpeg** (libavcodec/libavutil/libswscale) | H.264/H.265/AV1 encode/decode (MSYS2: `mingw-w64-x86_64-ffmpeg`) |
 

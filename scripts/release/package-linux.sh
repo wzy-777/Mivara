@@ -25,7 +25,8 @@
 #
 # Requirements (Debian/Ubuntu host): g++ make pkg-config libx11-dev
 # libsdl2-dev libsdl2-ttf-dev libavcodec-dev libavutil-dev libswscale-dev
-# patchelf dpkg-dev. Run `make install-deps` first for the compiler libs.
+# patchelf dpkg-dev; runtime libxtst6 (stitch target, loaded with dlopen).
+# Run `make install-deps` first for the compiler libs.
 # ============================================================================
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -265,7 +266,15 @@ EOF
   if out="$( cd "$dir" && dpkg-shlibdeps -O "${bins[@]}" 2>/dev/null )" \
      && [ -n "$out" ]; then
     out="${out#shlibs:Depends=}"
-    if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+    if [ -n "$out" ]; then
+      # libXtst is loaded at runtime with dlopen (stitch target), so
+      # dpkg-shlibdeps cannot see it. Declare it explicitly.
+      case ", $out," in
+        *", libxtst6"*) printf '%s' "$out" ;;
+        *) printf '%s' "$out, libxtst6" ;;
+      esac
+      return 0
+    fi
   fi
   warn "dpkg-shlibdeps 失败，回退到 dpkg -S 推导依赖（会包含传递依赖）"
 
@@ -296,6 +305,10 @@ EOF
     fi
   done
   [ -n "$deps" ] || die "无法计算 deb 依赖"
+  case ", $deps," in
+    *", libxtst6"*) ;;
+    *) deps="$deps, libxtst6" ;;
+  esac
   printf '%s' "$deps"
 }
 

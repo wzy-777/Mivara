@@ -21,7 +21,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 ## Highlights
 
 - **Extended desktop** — an extend session automatically enables a Windows virtual display that adds real desktop space; windows can be dragged onto it and the pointer crosses over. Every exit path detaches and disables the device, so nothing lingers in Settings > Display.
-- **Stitching (software KVM)** — two Windows PCs keep their own monitors and share one keyboard/mouse: choose which side of this PC the peer sits on (left / right / top / bottom) when starting, push the pointer out of that edge to take over the peer, and move back out of its facing edge (or press Ctrl+Alt+Shift+Q) to hand control back. The side can be switched mid-session and no picture is sent.
+- **Stitching (software KVM)** — a Windows controller and a second PC (Windows or Linux/X11) keep their own monitors and share one keyboard/mouse: choose which side of this PC the peer sits on (left / right / top / bottom) when starting, push the pointer out of that edge to take over the peer, and move back out of its facing edge (or press Ctrl+Alt+Shift+Q) to hand control back. The side can be switched mid-session and no picture is sent.
 - **Stitch file drop (optional, copy-only, both directions)** — when enabled on both ends, drag files or folders across the screen edge and release over an Explorer window or the desktop on the peer to copy them into that folder. You can also drag files from the controlled (target) machine back to the controller (they land on the controller's desktop). The source is never moved or deleted, name collisions are renamed, and both ends default to off.
 - **Two-way file transfer** — click the folder icon beside a recent computer name to browse local and remote directories side by side: multi-select, a transfer queue (pause / resume / cancel / clear finished), new folder, direct path entry, hidden items, and both device names. The page can detach into its own window, with a "detach file-transfer window by default" setting. SHA-256 verified, collisions renamed (over-long stems truncated to the local limit), separately authorized and off by default.
 - **Zero-config discovery** — SSDP finds receivers on the LAN and shows their hostnames; direct IP connection works when multicast is blocked by network policy.
@@ -39,7 +39,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 1. Download [Mivara-Setup.exe](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-Setup.exe) (or pick a version from [Releases](https://github.com/wzy-777/Mivara/releases)).
 2. Run the installer. It is not code-signed, so SmartScreen may prompt — see [below](#windows-smartscreen-notice).
-3. On the receiver, open Mivara and click "Start receiving" in the Home receive status bar; on the sender click "Connect device", pick a device, then choose "Cast", "Extend" or "Stitch" (stitch needs Windows on both ends — see the [User Guide](docs/en/usage.md#stitch-software-kvm)). New installs default to manual approval, so the receiver asks you to "Allow once" or "Deny"; change this under Settings → Receiving & Security to "Password only" or "Allow any connection".
+3. On the receiver, open Mivara and click "Start receiving" in the Home receive status bar; on the sender click "Connect device", pick a device, then choose "Cast", "Extend" or "Stitch" (the stitch controller needs Windows; the target may be Windows or Linux/X11 — see the [User Guide](docs/en/usage.md#stitch-software-kvm)). New installs default to manual approval, so the receiver asks you to "Allow once" or "Deny"; change this under Settings → Receiving & Security to "Password only" or "Allow any connection".
 
 > Extend mode requires the virtual display driver to be installed once — see [Virtual Display Driver](docs/en/virtual-display.md).
 
@@ -49,7 +49,7 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 2. Install one of:
    - Ubuntu: `sudo apt install ./Mivara-linux-amd64.deb`
    - Other distros: extract the tarball, enter the directory and run `./install.sh` (defaults to `~/.local`; `sudo ./install.sh` uses `/usr/local`)
-3. Launch "Mivara" from the application menu or run `mivara`. Linux supports mirroring, receiving and file transfer; extend needs a Windows sender, and stitch needs Windows on both ends.
+3. Launch "Mivara" from the application menu or run `mivara`. Linux supports mirroring, receiving, file transfer and acting as a stitch **target** (X11 session, XTest injection); extend and the stitch **controller** need a Windows sender.
 
 > The portable bundle ships the FFmpeg/SDL runtime and needs glibc 2.35+ with an X11 desktop; the `.deb` is built against Ubuntu 22.04's FFmpeg ABI. See [Building & Packaging](docs/en/building.md#prebuilt-linux-packages).
 

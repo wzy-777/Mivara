@@ -42,6 +42,7 @@ make install-deps          # Linux/macOS/MSYS2 自动安装
 |------|------|
 | g++ / make | C++17 构建 |
 | libX11-dev | Linux 屏幕采集 |
+| libXtst（运行库） | Linux 拼接被控端的 XTest 注入（运行时 `dlopen`，无需开发包） |
 | SDL2 / SDL2_ttf | 接收端渲染 + GUI（中文字体） |
 | **FFmpeg**（libavcodec/libavutil/libswscale） | H.264/H.265/AV1 编解码（MSYS2: `mingw-w64-x86_64-ffmpeg`） |
 
