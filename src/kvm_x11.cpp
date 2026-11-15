@@ -14,28 +14,40 @@
  * capture is X11-only too, so that boundary is intentional.
  *
  * This file is the target (被控端) backend only; the Linux controller lives in
- * kvm_x11_ctl.cpp (XInput2 raw events + grabs).
+ * kvm_x11_ctl.cpp (XInput2 raw events + grabs). It also hosts the reverse
+ * drag strip: when the controller accepts reverse copies, a 3 px XdndAware
+ * window on the edge facing the controller captures a local file drag and
+ * sends it to the controller's 8087 listener. The drag card/real image is
+ * drawn by the shared kvm_ghost_x11 class.
  */
 #include "kvm_core.h"
+#include "kvm_ghost_x11.h"
 #include "kvm_target.h"
 
 #ifdef __linux__
 
 #include <X11/XF86keysym.h>
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <dlfcn.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <sys/select.h>
+#include <unistd.h>
 
 namespace {
 
 Display *g_dpy = nullptr;
-
-void ghostMoveX11(int x, int y);
-void ghostPumpX11();
-void ghostEndX11();
+KvmGhostX11 g_ghost;
 
 typedef int (*XTestFakeMotionEventFn)(Display *, int, int, int, unsigned long);
 typedef int (*XTestFakeButtonEventFn)(Display *, unsigned int, Bool,
@@ -50,7 +62,10 @@ XTestFakeKeyEventFn     g_fakeKey = nullptr;
 
 Display *display()
 {
-    if (!g_dpy) g_dpy = XOpenDisplay(nullptr);
+    if (!g_dpy) {
+        g_dpy = XOpenDisplay(nullptr);
+        if (g_dpy) g_ghost.attach(g_dpy);
+    }
     return g_dpy;
 }
 
@@ -242,8 +257,6 @@ int xButton(uint32_t btn)
 
 void injectMoveX11(int x, int y, uint32_t w, uint32_t h, int sx, int sy)
 {
-    (void)sx;
-    (void)sy;
     Display *d = display();
     if (!d || !g_fakeMotion) return;
     if (x < 0) x = 0;
@@ -251,8 +264,8 @@ void injectMoveX11(int x, int y, uint32_t w, uint32_t h, int sx, int sy)
     if ((uint32_t)x >= w) x = (int)w - 1;
     if ((uint32_t)y >= h) y = (int)h - 1;
     g_fakeMotion(d, DefaultScreen(d), x, y, CurrentTime);
-    ghostMoveX11(x + sx, y + sy);
-    ghostPumpX11();
+    g_ghost.move(x + sx, y + sy);
+    g_ghost.pump();
     XFlush(d);
 }
 
@@ -298,179 +311,119 @@ void injectKeyX11(bool down, uint32_t vk, uint32_t scan, bool ext)
 }
 
 /* ── drag ghost (visual only) ─────────────────────────────────────────────
- * While a file drag crosses the shared edge the source's drag image stays on
- * the controller's desktop. Draw a small opaque card next to the injected
- * cursor on this screen. It is deliberately simple Xlib drawing (no compositor
- * / ARGB requirement); text is best-effort and a long or non-ASCII name still
- * gets a visible card. */
-struct GhostStateX11 {
-    Window win = 0;
-    GC gc = 0;
-    XFontStruct *font = nullptr;
-    int x = 0, y = 0, w = 0, h = 0;
+ * The shared KvmGhostX11 renders the source's real premultiplied BGRA drag
+ * image when a compositor and a 32-bit visual are available, otherwise a
+ * small opaque card with the item name/icon. Frame sequences are accumulated
+ * here; drawing never blocks the input loop. */
+struct DragGhostX11 {
     int count = 0;
-    int frames_left = 0;
-    bool visible = false;
+    int text_left = 0;
     std::string name;
+    int icon_w = 0, icon_h = 0, icon_left = 0;
+    std::vector<uint8_t> icon;
+    int img_w = 0, img_h = 0, img_ox = 0, img_oy = 0, img_left = 0;
+    bool img_premult = true;
+    std::vector<uint8_t> image;
 };
-GhostStateX11 g_ghost_x11;
+DragGhostX11 g_drag;
 
-std::string ghostLabel()
+void dragGhostReset()
 {
-    std::string label = g_ghost_x11.name;
-    if (label.empty()) label = "Files";
-    if (g_ghost_x11.count > 1)
-        label += "  +" + std::to_string(g_ghost_x11.count - 1);
-    return label;
+    g_drag = DragGhostX11{};
 }
 
-bool ghostCreateX11()
+void unpackDimOff(uint32_t v, int &dim, int &off)
 {
-    if (g_ghost_x11.win) return true;
-    Display *d = display();
-    if (!d) return false;
-    const int scr = DefaultScreen(d);
-    XSetWindowAttributes a = {};
-    a.override_redirect = True;
-    a.background_pixel = BlackPixel(d, scr);
-    a.border_pixel = WhitePixel(d, scr);
-    a.event_mask = ExposureMask;
-    g_ghost_x11.win = XCreateWindow(
-        d, DefaultRootWindow(d), 0, 0, 240, 48, 1, CopyFromParent,
-        InputOutput, CopyFromParent,
-        CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &a);
-    if (!g_ghost_x11.win) return false;
-    g_ghost_x11.gc = XCreateGC(d, g_ghost_x11.win, 0, nullptr);
-    g_ghost_x11.font = XLoadQueryFont(d, "9x15");
-    if (!g_ghost_x11.font) g_ghost_x11.font = XLoadQueryFont(d, "fixed");
-    if (g_ghost_x11.font)
-        XSetFont(d, g_ghost_x11.gc, g_ghost_x11.font->fid);
-    return true;
+    dim = (int)(v & 0xFFFFu);
+    off = (int)(int16_t)(v >> 16);
 }
 
-void ghostPaintX11()
+void appendGhostPixels(const KvmEvent &e, std::vector<uint8_t> &out)
 {
-    Display *d = display();
-    if (!d || !g_ghost_x11.win) return;
-    const int scr = DefaultScreen(d);
-    XClearWindow(d, g_ghost_x11.win);
-    XSetForeground(d, g_ghost_x11.gc, WhitePixel(d, scr));
-    /* A tiny page glyph. */
-    const int ix = 10, iy = 10;
-    XDrawRectangle(d, g_ghost_x11.win, g_ghost_x11.gc, ix, iy, 18, 26);
-    XDrawLine(d, g_ghost_x11.win, g_ghost_x11.gc, ix + 18, iy + 7,
-              ix + 11, iy);
-    XDrawLine(d, g_ghost_x11.win, g_ghost_x11.gc, ix + 11, iy,
-              ix + 11, iy + 7);
-    XDrawLine(d, g_ghost_x11.win, g_ghost_x11.gc, ix + 11, iy + 7,
-              ix + 18, iy + 7);
-    std::string label = ghostLabel();
-    size_t cut = std::min<size_t>(label.size(), 96);
-    while (cut > 0 && ((unsigned char)label[cut] & 0xC0) == 0x80) cut--;
-    label.resize(cut);
-    XDrawString(d, g_ghost_x11.win, g_ghost_x11.gc, 40, 31,
-                label.c_str(), (int)label.size());
-}
-
-void ghostPumpX11()
-{
-    Display *d = display();
-    if (!d || !g_ghost_x11.win) return;
-    XEvent ev;
-    while (XCheckWindowEvent(d, g_ghost_x11.win, ExposureMask, &ev)) {
-        if (ev.type == Expose && ev.xexpose.count == 0) ghostPaintX11();
-    }
-}
-
-void ghostPlaceX11()
-{
-    Display *d = display();
-    if (!d || !g_ghost_x11.win) return;
-    XMoveWindow(d, g_ghost_x11.win, g_ghost_x11.x + 16,
-                g_ghost_x11.y + 16);
-    XRaiseWindow(d, g_ghost_x11.win);
-    XFlush(d);
-}
-
-void ghostShowX11()
-{
-    if (!ghostCreateX11()) return;
-    Display *d = display();
-    std::string label = ghostLabel();
-    int tw = 240;
-    if (g_ghost_x11.font) {
-        tw = XTextWidth(g_ghost_x11.font, label.c_str(),
-                        (int)std::min<size_t>(label.size(), 96)) + 56;
-        if (tw < 160) tw = 160;
-        if (tw > 380) tw = 380;
-    }
-    g_ghost_x11.w = tw;
-    g_ghost_x11.h = 48;
-    XResizeWindow(d, g_ghost_x11.win, (unsigned)tw, 48);
-    ghostPlaceX11();
-    XMapRaised(d, g_ghost_x11.win);
-    XSync(d, False);
-    ghostPaintX11();
-    XFlush(d);
-    g_ghost_x11.visible = true;
-}
-
-void ghostHideX11()
-{
-    Display *d = display();
-    if (!d || !g_ghost_x11.win) return;
-    XUnmapWindow(d, g_ghost_x11.win);
-    XFlush(d);
-    g_ghost_x11.visible = false;
-}
-
-void ghostMoveX11(int x, int y)
-{
-    g_ghost_x11.x = x;
-    g_ghost_x11.y = y;
-    if (g_ghost_x11.visible) ghostPlaceX11();
-}
-
-void ghostEndX11()
-{
-    Display *d = display();
-    if (d && g_ghost_x11.win) {
-        XDestroyWindow(d, g_ghost_x11.win);
-        XFreeGC(d, g_ghost_x11.gc);
-        if (g_ghost_x11.font) XFreeFont(d, g_ghost_x11.font);
-        XFlush(d);
-    }
-    g_ghost_x11 = GhostStateX11{};
+    char chunk[12];
+    std::memcpy(chunk, &e.a, 4);
+    std::memcpy(chunk + 4, &e.b, 4);
+    std::memcpy(chunk + 8, &e.c, 4);
+    out.insert(out.end(), chunk, chunk + 12);
 }
 
 void dragEventX11(const KvmEvent &e)
 {
-    ghostPumpX11();
+    g_ghost.pump();
     switch (e.type) {
     case KVM_EV_DRAG_INFO:
         if (e.a) {
-            g_ghost_x11.frames_left = (int)e.c;
-            g_ghost_x11.count = (int)e.b;
-            g_ghost_x11.name.clear();
-            ghostShowX11();
+            dragGhostReset();
+            g_drag.count = (int)e.b;
+            g_drag.text_left = (int)e.c;
+            g_ghost.begin(g_drag.count);
+            if (g_drag.text_left <= 0) g_ghost.setText(std::string());
         } else {
-            ghostHideX11();
-            g_ghost_x11.frames_left = 0;
+            g_ghost.end();
+            dragGhostReset();
         }
         break;
     case KVM_EV_DRAG_TEXT:
-        if (g_ghost_x11.frames_left > 0) {
+        if (g_drag.text_left > 0) {
             char chunk[12];
             std::memcpy(chunk, &e.a, 4);
             std::memcpy(chunk + 4, &e.b, 4);
             std::memcpy(chunk + 8, &e.c, 4);
-            g_ghost_x11.name.append(chunk, 12);
-            if (--g_ghost_x11.frames_left == 0) {
-                while (!g_ghost_x11.name.empty() &&
-                       g_ghost_x11.name.back() == '\0')
-                    g_ghost_x11.name.pop_back();
-                ghostShowX11();
+            g_drag.name.append(chunk, 12);
+            if (--g_drag.text_left == 0) {
+                while (!g_drag.name.empty() && g_drag.name.back() == '\0')
+                    g_drag.name.pop_back();
+                g_ghost.setText(g_drag.name);
             }
+        }
+        break;
+    case KVM_EV_DRAG_ICON_INFO: {
+        const int w = (int)e.a, h = (int)e.b;
+        g_drag.icon_w = w;
+        g_drag.icon_h = h;
+        g_drag.icon_left = (int)e.c;
+        g_drag.icon.clear();
+        if (w > 0 && h > 0 && w <= 2048 && h <= 2048 &&
+            (uint64_t)w * (uint64_t)h <= 36864u)
+            g_drag.icon.reserve((size_t)w * (size_t)h * 4);
+        if (g_drag.icon_left == 0 &&
+            g_drag.icon.size() == (size_t)w * (size_t)h * 4)
+            g_ghost.setIcon(w, h, g_drag.icon);
+        break;
+    }
+    case KVM_EV_DRAG_ICON_DATA:
+        if (g_drag.icon_left > 0) {
+            appendGhostPixels(e, g_drag.icon);
+            if (--g_drag.icon_left == 0)
+                g_ghost.setIcon(g_drag.icon_w, g_drag.icon_h, g_drag.icon);
+        }
+        break;
+    case KVM_EV_DRAG_IMAGE_INFO: {
+        int w = 0, h = 0, ox = 0, oy = 0;
+        unpackDimOff(e.a, w, ox);
+        unpackDimOff(e.b, h, oy);
+        g_drag.img_w = w;
+        g_drag.img_h = h;
+        g_drag.img_ox = ox;
+        g_drag.img_oy = oy;
+        g_drag.img_left = (int)e.c;
+        g_drag.img_premult = true;
+        g_drag.image.clear();
+        if (w > 0 && h > 0 && w <= 2048 && h <= 2048 &&
+            (uint64_t)w * (uint64_t)h <= 36864u)
+            g_drag.image.reserve((size_t)w * (size_t)h * 4);
+        if (g_drag.img_left == 0 &&
+            g_drag.image.size() == (size_t)w * (size_t)h * 4)
+            g_ghost.setImage(w, h, ox, oy, g_drag.image, true);
+        break;
+    }
+    case KVM_EV_DRAG_IMAGE_DATA:
+        if (g_drag.img_left > 0) {
+            appendGhostPixels(e, g_drag.image);
+            if (--g_drag.img_left == 0)
+                g_ghost.setImage(g_drag.img_w, g_drag.img_h, g_drag.img_ox,
+                                 g_drag.img_oy, g_drag.image,
+                                 g_drag.img_premult);
         }
         break;
     default:
@@ -478,9 +431,441 @@ void dragEventX11(const KvmEvent &e)
     }
 }
 
-void sessionEndX11(void *)
+/* ── reverse drag: XDND strip on the edge facing the controller ────────────
+ * The user controls this (target) desktop; a drag started here and carried to
+ * the edge facing the controller becomes a reverse copy. The strip is a 3 px
+ * InputOnly XdndAware window. On a drop it starts dropSendFiles() with
+ * DROP_FLAG_REVERSE against the controller's 8087 listener, using the session
+ * token. All KVM frames are written under targetLoop's tx mutex. */
+struct ReverseX11 {
+    std::atomic<bool> run{false};
+    std::thread strip_thread;
+    std::thread worker;
+    std::atomic<bool> worker_busy{false};
+    kvm_sock_t client = KVM_INVALID_SOCK;
+    std::mutex *tx = nullptr;
+    std::string peer_ip;
+    uint16_t rev_port = (uint16_t)DROP_REVERSE_PORT;
+    uint8_t token[DROP_TOKEN_BYTES] = {};
+    int strip_side = KVM_SIDE_LEFT;
+    uint32_t sw = 1, sh = 1;
+
+    /* Written only by the strip thread. */
+    Display *dpy = nullptr;
+    Window win = 0;
+    Window source = 0;
+    bool uri_ok = false;
+    bool waiting = false;
+    bool early = false;
+    bool announced = false;
+    bool rdrag_on = false;
+    int count = 0;
+    std::string name;
+    std::vector<std::string> paths;
+    Atom A_aware = 0, A_enter = 0, A_pos = 0, A_status = 0, A_leave = 0,
+         A_drop = 0, A_finished = 0, A_sel = 0, A_types = 0, A_action = 0,
+         A_uri = 0, A_prop = 0;
+};
+
+std::string revPercentDecode(const std::string &s)
 {
-    ghostEndX11();
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            const int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back((char)((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+bool revUrisToPaths(const std::string &data, std::vector<std::string> &out)
+{
+    size_t pos = 0;
+    while (pos <= data.size()) {
+        const size_t nl = data.find('\n', pos);
+        std::string line = data.substr(
+            pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        pos = nl == std::string::npos ? data.size() + 1 : nl + 1;
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("file://", 0) != 0) continue;
+        std::string rest = line.substr(7);
+        if (rest.rfind("localhost/", 0) == 0) rest = rest.substr(9);
+        else if (!rest.empty() && rest[0] != '/') continue;
+        const std::string path = revPercentDecode(rest);
+        if (path.empty() || path[0] != '/' ||
+            path.find('\0') != std::string::npos)
+            continue;
+        out.push_back(path);
+    }
+    return !out.empty();
+}
+
+std::string revBaseName(const std::string &p)
+{
+    size_t end = p.size();
+    while (end > 0 && p[end - 1] == '/') end--;
+    if (end == 0) return std::string();
+    const size_t b = p.find_last_of('/', end - 1);
+    return p.substr(b == std::string::npos ? 0 : b + 1,
+                    end - (b == std::string::npos ? 0 : b + 1));
+}
+
+bool revSend(ReverseX11 *st, uint32_t type, uint32_t a, uint32_t b,
+             uint32_t c)
+{
+    if (!st->tx || st->client == KVM_INVALID_SOCK) return false;
+    KvmEvent e = {};
+    e.type = htonl(type);
+    e.a = htonl(a);
+    e.b = htonl(b);
+    e.c = htonl(c);
+    std::lock_guard<std::mutex> lk(*st->tx);
+    return kvmSendAll(st->client, &e, sizeof(e));
+}
+
+bool revSendBytes(ReverseX11 *st, uint32_t type, const unsigned char *p)
+{
+    uint32_t w[3] = {};
+    std::memcpy(w, p, 12);
+    return revSend(st, type, w[0], w[1], w[2]);
+}
+
+void revRdrag(ReverseX11 *st, bool on)
+{
+    if (on == st->rdrag_on) return;
+    if (revSend(st, KVM_EV_RDRAG, on ? 1u : 0u, 0, 0))
+        st->rdrag_on = on;
+}
+
+void revAnnounce(ReverseX11 *st)
+{
+    if (st->announced || st->paths.empty()) return;
+    st->announced = true;
+    st->count = (int)st->paths.size();
+    st->name = revBaseName(st->paths.front());
+    if (!st->rdrag_on) revRdrag(st, true);
+    if (st->name.empty()) return;
+    revSend(st, KVM_EV_DRAG_INFO, 1, (uint32_t)st->count, 4);
+    for (int i = 0; i < 4; i++) {
+        unsigned char chunk[12] = {};
+        const size_t off = (size_t)i * 12;
+        if (off < st->name.size())
+            std::memcpy(chunk, st->name.data() + off,
+                        std::min<size_t>(12, st->name.size() - off));
+        revSendBytes(st, KVM_EV_DRAG_TEXT, chunk);
+    }
+}
+
+void revReset(ReverseX11 *st)
+{
+    st->source = 0;
+    st->uri_ok = false;
+    st->waiting = false;
+    st->early = false;
+    st->announced = false;
+    st->count = 0;
+    st->name.clear();
+    st->paths.clear();
+}
+
+void revStartTransfer(ReverseX11 *st)
+{
+    if (st->paths.empty()) return;
+    if (st->worker_busy.exchange(true)) return;
+    if (st->worker.joinable()) st->worker.join();
+    std::vector<std::string> paths = st->paths;
+    st->worker = std::thread([st, paths] {
+        DropOptions opt;
+        opt.peer_ip = st->peer_ip.c_str();
+        opt.port = st->rev_port;
+        opt.flags = DROP_FLAG_REVERSE;
+        opt.transfer_id = (uint32_t)(kvmNowMs() ^ (uint64_t)getpid());
+        const DropResult r = dropSendFiles(opt, paths, st->token, st->run);
+        std::cout << "[kvm] reverse drop to " << st->peer_ip << ":"
+                  << st->rev_port << " status=" << r.status
+                  << " committed=" << r.committed
+                  << " failed=" << r.failed
+                  << (r.message.empty() ? "" : " msg=" + r.message)
+                  << "\n" << std::flush;
+        st->worker_busy.store(false);
+    });
+}
+
+void revSendXdnd(ReverseX11 *st, Window dst, Atom type, long l0, long l1,
+                 long l2, long l3, long l4)
+{
+    XEvent ev = {};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.display = st->dpy;
+    ev.xclient.window = dst;
+    ev.xclient.message_type = type;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = l0;
+    ev.xclient.data.l[1] = l1;
+    ev.xclient.data.l[2] = l2;
+    ev.xclient.data.l[3] = l3;
+    ev.xclient.data.l[4] = l4;
+    XSendEvent(st->dpy, dst, False, NoEventMask, &ev);
+    XFlush(st->dpy);
+}
+
+void revRequestUris(ReverseX11 *st, Time when)
+{
+    XConvertSelection(st->dpy, st->A_sel, st->A_uri, st->A_prop, st->win,
+                      when);
+    XFlush(st->dpy);
+}
+
+void revSelectionNotify(ReverseX11 *st, XSelectionEvent &e)
+{
+    if (!st->win || e.requestor != st->win) return;
+    Atom actual = 0;
+    int fmt = 0;
+    unsigned long n = 0, rem = 0;
+    unsigned char *prop = nullptr;
+    if (e.property == None ||
+        XGetWindowProperty(st->dpy, st->win, e.property, 0, 1 << 20, False,
+                           AnyPropertyType, &actual, &fmt, &n, &rem,
+                           &prop) != Success ||
+        !prop) {
+        if (st->waiting) {
+            if (st->source) revSendXdnd(st, st->source, st->A_finished,
+                                        (long)st->win, 0, 0, 0, 0);
+            revRdrag(st, false);
+            revReset(st);
+        }
+        return;
+    }
+    std::string data;
+    if (fmt == 8) data.assign((const char *)prop, n);
+    else if (fmt == 32) data.assign((const char *)prop, n * 4);
+    XFree(prop);
+    XDeleteProperty(st->dpy, st->win, e.property);
+
+    std::vector<std::string> paths;
+    if (!revUrisToPaths(data, paths)) {
+        if (st->waiting) {
+            if (st->source) revSendXdnd(st, st->source, st->A_finished,
+                                        (long)st->win, 0, 0, 0, 0);
+            revRdrag(st, false);
+            revReset(st);
+        }
+        return;
+    }
+    st->paths = paths;
+    revAnnounce(st);
+    if (st->waiting) {
+        if (st->source) revSendXdnd(st, st->source, st->A_finished,
+                                    (long)st->win, 1,
+                                    (long)st->A_action, 0, 0);
+        revStartTransfer(st);
+        revRdrag(st, false);
+        revReset(st);
+    }
+}
+
+void revClientMessage(ReverseX11 *st, XClientMessageEvent &c)
+{
+    if (!st->win || c.window != st->win) return;
+    if (c.message_type == st->A_enter) {
+        st->source = (Window)c.data.l[0];
+        st->paths.clear();
+        st->count = 0;
+        st->name.clear();
+        st->announced = false;
+        st->waiting = false;
+        st->early = false;
+        bool uri = false;
+        if (c.data.l[1] & 1) {
+            Atom actual = 0;
+            int fmt = 0;
+            unsigned long n = 0, rem = 0;
+            unsigned char *prop = nullptr;
+            if (XGetWindowProperty(st->dpy, st->source, st->A_types, 0, 64,
+                                   False, XA_ATOM, &actual, &fmt, &n, &rem,
+                                   &prop) == Success && prop) {
+                const Atom *types = (const Atom *)prop;
+                for (unsigned long i = 0; i < n; i++)
+                    if (types[i] == st->A_uri) uri = true;
+                XFree(prop);
+            }
+        } else {
+            for (int i = 2; i <= 4; i++)
+                if ((Atom)c.data.l[i] == st->A_uri) uri = true;
+        }
+        st->uri_ok = uri;
+        if (uri) {
+            revRdrag(st, true);
+            if (!st->early) {
+                st->early = true;
+                revRequestUris(st, CurrentTime);
+            }
+        }
+        return;
+    }
+    if (c.message_type == st->A_pos) {
+        if ((Window)c.data.l[0] != st->source) return;
+        revSendXdnd(st, st->source, st->A_status, (long)st->win,
+                    st->uri_ok ? 1 : 0, 0, 0,
+                    st->uri_ok ? (long)st->A_action : 0);
+        if (st->uri_ok && !st->announced && !st->paths.empty())
+            revAnnounce(st);
+        return;
+    }
+    if (c.message_type == st->A_leave) {
+        revRdrag(st, false);
+        revReset(st);
+        return;
+    }
+    if (c.message_type == st->A_drop) {
+        if (!st->uri_ok || !st->source) {
+            if (st->source)
+                revSendXdnd(st, st->source, st->A_finished, (long)st->win, 0,
+                            0, 0, 0);
+            revRdrag(st, false);
+            revReset(st);
+            return;
+        }
+        st->waiting = true;
+        if (!st->paths.empty()) {
+            revSendXdnd(st, st->source, st->A_finished, (long)st->win, 1,
+                        (long)st->A_action, 0, 0);
+            revStartTransfer(st);
+            revRdrag(st, false);
+            revReset(st);
+        } else {
+            revRequestUris(st, (Time)c.data.l[2]);
+        }
+        return;
+    }
+}
+
+void reverseStripThread(ReverseX11 *st)
+{
+    Display *d = XOpenDisplay(nullptr);
+    if (!d) return;
+    st->dpy = d;
+    const int scr = DefaultScreen(d);
+    const Window root = RootWindow(d, scr);
+    st->A_aware = XInternAtom(d, "XdndAware", False);
+    st->A_enter = XInternAtom(d, "XdndEnter", False);
+    st->A_pos = XInternAtom(d, "XdndPosition", False);
+    st->A_status = XInternAtom(d, "XdndStatus", False);
+    st->A_leave = XInternAtom(d, "XdndLeave", False);
+    st->A_drop = XInternAtom(d, "XdndDrop", False);
+    st->A_finished = XInternAtom(d, "XdndFinished", False);
+    st->A_sel = XInternAtom(d, "XdndSelection", False);
+    st->A_types = XInternAtom(d, "XdndTypeList", False);
+    st->A_action = XInternAtom(d, "XdndActionCopy", False);
+    st->A_uri = XInternAtom(d, "text/uri-list", False);
+    st->A_prop = XInternAtom(d, "MivaraRevData", False);
+
+    int x = 0, y = 0, w = 3, h = 3;
+    const int sw = (int)(st->sw ? st->sw : (uint32_t)DisplayWidth(d, scr));
+    const int sh = (int)(st->sh ? st->sh : (uint32_t)DisplayHeight(d, scr));
+    switch (st->strip_side) {
+    case KVM_SIDE_LEFT:   x = 0;      y = 0;      w = 3; h = sh; break;
+    case KVM_SIDE_TOP:    x = 0;      y = 0;      w = sw; h = 3; break;
+    case KVM_SIDE_BOTTOM: x = 0;      y = sh - 3; w = sw; h = 3; break;
+    default:              x = sw - 3; y = 0;      w = 3; h = sh; break;
+    }
+    XSetWindowAttributes a = {};
+    a.override_redirect = True;
+    st->win = XCreateWindow(d, root, x, y, (unsigned)w, (unsigned)h, 0, 0,
+                            InputOnly, CopyFromParent, CWOverrideRedirect, &a);
+    if (!st->win) {
+        XCloseDisplay(d);
+        st->dpy = nullptr;
+        return;
+    }
+    long version = 5;
+    XChangeProperty(d, st->win, st->A_aware, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char *)&version, 1);
+    XMapRaised(d, st->win);
+    XFlush(d);
+
+    while (st->run.load()) {
+        const int fd = ConnectionNumber(d);
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(fd, &rd);
+        struct timeval tv = {0, 100000};
+        const int sel = select(fd + 1, &rd, nullptr, nullptr, &tv);
+        if (sel < 0 && errno != EINTR) break;
+        while (XPending(d)) {
+            XEvent ev;
+            XNextEvent(d, &ev);
+            if (ev.type == ClientMessage) revClientMessage(st, ev.xclient);
+            else if (ev.type == SelectionNotify)
+                revSelectionNotify(st, ev.xselection);
+        }
+    }
+    revRdrag(st, false);
+    if (st->win) XDestroyWindow(d, st->win);
+    XFlush(d);
+    XCloseDisplay(d);
+    st->dpy = nullptr;
+    st->win = 0;
+}
+
+void *reverseSessionBegin(const KvmTargetGrant &grant,
+                          const std::string &peer_ip, kvm_sock_t client,
+                          const KvmTargetAuth *, std::atomic<bool> &running,
+                          std::mutex &tx)
+{
+    (void)running;
+    if (!grant.reverse_ok) return nullptr;
+    auto *st = new ReverseX11();
+    st->run.store(true);
+    st->client = client;
+    st->tx = &tx;
+    st->peer_ip = peer_ip;
+    st->rev_port = (grant.rev_port >= 1 && grant.rev_port <= 65535)
+                       ? (uint16_t)grant.rev_port
+                       : (uint16_t)DROP_REVERSE_PORT;
+    std::memcpy(st->token, grant.drop_token, sizeof(st->token));
+    st->sw = grant.sw;
+    st->sh = grant.sh;
+    switch (grant.side) {
+    case KVM_SIDE_LEFT:   st->strip_side = KVM_SIDE_RIGHT; break;
+    case KVM_SIDE_RIGHT:  st->strip_side = KVM_SIDE_LEFT; break;
+    case KVM_SIDE_TOP:    st->strip_side = KVM_SIDE_BOTTOM; break;
+    default:              st->strip_side = KVM_SIDE_TOP; break;
+    }
+    st->strip_thread = std::thread(reverseStripThread, st);
+    return st;
+}
+
+void reverseSessionEnd(void *p)
+{
+    if (!p) return;
+    auto *st = (ReverseX11 *)p;
+    st->run.store(false);
+    if (st->strip_thread.joinable()) st->strip_thread.join();
+    if (st->worker.joinable()) st->worker.join();
+    mivaraSecureZero(st->token, sizeof(st->token));
+    delete st;
+}
+
+void sessionEndX11(void *state)
+{
+    reverseSessionEnd(state);
+    g_ghost.end();
+    dragGhostReset();
 }
 
 void releaseAllX11()
@@ -511,7 +896,7 @@ const KvmTargetOps &kvmTargetOps()
     static const KvmTargetOps ops = {
         initX11,
         metricsX11,
-        0,                 /* no Windows drag-icon/image frames */
+        KVM_FEATURE_DRAG_ICON | KVM_FEATURE_DRAG_IMAGE,
         injectMoveX11,
         injectButtonX11,
         injectWheelX11,
@@ -519,7 +904,7 @@ const KvmTargetOps &kvmTargetOps()
         releaseAllX11,
         dragEventX11,
         nullptr,           /* askConsent: receiver always supplies a hook */
-        nullptr,           /* sessionBegin */
+        reverseSessionBegin,
         sessionEndX11
     };
     return ops;

@@ -3009,6 +3009,34 @@ bool xdndDropStaged(const std::string &, const std::vector<std::string> &,
 }
 #endif
 
+#if defined(__linux__)
+/* Reverse transfers are resolved from the receiving controller's own cursor,
+ * exactly like the Windows controller's GetCursorPos path. */
+bool localPointerX11(int &x, int &y)
+{
+    static std::once_flag once;
+    std::call_once(once, [] { XInitThreads(); });
+    Display *d = XOpenDisplay(nullptr);
+    if (!d) return false;
+    const Window root = DefaultRootWindow(d);
+    Window root_ret = None, child = None;
+    int rx = 0, ry = 0, wx = 0, wy = 0;
+    unsigned mask = 0;
+    const Bool ok = XQueryPointer(d, root, &root_ret, &child, &rx, &ry,
+                                  &wx, &wy, &mask);
+    XCloseDisplay(d);
+    if (!ok) return false;
+    x = rx;
+    y = ry;
+    return true;
+}
+#else
+bool localPointerX11(int &, int &)
+{
+    return false;
+}
+#endif
+
 void dropWorker(drop_sock_t s, const std::string &peer,
                 const std::atomic<bool> &running, const DropHello &pre)
 {
@@ -3111,21 +3139,30 @@ void dropWorker(drop_sock_t s, const std::string &peer,
     const int release_x = (int)(int32_t)ntohl((uint32_t)hello.x);
     const int release_y = (int)(int32_t)ntohl((uint32_t)hello.y);
     const bool reverse = (ntohl(hello.flags) & DROP_FLAG_REVERSE) != 0;
-    /* The controller reports (0,0) before it has ever moved the remote
-     * cursor; that is not a meaningful release point, so keep the predictable
-     * receive directory in that case. Reverse drops are resolved by the
-     * receiving controller, not here. */
-    if (!reverse && !roots.empty() &&
-        (release_x != 0 || release_y != 0) &&
-        xdndDropStaged(staging, roots, release_x, release_y, why)) {
+    /* Forward: the controller reports (0,0) before it has ever moved the
+     * remote cursor; that is not a meaningful release point. Reverse: the
+     * receiving controller resolves the point from its own cursor at drop
+     * time (a reverse hello carries no useful x/y). */
+    int point_x = release_x, point_y = release_y;
+    bool have_point = !reverse && (release_x != 0 || release_y != 0);
+    if (reverse) {
+        int lx = 0, ly = 0;
+        if (localPointerX11(lx, ly)) {
+            point_x = lx;
+            point_y = ly;
+            have_point = true;
+        }
+    }
+    if (!roots.empty() && have_point &&
+        xdndDropStaged(staging, roots, point_x, point_y, why)) {
         committed = (uint32_t)roots.size();
         fallback = false;
         msg = "dropped on the target window";
         dropStat("event=drop|state=target|fallback=0|x=" +
-                 std::to_string(release_x) + "|y=" +
-                 std::to_string(release_y));
+                 std::to_string(point_x) + "|y=" +
+                 std::to_string(point_y));
     } else {
-        if (!reverse && (release_x != 0 || release_y != 0))
+        if (have_point)
             dropStat("event=drop|state=xdnd|fallback=1|msg=" +
                      statSafe(why));
         std::string dest;
@@ -3137,8 +3174,8 @@ void dropWorker(drop_sock_t s, const std::string &peer,
             return;
         }
         dropStat("event=drop|state=target|fallback=1|x=" +
-                 std::to_string(release_x) + "|y=" +
-                 std::to_string(release_y) + "|dir=" + statSafe(dest));
+                 std::to_string(point_x) + "|y=" +
+                 std::to_string(point_y) + "|dir=" + statSafe(dest));
         if (!msg.empty()) msg += "; ";
         commitItems(staging, dest, roots, committed, failed, msg);
     }

@@ -100,7 +100,8 @@
 #define KVM_HEARTBEAT_TIMEOUT_MS  9000u
 /* Reverse (target -> controller) drag copy. The controller advertises it when
  * its own file_drop_accept=1 (it can RECEIVE); the target echoes it when its
- * own file_drop_send=1 (it can SEND) and the 8085 listener is up. */
+ * own file_drop_send=1 (it can SEND) and the 8085 listener is up. Both the
+ * Windows and the Linux/X11 backends implement both sides. */
 #define KVM_FEATURE_REVERSE_DROP 4u
 /* Drag-ghost icon payload, visual only. Both peers understand the icon frames
  * below; the bit is echoed in KvmReply so neither side sends them to a build
@@ -108,7 +109,9 @@
 #define KVM_FEATURE_DRAG_ICON    8u
 /* Source Explorer's real drag image ("DragImageBits"), visual only. A peer
  * that understands KVM_EV_DRAG_IMAGE_* echoes this bit; it supersedes the
- * reconstructed icon card on the receiving screen. */
+ * reconstructed icon card on the receiving screen. The Linux/X11 ghost draws
+ * it with ARGB when a compositor is available and composites it opaquely
+ * otherwise. */
 #define KVM_FEATURE_DRAG_IMAGE   16u
 
 /* KvmReply.status */
@@ -136,9 +139,10 @@ enum KvmEventType : uint32_t {
      * frame ever enters the 16-byte event stream. */
     KVM_EV_DROP_INFO   = 8,
     /* Target → controller, only with KVM_FEATURE_REVERSE_DROP: the target's
-     * edge helper announced (a=1) or cancelled (a=0) a reverse file drag.
-     * The controller suppresses back-crossing while a=1 so the target's OLE
-     * drag can finish on release, then hands control back. */
+     * edge helper announced (a=1) or cancelled/ended (a=0) a reverse file
+     * drag. The controller keeps the target's injected button held while it
+     * carries the drag back to its own desktop; the local release forwards
+     * the matching UP so the target's drop fires, then hands control back. */
     KVM_EV_RDRAG       = 9,
     /* Controller → target, visual only. The name frames need no negotiation
      * (an older target ignores unknown types); the optional icon frames below

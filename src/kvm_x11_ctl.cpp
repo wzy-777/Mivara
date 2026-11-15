@@ -16,12 +16,14 @@
  *
  * Edge crossing, side semantics, held-input re-arming, the 250 ms re-entry
  * guard and the STAT/state machine match the Windows controller in kvm.cpp.
- * File drop / drag ghosts are Windows-only features and are not advertised.
+ * File drop: forward drags are captured by an XDND strip on the shared edge;
+ * reverse drags run a 8087 listener and are carried back with an X11 ghost.
  */
 #include "kvm.h"
 #include "kvm_core.h"
 #include "kvm_event_queue.h"
 #include "drop.h"
+#include "kvm_ghost_x11.h"
 #include "proto.h"
 
 #ifdef __linux__
@@ -116,6 +118,90 @@ std::vector<std::string> g_drag_paths;
 void dropStripSetSide(int side);
 void dropResetDrag();
 
+/* ── reverse drag (target -> controller) ────────────────────────────────── */
+bool g_reverse_enabled = false;
+bool g_reverse_ok = false;
+bool g_drag_icon_ok = false;
+bool g_drag_image_ok = false;
+std::atomic<bool> g_reverse_service_run{false};
+std::thread g_reverse_service;
+std::atomic<bool> g_reverse_drag{false};
+std::atomic<bool> g_rev_cancel_req{false};
+bool g_rev_held = false;          /* target's button kept down (main thread) */
+bool g_rev_pointer_grab = false;  /* active XGrabPointer during the carry */
+bool g_rev_visible = false;       /* ghost currently mapped (main thread) */
+uint64_t g_rev_applied = ~0ull;
+int g_rev_last_count = -1;
+KvmGhostX11 g_rev_ghost;
+
+struct ReverseDragState {
+    std::mutex m;
+    bool active = false;
+    int count = 0;
+    bool name_ready = false;
+    std::string name;
+    bool have_icon = false;
+    int icon_w = 0, icon_h = 0;
+    std::vector<uint8_t> icon;
+    bool have_image = false;
+    int img_w = 0, img_h = 0, img_ox = 0, img_oy = 0;
+    std::vector<uint8_t> image;
+    uint64_t version = 0;
+    /* Accumulators are touched only by the drain thread while m is held. */
+    int text_left = 0, icon_left = 0, image_left = 0;
+    std::vector<uint8_t> icon_acc, image_acc;
+};
+ReverseDragState g_rev;
+
+void revResetLocked()
+{
+    g_rev.active = false;
+    g_rev.count = 0;
+    g_rev.name_ready = false;
+    g_rev.name.clear();
+    g_rev.have_icon = false;
+    g_rev.icon_w = g_rev.icon_h = 0;
+    g_rev.icon.clear();
+    g_rev.have_image = false;
+    g_rev.img_w = g_rev.img_h = 0;
+    g_rev.img_ox = g_rev.img_oy = 0;
+    g_rev.image.clear();
+    g_rev.text_left = g_rev.icon_left = g_rev.image_left = 0;
+    g_rev.icon_acc.clear();
+    g_rev.image_acc.clear();
+    ++g_rev.version;
+}
+
+void revReset()
+{
+    std::lock_guard<std::mutex> lk(g_rev.m);
+    revResetLocked();
+}
+
+void revAppendLocked(const KvmEvent &e, std::vector<uint8_t> &out)
+{
+    char chunk[12];
+    std::memcpy(chunk, &e.a, 4);
+    std::memcpy(chunk + 4, &e.b, 4);
+    std::memcpy(chunk + 8, &e.c, 4);
+    out.insert(out.end(), chunk, chunk + 12);
+}
+
+void revDimOff(uint32_t v, int &dim, int &off)
+{
+    dim = (int)(v & 0xFFFFu);
+    off = (int)(int16_t)(v >> 16);
+}
+
+void revAppendNameLocked(const KvmEvent &e)
+{
+    char chunk[12];
+    std::memcpy(chunk, &e.a, 4);
+    std::memcpy(chunk + 4, &e.b, 4);
+    std::memcpy(chunk + 8, &e.c, 4);
+    g_rev.name.append(chunk, 12);
+}
+
 int g_wake[2] = {-1, -1};
 
 /* ── X state ─────────────────────────────────────────────────────────────── */
@@ -130,6 +216,11 @@ int      g_tgt_x0 = 0, g_tgt_y0 = 0;
 
 ControlState g_state = ControlState::Local;
 int      g_remote_x = 0, g_remote_y = 0;
+/* While a button is down, X11 can suppress XI2 raw motion (the server routes
+ * pointer motion to the implicit grab). Poll the local pointer instead so a
+ * held drag still moves the remote cursor; raw motion resumes on release. */
+bool     g_motion_poll = false;
+int      g_poll_x = 0, g_poll_y = 0;
 int      g_edge_overshoot = 0;
 uint64_t g_leave_tick = 0;
 uint64_t g_grab_fail_tick = 0;
@@ -517,7 +608,48 @@ void ungrabInput()
     XFlush(g_dpy);
 }
 
+/* While a reverse drag is carried back, keep receiving the physical button-up
+ * even though the pointer is now over an arbitrary local window. An active
+ * pointer grab routes it to our root selection; the local cursor still moves
+ * and the ghost follows it. */
+void grabReversePointer()
+{
+    if (!g_dpy) return;
+    const int r = XGrabPointer(
+        g_dpy, DefaultRootWindow(g_dpy), False,
+        ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync,
+        None, None, CurrentTime);
+    g_rev_pointer_grab = (r == GrabSuccess);
+    if (!g_rev_pointer_grab && g_trace)
+        std::cerr << "[kvm-trace] reverse pointer grab failed " << r
+                  << "\n";
+    XFlush(g_dpy);
+}
+
+void ungrabReversePointer()
+{
+    if (g_dpy && g_rev_pointer_grab)
+        XUngrabPointer(g_dpy, CurrentTime);
+    g_rev_pointer_grab = false;
+    if (g_dpy) XFlush(g_dpy);
+}
+
 /* ── state machine ───────────────────────────────────────────────────────── */
+
+void startMotionPoll()
+{
+    int px = 0, py = 0;
+    if (pointerPos(px, py)) {
+        g_poll_x = px;
+        g_poll_y = py;
+    }
+    g_motion_poll = true;
+}
+
+void stopMotionPoll()
+{
+    g_motion_poll = false;
+}
 
 void syncHeldInput()
 {
@@ -532,6 +664,126 @@ void syncHeldInput()
         if (b == 1 && g_file_drag) continue;
         if (g_btn_down[b]) queueButton((uint32_t)b, true);
     }
+}
+
+void hideReverseGhost()
+{
+    if (g_rev_visible) {
+        g_rev_ghost.end();
+        g_rev_visible = false;
+    }
+    g_rev_last_count = -1;
+}
+
+void cancelReverseDrag(bool sendReleaseAll)
+{
+    g_rev_held = false;
+    g_reverse_drag.store(false);
+    g_rev_cancel_req.store(false);
+    revReset();
+    hideReverseGhost();
+    ungrabReversePointer();
+    if (sendReleaseAll) queueReleaseAll();
+}
+
+void finishReverseDrag()
+{
+    if (g_rev_held) queueButton(1, false);
+    g_rev_held = false;
+    g_reverse_drag.store(false);
+    revReset();
+    hideReverseGhost();
+    ungrabReversePointer();
+    g_btn_local[1] = false;
+}
+
+void handleRevCancel()
+{
+    if (!g_rev_cancel_req.exchange(false)) return;
+    if (g_rev_held) {
+        queueReleaseAll();
+        g_rev_held = false;
+    }
+    g_reverse_drag.store(false);
+    revReset();
+    hideReverseGhost();
+}
+
+/* Keeps the reverse-drag ghost on the local cursor after control has been
+ * carried back, and drops it when the gesture ends. Runs on the Xlib loop. */
+void syncReverseGhost()
+{
+    /* Fallback for a missed ButtonRelease (an active grab can fail): once the
+     * server reports the local left button up, complete the target's drop. */
+    if (g_rev_held && g_dpy) {
+        Window root_ret = None, child = None;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned mask = 0;
+        if (XQueryPointer(g_dpy, DefaultRootWindow(g_dpy), &root_ret, &child,
+                          &rx, &ry, &wx, &wy, &mask) &&
+            !(mask & Button1Mask)) {
+            finishReverseDrag();
+            return;
+        }
+    }
+    const bool armed = g_reverse_drag.load() && g_btn_down[1] &&
+                       g_state == ControlState::Local;
+    if (!armed) {
+        hideReverseGhost();
+        return;
+    }
+    if (!g_dpy) return;
+    Window root_ret = None, child = None;
+    int rx = 0, ry = 0, wx = 0, wy = 0;
+    unsigned mask = 0;
+    if (!XQueryPointer(g_dpy, DefaultRootWindow(g_dpy), &root_ret, &child,
+                       &rx, &ry, &wx, &wy, &mask))
+        return;
+
+    bool changed = false, ready = false;
+    bool have_icon = false, have_image = false;
+    int count = 0, iw = 0, ih = 0, imgw = 0, imgh = 0, ox = 0, oy = 0;
+    std::string name;
+    std::vector<uint8_t> icon, image;
+    uint64_t ver = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_rev.m);
+        ver = g_rev.version;
+        if (!g_rev_visible || ver != g_rev_applied) {
+            ready = g_rev.name_ready;
+            if (!ready) {
+                if (g_rev_visible) hideReverseGhost();
+                return;
+            }
+            count = g_rev.count;
+            name = g_rev.name;
+            have_icon = g_rev.have_icon;
+            iw = g_rev.icon_w;
+            ih = g_rev.icon_h;
+            icon = g_rev.icon;
+            have_image = g_rev.have_image;
+            imgw = g_rev.img_w;
+            imgh = g_rev.img_h;
+            ox = g_rev.img_ox;
+            oy = g_rev.img_oy;
+            image = g_rev.image;
+            changed = true;
+        }
+    }
+    if (changed) {
+        /* begin() clears a previous drag's image/icon, so a new drag never
+         * keeps showing the old drag image. */
+        g_rev_ghost.begin(count);
+        g_rev_last_count = count;
+        g_rev_ghost.setText(name);
+        if (have_icon) g_rev_ghost.setIcon(iw, ih, icon);
+        if (have_image)
+            g_rev_ghost.setImage(imgw, imgh, ox, oy, image, true);
+        g_rev_applied = ver;
+        g_rev_visible = true;
+    }
+    g_rev_ghost.move(rx, ry);
+    g_rev_ghost.pump();
 }
 
 void enterRemote(int local_x, int local_y)
@@ -576,10 +828,12 @@ void enterRemote(int local_x, int local_y)
     setCursorVisible(false);
     pushMove((uint32_t)g_remote_x, (uint32_t)g_remote_y);
     syncHeldInput();
+    for (int b = 1; b < 6; b++)
+        if (g_btn_down[b]) { startMotionPoll(); break; }
     emitStitchState("remote");
 }
 
-void leaveRemote(bool warpCursor)
+void leaveRemote(bool warpCursor, bool keepHeldInput = false)
 {
     if (g_state != ControlState::Remote) return;
     if (g_trace)
@@ -589,9 +843,21 @@ void leaveRemote(bool warpCursor)
     /* Mark Local before any XTest release so those synthetic events are not
      * forwarded back to the peer. */
     g_state = ControlState::Local;
-    queueReleaseAll();
+    stopMotionPoll();
+    if (keepHeldInput) {
+        /* The target's drag is still live. Keep its injected button down until
+         * the local release completes the drop. */
+        g_rev_held = true;
+    } else {
+        g_rev_held = false;
+        if (g_reverse_drag.exchange(false)) revReset();
+        hideReverseGhost();
+        queueReleaseAll();
+    }
     ungrabInput();
     setCursorVisible(true);
+    if (keepHeldInput) grabReversePointer();
+    else ungrabReversePointer();
 
     if (warpCursor && g_dpy) {
         int lw = 1, lh = 1;
@@ -630,7 +896,13 @@ void moveRemote(int dx, int dy)
     default:              out = -nx; break;
     }
     if (out > 0) {
-        leaveRemote(true);
+        /* A reverse drag crossing back CARRIES the files to this desktop:
+         * return control, keep the target's button held (so its drag
+         * survives) and let the local release choose the drop point. */
+        if (g_reverse_drag.load() && g_btn_down[1])
+            leaveRemote(false, /*keepHeldInput=*/true);
+        else
+            leaveRemote(true);
         return;
     }
     nx = clampInt(nx, 0, (int)g_tgt_w - 1);
@@ -640,11 +912,25 @@ void moveRemote(int dx, int dy)
     pushMove((uint32_t)nx, (uint32_t)ny);
 }
 
+void pollRemoteMotion()
+{
+    if (!g_motion_poll || g_state != ControlState::Remote) return;
+    int px = 0, py = 0;
+    if (!pointerPos(px, py)) return;
+    const int dx = px - g_poll_x;
+    const int dy = py - g_poll_y;
+    if (!dx && !dy) return;
+    g_poll_x = px;
+    g_poll_y = py;
+    moveRemote(dx, dy);
+}
+
 void applySide(int side)
 {
     if (side < (int)KVM_SIDE_LEFT || side > (int)KVM_SIDE_BOTTOM ||
         side == g_side)
         return;
+    if (g_rev_held || g_reverse_drag.load()) cancelReverseDrag(true);
     if (g_state == ControlState::Remote) leaveRemote(true);
     g_side = side;
     dropStripSetSide(g_side);
@@ -1068,6 +1354,12 @@ void onMotion(int dx, int dy)
         return;
     }
 
+    /* Carrying a reverse drag on the local desktop: never re-enter Remote. */
+    if (g_rev_held) {
+        g_edge_overshoot = 0;
+        return;
+    }
+
     /* Only motion further out of the chosen edge counts; any other direction
      * resets the accumulator so jitter cannot cross. */
     const bool horizontal =
@@ -1130,8 +1422,29 @@ void onButton(int button, bool down, bool grabbed)
     default: return;
     }
 
+    /* The active pointer grab installed for a carried reverse drag reports
+     * the physical release here even though the local state is not Remote. */
+    if (grabbed && !down && pb == 1 && g_state == ControlState::Local &&
+        g_rev_held) {
+        g_btn_down[1] = false;
+        finishReverseDrag();
+        return;
+    }
+
     g_btn_down[pb] = down;
+    if (!down) {
+        bool any = false;
+        for (int b = 1; b < 6; b++) any = any || g_btn_down[b];
+        if (!any) stopMotionPoll();
+    }
     if (!grabbed) {
+        /* Local release after carrying a reverse drag back: forward the UP so
+         * the target's drop fires, then keep the local desktop from seeing an
+         * unmatched release. */
+        if (pb == 1 && !down && (g_rev_held || g_reverse_drag.load())) {
+            finishReverseDrag();
+            return;
+        }
         if (g_state == ControlState::Local) g_btn_local[pb] = down;
         return;
     }
@@ -1140,6 +1453,10 @@ void onButton(int button, bool down, bool grabbed)
         std::cerr << "[kvm-trace] forward button pb=" << pb
                   << " down=" << down << "\n";
     queueButton((uint32_t)pb, down);
+    bool any_down = false;
+    for (int b = 1; b < 6; b++) any_down = any_down || g_btn_down[b];
+    if (any_down) startMotionPoll();
+    else stopMotionPoll();
     /* Keep g_btn_local[pb] as-is on a Remote release: if the press reached the
      * local desktop, injectLocalReleases() must still send its up on leave. */
 }
@@ -1163,6 +1480,11 @@ void onKey(int keycode, bool down, bool grabbed)
          * press reached this desktop. A raw event while Remote would be a
          * duplicate of a grabbed event; ignore it. */
         if (g_state == ControlState::Local) {
+            if (down && keycode == g_q_key && g_ctrl && g_alt && g_shift &&
+                (g_rev_held || g_reverse_drag.load())) {
+                cancelReverseDrag(true);
+                return;
+            }
             g_key_local[keycode] = down;
             if (g_panic_key == keycode && !down) g_panic_key = -1;
         }
@@ -1218,8 +1540,12 @@ void handleEvent(XEvent &ev)
         return;
     }
     if (ev.type == ButtonPress || ev.type == ButtonRelease) {
-        if (g_state == ControlState::Remote)
+        if (g_state == ControlState::Remote) {
             onButton(ev.xbutton.button, ev.type == ButtonPress, true);
+        } else if (g_rev_held && ev.xbutton.button == 1 &&
+                   ev.type == ButtonRelease) {
+            onButton(1, false, true);
+        }
         return;
     }
     if (ev.type != GenericEvent || ev.xcookie.extension != g_xi_op) return;
@@ -1277,6 +1603,7 @@ void handleEvent(XEvent &ev)
             dy = have_y ? ay : 0.0;
         }
 
+        if (g_motion_poll) break;
         g_motion_acc_x += dx;
         g_motion_acc_y += dy;
         const int ix = (int)g_motion_acc_x;
@@ -1315,6 +1642,7 @@ bool initX11(std::string &why)
         why = "无法打开 X11 显示";
         return false;
     }
+    g_rev_ghost.attach(g_dpy);
     int event_base = 0, error_base = 0;
     if (!XQueryExtension(g_dpy, "XInputExtension", &g_xi_op, &event_base,
                          &error_base)) {
@@ -1380,6 +1708,7 @@ void closeX11()
     if (!g_dpy) return;
     setCursorVisible(true);
     ungrabInput();
+    g_rev_ghost.detach();
     XCloseDisplay(g_dpy);
     g_dpy = nullptr;
 }
@@ -1481,9 +1810,9 @@ void drainLoop(kvm_sock_t sock, bool heartbeat,
         if (rx_off < sizeof(rx)) continue;
 
         rx_off = 0;
-        uint32_t type = 0;
-        std::memcpy(&type, rx, sizeof(type));
-        type = ntohl(type);
+        KvmEvent incoming = {};
+        std::memcpy(&incoming, rx, sizeof(incoming));
+        const uint32_t type = ntohl(incoming.type);
         if (type == KVM_EV_PING) {
             if (heartbeat) {
                 KvmEvent pong = {};
@@ -1493,9 +1822,113 @@ void drainLoop(kvm_sock_t sock, bool heartbeat,
                     break;
                 }
             }
-        } else if (type != KVM_EV_PONG) {
-            /* We advertised no file-drop/drag bits; anything else means the
-             * 16-byte stream is out of sync. */
+        } else if (type == KVM_EV_PONG) {
+            /* Heartbeat reply. */
+        } else if (type == KVM_EV_RDRAG && g_reverse_ok) {
+            const bool on = ntohl(incoming.a) != 0;
+            g_reverse_drag.store(on);
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            g_rev.active = on;
+            if (!on) {
+                revResetLocked();
+                g_rev_cancel_req.store(true);
+            }
+        } else if (type == KVM_EV_DRAG_INFO && g_reverse_ok) {
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            const bool begin = ntohl(incoming.a) != 0;
+            revResetLocked();
+            if (begin) {
+                g_rev.active = true;
+                g_rev.count = (int)ntohl(incoming.b);
+                g_rev.text_left = (int)ntohl(incoming.c);
+                g_rev.name_ready = g_rev.text_left <= 0;
+            }
+        } else if (type == KVM_EV_DRAG_TEXT && g_reverse_ok) {
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            if (g_rev.text_left > 0) {
+                revAppendNameLocked(incoming);
+                if (--g_rev.text_left == 0) {
+                    while (!g_rev.name.empty() &&
+                           g_rev.name.back() == '\0')
+                        g_rev.name.pop_back();
+                    g_rev.name_ready = true;
+                    ++g_rev.version;
+                }
+            }
+        } else if (type == KVM_EV_DRAG_ICON_INFO && g_reverse_ok &&
+                   g_drag_icon_ok) {
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            const int w = (int)ntohl(incoming.a);
+            const int h = (int)ntohl(incoming.b);
+            const int frames = (int)ntohl(incoming.c);
+            g_rev.have_icon = false;
+            g_rev.icon.clear();
+            g_rev.icon_acc.clear();
+            g_rev.icon_w = w;
+            g_rev.icon_h = h;
+            g_rev.icon_left = 0;
+            if (w > 0 && h > 0 && w <= 2048 && h <= 2048 &&
+                (uint64_t)w * (uint64_t)h <= 36864u &&
+                frames >= 0 && frames <= 12288) {
+                g_rev.icon_acc.reserve((size_t)w * (size_t)h * 4);
+                g_rev.icon_left = frames;
+                if (frames == 0) {
+                    g_rev.have_icon = true;
+                    ++g_rev.version;
+                }
+            }
+        } else if (type == KVM_EV_DRAG_ICON_DATA && g_reverse_ok &&
+                   g_drag_icon_ok) {
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            if (g_rev.icon_left > 0) {
+                revAppendLocked(incoming, g_rev.icon_acc);
+                if (--g_rev.icon_left == 0 &&
+                    g_rev.icon_acc.size() ==
+                        (size_t)g_rev.icon_w * (size_t)g_rev.icon_h * 4) {
+                    g_rev.icon = g_rev.icon_acc;
+                    g_rev.have_icon = true;
+                    ++g_rev.version;
+                }
+            }
+        } else if (type == KVM_EV_DRAG_IMAGE_INFO && g_reverse_ok &&
+                   g_drag_image_ok) {
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            int w = 0, h = 0, ox = 0, oy = 0;
+            revDimOff(ntohl(incoming.a), w, ox);
+            revDimOff(ntohl(incoming.b), h, oy);
+            const int frames = (int)ntohl(incoming.c);
+            g_rev.have_image = false;
+            g_rev.image.clear();
+            g_rev.image_acc.clear();
+            g_rev.img_w = w;
+            g_rev.img_h = h;
+            g_rev.img_ox = ox;
+            g_rev.img_oy = oy;
+            g_rev.image_left = 0;
+            if (w > 0 && h > 0 && w <= 2048 && h <= 2048 &&
+                (uint64_t)w * (uint64_t)h <= 36864u &&
+                frames >= 0 && frames <= 12288) {
+                g_rev.image_acc.reserve((size_t)w * (size_t)h * 4);
+                g_rev.image_left = frames;
+                if (frames == 0) {
+                    g_rev.have_image = true;
+                    ++g_rev.version;
+                }
+            }
+        } else if (type == KVM_EV_DRAG_IMAGE_DATA && g_reverse_ok &&
+                   g_drag_image_ok) {
+            std::lock_guard<std::mutex> lk(g_rev.m);
+            if (g_rev.image_left > 0) {
+                revAppendLocked(incoming, g_rev.image_acc);
+                if (--g_rev.image_left == 0 &&
+                    g_rev.image_acc.size() ==
+                        (size_t)g_rev.img_w * (size_t)g_rev.img_h * 4) {
+                    g_rev.image = g_rev.image_acc;
+                    g_rev.have_image = true;
+                    ++g_rev.version;
+                }
+            }
+        } else {
             drainFail(LOSS_PROTOCOL_EVENT, 0);
             break;
         }
@@ -1505,13 +1938,19 @@ void drainLoop(kvm_sock_t sock, bool heartbeat,
 /* ── connect / authorization ─────────────────────────────────────────────── */
 
 /* The target sends the 8085 token as one fixed marker frame plus eight data
- * frames immediately after KvmReply, before any event-stream parser runs. */
+ * frames immediately after KvmReply, before any event-stream parser runs.
+ * Read it when EITHER direction is enabled: a reverse-only session still
+ * needs it for our own 8087 gate. */
 bool readDropToken(kvm_sock_t sock, const KvmReply &reply,
                    const std::atomic<bool> &running)
 {
-    g_drop_ready = g_drop_enabled &&
-                   (ntohl(reply.reserved) & KVM_FEATURE_FILE_DROP) != 0;
-    if (!g_drop_ready) return true;
+    const uint32_t feat = ntohl(reply.reserved);
+    g_drop_ready = g_drop_enabled && (feat & KVM_FEATURE_FILE_DROP) != 0;
+    g_reverse_ok = g_reverse_enabled &&
+                   (feat & KVM_FEATURE_REVERSE_DROP) != 0;
+    g_drag_icon_ok = (feat & KVM_FEATURE_DRAG_ICON) != 0;
+    g_drag_image_ok = (feat & KVM_FEATURE_DRAG_IMAGE) != 0;
+    if (!g_drop_ready && !g_reverse_ok) return true;
     KvmEvent ev = {};
     const auto read = [&] {
         return kvmRecvAllPoll(sock, &ev, sizeof(ev), running, 35000) == 1;
@@ -1520,6 +1959,7 @@ bool readDropToken(kvm_sock_t sock, const KvmReply &reply,
         ntohl(ev.a) != 0x4D564B58u || ntohl(ev.b) != 1u ||
         ntohl(ev.c) != 8u) {
         g_drop_ready = false;
+        g_reverse_ok = false;
         return false;
     }
     for (int i = 0; i < 8; i++) {
@@ -1527,13 +1967,15 @@ bool readDropToken(kvm_sock_t sock, const KvmReply &reply,
             ntohl(ev.a) != (uint32_t)i) {
             mivaraSecureZero(g_drop_token, sizeof(g_drop_token));
             g_drop_ready = false;
+            g_reverse_ok = false;
             return false;
         }
         const uint32_t word = ntohl(ev.b);
         std::memcpy(g_drop_token + i * 4, &word, 4);
     }
-    emitStat("event=drop|state=ready|port=" +
-             std::to_string((int)DROP_PORT));
+    if (g_drop_ready)
+        emitStat("event=drop|state=ready|port=" +
+                 std::to_string((int)DROP_PORT));
     return true;
 }
 
@@ -1566,11 +2008,16 @@ int connectHandshake(const char *peer_ip, int peer_port, int side,
         hello.magic = htonl(KVM_MAGIC);
         hello.version = htonl(KVM_VERSION);
         hello.reserved[0] = htonl((uint32_t)side + 1u);
-        /* Reverse drop and drag images are not implemented here; file drop
-         * is advertised only when the GUI/CLI enabled it. */
+        /* Low 16 bits are capabilities; bits 16..31 carry our reverse-drop
+         * port so the target never has to guess (a local receiver may own
+         * 8085). */
         hello.reserved[1] = htonl(
-            KVM_FEATURE_HEARTBEAT |
-            (g_drop_enabled ? KVM_FEATURE_FILE_DROP : 0u));
+            KVM_FEATURE_HEARTBEAT | KVM_FEATURE_DRAG_ICON |
+            KVM_FEATURE_DRAG_IMAGE |
+            (g_drop_enabled ? KVM_FEATURE_FILE_DROP : 0u) |
+            (g_reverse_enabled ? KVM_FEATURE_REVERSE_DROP : 0u) |
+            (g_reverse_enabled
+                 ? ((uint32_t)DROP_REVERSE_PORT << 16) : 0u));
         if (!kvmSendAll(sock, &hello, sizeof(hello))) {
             if (running.load()) emitStatError("拼接握手发送失败");
             kvmClose(sock);
@@ -1768,6 +2215,8 @@ void resetSessionState(int side)
                  ? side : (int)KVM_SIDE_RIGHT;
     g_state = ControlState::Local;
     g_remote_x = g_remote_y = 0;
+    g_motion_poll = false;
+    g_poll_x = g_poll_y = 0;
     g_edge_overshoot = 0;
     g_leave_tick = 0;
     g_grab_fail_tick = 0;
@@ -1786,6 +2235,17 @@ void resetSessionState(int side)
     g_x_error = false;
     g_drop_enabled = false;
     g_drop_ready = false;
+    g_reverse_enabled = false;
+    g_reverse_ok = false;
+    g_drag_icon_ok = g_drag_image_ok = false;
+    g_reverse_drag.store(false);
+    g_rev_cancel_req.store(false);
+    g_rev_held = false;
+    g_rev_pointer_grab = false;
+    g_rev_visible = false;
+    g_rev_applied = ~0ull;
+    g_rev_last_count = -1;
+    revReset();
     std::memset(g_drop_token, 0, sizeof(g_drop_token));
     g_peer_ip.clear();
     g_drop_run.store(false);
@@ -1803,6 +2263,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
 
     resetSessionState(side);
     g_drop_enabled = auth && auth->file_drop;
+    g_reverse_enabled = auth && auth->accept_files;
     g_peer_ip = peer_ip;
 
     kvm_sock_t sock = KVM_INVALID_SOCK;
@@ -1843,6 +2304,37 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     fcntl(g_wake[0], F_SETFL, fcntl(g_wake[0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(g_wake[1], F_SETFL, fcntl(g_wake[1], F_GETFL, 0) | O_NONBLOCK);
 
+    bool reverse_started = false;
+    if (g_reverse_ok) {
+        dropGateInstall(g_drop_token, /*epoch=*/1);
+        dropServiceStatusReset();
+        g_reverse_service_run.store(true);
+        g_reverse_service = std::thread([] {
+            dropServiceRun(g_reverse_service_run,
+                           (uint16_t)DROP_REVERSE_PORT);
+        });
+        int st = 0;
+        for (int i = 0; i < 100 && st == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            st = dropServiceStatus().state;
+        }
+        if (st == 1) {
+            reverse_started = true;
+            emitStat("event=drop|state=reverse_ready|port=" +
+                     std::to_string((int)DROP_REVERSE_PORT));
+        } else {
+            emitLog("reverse file-drop listener failed on port " +
+                    std::to_string((int)DROP_REVERSE_PORT) + " (state=" +
+                    std::to_string(st) + ")");
+            g_reverse_service_run.store(false);
+            if (g_reverse_service.joinable()) g_reverse_service.join();
+            dropGateClear(/*epoch=*/1);
+            g_reverse_ok = false;
+            emitStat("event=drop|state=reverse_error|port=" +
+                     std::to_string((int)DROP_REVERSE_PORT));
+        }
+    }
+
     std::thread drain(drainLoop, sock, heartbeat, std::cref(running));
 
     g_ctrl_session_start = kvmNowMs();
@@ -1859,12 +2351,17 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     while (running.load()) {
         const int req = g_side_req.exchange(-1);
         if (req >= 0) applySide(req);
+        handleRevCancel();
+        syncReverseGhost();
+        pollRemoteMotion();
         if (!g_netOK.load()) break;
 
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(xfd, &rd);
-        struct timeval tv = {0, 50000};   /* 50 ms, also polls side/running */
+        /* 100 Hz while a drag/held button needs pointer polling; 20 Hz is
+         * enough for the idle side/running checks. */
+        struct timeval tv = {0, g_motion_poll ? 10000 : 50000};
         const int sel = select(xfd + 1, &rd, nullptr, nullptr, &tv);
         if (sel < 0) {
             if (errno == EINTR) continue;
@@ -1873,14 +2370,28 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
             g_netOK.store(false, std::memory_order_relaxed);
             break;
         }
-        if (sel == 0) continue;
+        if (sel == 0) {
+            handleRevCancel();
+            syncReverseGhost();
+            continue;
+        }
         while (XPending(g_dpy)) {
             XEvent ev;
             XNextEvent(g_dpy, &ev);
             handleEvent(ev);
         }
+        handleRevCancel();
+        syncReverseGhost();
     }
 
+    cancelReverseDrag(true);
+    if (reverse_started) {
+        g_reverse_service_run.store(false);
+        if (g_reverse_service.joinable()) g_reverse_service.join();
+        dropGateClear(/*epoch=*/1);
+        reverse_started = false;
+    }
+    g_reverse_ok = false;
     g_drop_run.store(false);
     if (g_drop_thread.joinable()) g_drop_thread.join();
     dropStripDestroy();

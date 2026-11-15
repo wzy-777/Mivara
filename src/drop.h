@@ -21,10 +21,12 @@
  * Windows and Linux/X11 are supported. A Windows target resolves the release
  * point through the shell's OLE drop target; a Linux/X11 target offers the
  * staged items to the XDND-aware window under the release point and falls back
- * to a default receive directory when there is none. Linux does not implement
- * the reverse (target -> controller) direction. Other POSIX builds compile the
- * listener, but stitch itself is unsupported there, so no session token is
- * installed and every connection is refused.
+ * to a default receive directory when there is none. Both directions are
+ * supported on Windows and Linux/X11: a reverse transfer is sent to the
+ * controller's own listener (DROP_REVERSE_PORT) and resolved from that
+ * controller's cursor. Other POSIX builds compile the listener, but stitch
+ * itself is unsupported there, so no session token is installed and every
+ * connection is refused.
  */
 #ifndef MIVARA_DROP_H
 #define MIVARA_DROP_H

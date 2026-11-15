@@ -197,17 +197,21 @@ OBJ_KVM_CORE := $(BUILDDIR)/kvm_core.o
 OBJ_KVM_TARGET := $(BUILDDIR)/kvm_target.o
 OBJ_KVM_X11  := $(BUILDDIR)/kvm_x11.o
 OBJ_KVM_X11_CTL := $(BUILDDIR)/kvm_x11_ctl.o
+OBJ_KVM_GHOST := $(BUILDDIR)/kvm_ghost_x11.o
 OBJ_KVM_STUB := $(BUILDDIR)/kvm_stub.o
 # Platform backend: Windows hooks/SendInput, Linux/X11 XTest, stubs elsewhere.
 ifeq ($(PLATFORM),windows)
 OBJ_KVM      := $(BUILDDIR)/kvm.o
 OBJ_KVM_CTL  :=
+OBJ_KVM_GHOST_VIS :=
 else ifeq ($(PLATFORM),linux)
 OBJ_KVM      := $(OBJ_KVM_X11)
 OBJ_KVM_CTL  := $(OBJ_KVM_X11_CTL)
+OBJ_KVM_GHOST_VIS := $(OBJ_KVM_GHOST)
 else
 OBJ_KVM      := $(OBJ_KVM_STUB)
 OBJ_KVM_CTL  :=
+OBJ_KVM_GHOST_VIS :=
 endif
 OBJ_AUTH     := $(BUILDDIR)/auth.o
 OBJ_TRAY     := $(BUILDDIR)/tray.o
@@ -269,10 +273,11 @@ $(OBJ_CONFIG): $(SRCDIR)/config.h
 $(OBJ_HISTORY): $(SRCDIR)/history.h
 $(OBJ_UPDATE): $(SRCDIR)/update.h $(SRCDIR)/version.h
 $(OBJ_THEME): $(SRCDIR)/theme.h
-$(OBJ_KVM): $(SRCDIR)/kvm.h $(SRCDIR)/kvm_core.h $(SRCDIR)/kvm_event_queue.h $(SRCDIR)/kvm_target.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/drop.h
+$(OBJ_KVM): $(SRCDIR)/kvm.h $(SRCDIR)/kvm_core.h $(SRCDIR)/kvm_event_queue.h $(SRCDIR)/kvm_target.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/drop.h $(SRCDIR)/kvm_ghost_x11.h
 $(OBJ_KVM_CORE): $(SRCDIR)/kvm_core.h $(SRCDIR)/kvm.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h
 $(OBJ_KVM_TARGET): $(SRCDIR)/kvm_target.h $(SRCDIR)/kvm_core.h $(SRCDIR)/kvm.h $(SRCDIR)/auth.h $(SRCDIR)/drop.h $(SRCDIR)/proto.h
-$(OBJ_KVM_X11_CTL): $(SRCDIR)/kvm.h $(SRCDIR)/kvm_core.h $(SRCDIR)/kvm_event_queue.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h
+$(OBJ_KVM_X11_CTL): $(SRCDIR)/kvm.h $(SRCDIR)/kvm_core.h $(SRCDIR)/kvm_event_queue.h $(SRCDIR)/proto.h $(SRCDIR)/auth.h $(SRCDIR)/drop.h $(SRCDIR)/kvm_ghost_x11.h
+$(OBJ_KVM_GHOST): $(SRCDIR)/kvm_ghost_x11.h
 $(OBJ_AUTH): $(SRCDIR)/auth.h
 $(OBJ_TRAY): $(SRCDIR)/tray.h
 $(OBJ_DROP): $(SRCDIR)/drop.h $(SRCDIR)/auth.h $(SRCDIR)/dropshell.h
@@ -288,11 +293,11 @@ $(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/kvm.h $(SRCDIR)/confi
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM_CORE) $(OBJ_KVM) $(OBJ_KVM_CTL) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_CAPTURE_DDA) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_KVM_CORE) $(OBJ_KVM) $(OBJ_KVM_CTL) $(OBJ_KVM_GHOST_VIS) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_CAPTURE_DDA) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
-$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM_CORE) $(OBJ_KVM_TARGET) $(OBJ_KVM) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_FILEXFER) $(OBJ_CONFIG) | $(BINDIR)
+$(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_CODEC) $(OBJ_KVM_CORE) $(OBJ_KVM_TARGET) $(OBJ_KVM) $(OBJ_KVM_GHOST_VIS) $(OBJ_AUTH) $(OBJ_DROP) $(OBJ_DROPSHELL) $(OBJ_FILEXFER) $(OBJ_CONFIG) | $(BINDIR)
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
@@ -382,7 +387,7 @@ check:
                gpu_accelerate.c gpu_accelerate.h ports.cpp ports.h \
                vdd.cpp vdd.h codec.cpp codec.h proto.h \
                kvm.cpp kvm.h kvm_core.cpp kvm_core.h kvm_target.cpp kvm_target.h \
-               kvm_event_queue.h kvm_x11.cpp kvm_x11_ctl.cpp kvm_stub.cpp \
+               kvm_event_queue.h kvm_x11.cpp kvm_x11_ctl.cpp kvm_ghost_x11.cpp kvm_ghost_x11.h kvm_stub.cpp \
                drop.cpp drop.h dropshell.cpp dropshell.h stitchcap.cpp filexfer.cpp filexfer.h \
                capture_dda.cpp capture_dda.h \
                config.cpp config.h history.cpp history.h \

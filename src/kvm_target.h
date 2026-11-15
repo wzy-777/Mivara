@@ -6,7 +6,7 @@
  * the local input primitives through KvmTargetOps:
  *
  *   Windows (kvm.cpp)  SendInput + GDI layered drag ghost + 8085 reverse drop
- *   Linux   (kvm_x11.cpp) XTest + Xlib desktop metrics
+ *   Linux   (kvm_x11.cpp) XTest + shared X11 drag ghost + reverse XDND strip
  *   other   (kvm_stub.cpp) unavailable
  *
  * The shared code never touches a platform input API. Documented Windows
@@ -64,8 +64,9 @@ struct KvmTargetOps {
     KvmApprovalResult (*askConsent)(const std::string &ip, int side,
                                     std::atomic<bool> &running,
                                     kvm_sock_t client);
-    /* Optional per-session backend (Windows starts its 8085 reverse-drop
-     * watcher here). Returned pointer is passed unchanged to sessionEnd. */
+    /* Optional per-session backend (Windows starts its OLE watcher, Linux its
+     * reverse XDND strip + sender). Returned pointer is passed unchanged to
+     * sessionEnd. */
     void *(*sessionBegin)(const KvmTargetGrant &grant,
                           const std::string &peer_ip, kvm_sock_t client,
                           const KvmTargetAuth *auth,
