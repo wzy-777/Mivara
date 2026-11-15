@@ -64,9 +64,14 @@
  * name. A denied request gets HsResponseV2(HS_ERR_DENIED), an unanswered one
  * HS_ERR_AUTH_TIMEOUT, and the connection is closed.
  *
- * Windows only. On other platforms kvmRunController() reports an error and
- * kvmServiceRun() returns immediately, so the rest of the program is
- * unaffected.
+ * Platform support: the controller runs on Windows and Linux/X11; the target
+ * (被控端) runs on Windows and Linux/X11. On any other platform
+ * kvmRunController() reports that 拼接 is unsupported and kvmServiceRun()
+ * returns immediately. The platform-neutral socket/auth helpers live in
+ * kvm_core.cpp, the shared 8084 listener/handshake/session loop in
+ * kvm_target.cpp, the Windows backends in kvm.cpp, the Linux/X11 target in
+ * kvm_x11.cpp, the Linux/X11 controller in kvm_x11_ctl.cpp, and the remaining
+ * stubs in kvm_stub.cpp.
  */
 #ifndef MIVARA_KVM_H
 #define MIVARA_KVM_H
@@ -95,7 +100,8 @@
 #define KVM_HEARTBEAT_TIMEOUT_MS  9000u
 /* Reverse (target -> controller) drag copy. The controller advertises it when
  * its own file_drop_accept=1 (it can RECEIVE); the target echoes it when its
- * own file_drop_send=1 (it can SEND) and the 8085 listener is up. */
+ * own file_drop_send=1 (it can SEND) and the 8085 listener is up. Both the
+ * Windows and the Linux/X11 backends implement both sides. */
 #define KVM_FEATURE_REVERSE_DROP 4u
 /* Drag-ghost icon payload, visual only. Both peers understand the icon frames
  * below; the bit is echoed in KvmReply so neither side sends them to a build
@@ -103,7 +109,9 @@
 #define KVM_FEATURE_DRAG_ICON    8u
 /* Source Explorer's real drag image ("DragImageBits"), visual only. A peer
  * that understands KVM_EV_DRAG_IMAGE_* echoes this bit; it supersedes the
- * reconstructed icon card on the receiving screen. */
+ * reconstructed icon card on the receiving screen. The Linux/X11 ghost draws
+ * it with ARGB when a compositor is available and composites it opaquely
+ * otherwise. */
 #define KVM_FEATURE_DRAG_IMAGE   16u
 
 /* KvmReply.status */
@@ -131,9 +139,10 @@ enum KvmEventType : uint32_t {
      * frame ever enters the 16-byte event stream. */
     KVM_EV_DROP_INFO   = 8,
     /* Target → controller, only with KVM_FEATURE_REVERSE_DROP: the target's
-     * edge helper announced (a=1) or cancelled (a=0) a reverse file drag.
-     * The controller suppresses back-crossing while a=1 so the target's OLE
-     * drag can finish on release, then hands control back. */
+     * edge helper announced (a=1) or cancelled/ended (a=0) a reverse file
+     * drag. The controller keeps the target's injected button held while it
+     * carries the drag back to its own desktop; the local release forwards
+     * the matching UP so the target's drop fires, then hands control back. */
     KVM_EV_RDRAG       = 9,
     /* Controller → target, visual only. The name frames need no negotiation
      * (an older target ignores unknown types); the optional icon frames below
@@ -283,10 +292,12 @@ struct KvmClientAuth {
     void *ctx = nullptr;
 };
 
-/** True on platforms where 拼接 is implemented (currently Windows only). */
+/** True where the stitch CONTROLLER is implemented: Windows (kvm.cpp) and
+ *  Linux/X11 (kvm_x11_ctl.cpp). The GUI gates the "拼接" send mode on this;
+ *  the target side (kvmServiceRun) also runs on Linux/X11. */
 inline bool kvmSupported()
 {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     return true;
 #else
     return false;

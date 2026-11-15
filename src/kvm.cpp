@@ -18,15 +18,11 @@
  *      still carries the device's relative delta, which is what drives both
  *      the edge crossing and the remote cursor.
  *
- *  - kvmServiceRun()     (bin/receiver)
- *      Listens on TCP 8084 and serves one controller at a time. Every
- *      connection obeys the receiver's configured policy (open / password /
- *      manual, see kvm.h); the manual prompt is a topmost MessageBox (default
- *      No, auto-dismissed after 30 s) when the receiver supplied no GUI hooks.
- *      8084 shares the process-wide single-session slot with 8081, so video
- *      and stitch can never be active together. Accepted events are replayed
- *      with SendInput (absolute virtual-desktop moves + scancode key events).
- *      Every exit path sends a release-all so no key/button stays stuck.
+ *  - kvmServiceRun()     (bin/receiver, shared with the Linux backend)
+ *      The listener, v2 authorization and event loop live in kvm_target.cpp;
+ *      this file only supplies the Windows KvmTargetOps: SendInput injection,
+ *      the GDI layered drag ghost and the 8085 reverse-drop watcher. See
+ *      kvm_target.h for the seam.
  *
  * Threading / latency: a hook callback must never block on the network (a
  * low-level hook that overruns LowLevelHooksTimeout is silently removed).
@@ -34,10 +30,14 @@
  * socket and sends. A send failure is posted back to the hook thread, which
  * releases remote control and quits.
  *
- * Windows only. On other platforms kvmRunController() reports that 拼接 is
- * unsupported and kvmServiceRun() returns immediately.
+ * Windows controller + Windows target backend. The Linux/X11 target backend
+ * is kvm_x11.cpp; shared socket/auth/session code is kvm_core.cpp and
+ * kvm_target.cpp. The Linux controller (XInput2 + grabs) is still pending.
  */
 #include "kvm.h"
+#include "kvm_core.h"
+#include "kvm_event_queue.h"
+#include "kvm_target.h"
 #include "drop.h"
 #include "proto.h"
 
@@ -75,83 +75,6 @@
 
 /* ── small helpers ───────────────────────────────────────────────────────── */
 
-typedef SOCKET kvm_sock_t;
-#define KVM_INVALID_SOCK INVALID_SOCKET
-
-static void kvmClose(kvm_sock_t s)
-{
-    if (s != KVM_INVALID_SOCK) closesocket(s);
-}
-
-/* Never retry a blocking send after a timeout: Winsock can have copied an
- * unreported prefix into the send buffer before the timer fired, so re-sending
- * would duplicate bytes and desynchronise the fixed 16-byte event stream. The
- * stall tolerance instead comes from a 2 s SO_SNDTIMEO (a KVM event is 16
- * bytes and the kernel buffer absorbs thousands of them), which rides out a
- * congested link without ever re-sending an ambiguous buffer. */
-static bool kvmSendAll(kvm_sock_t s, const void *buf, size_t len)
-{
-    const char *p = (const char *)buf;
-    size_t off = 0;
-    while (off < len) {
-        int n = send(s, p + off, (int)(len - off), 0);
-        if (n <= 0) return false;
-        off += (size_t)n;
-    }
-    return true;
-}
-
-static void kvmSetTimeouts(kvm_sock_t s, DWORD recv_ms, DWORD send_ms)
-{
-    if (recv_ms) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_ms,
-                            sizeof(recv_ms));
-    if (send_ms) setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&send_ms,
-                            sizeof(send_ms));
-}
-
-/* A software KVM is silent whenever the user is idle, so an unplugged or
- * powered-off controller never produces a FIN/RST. TCP keepalive is the only
- * thing that notices; without it the target sits in serveClient forever and
- * the single session slot is wedged (and held modifiers stay down). */
-static void kvmEnableKeepAlive(kvm_sock_t s)
-{
-    BOOL on = TRUE;
-    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof(on));
-    tcp_keepalive ka = {};
-    ka.onoff = 1;
-    ka.keepalivetime = 15000;   /* idle before the first probe  */
-    ka.keepaliveinterval = 3000; /* between probes (10 on Win)   */
-    DWORD ret = 0;
-    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &ret,
-             nullptr, nullptr);
-}
-
-/* recv exactly len bytes, checking *running between 200 ms waits.
- * 1 = ok, 0 = deadline, -1 = closed/error/caller stopped. */
-static int kvmRecvAllPoll(kvm_sock_t s, void *buf, size_t len,
-                          const std::atomic<bool> &running, int timeout_ms)
-{
-    char *p = (char *)buf;
-    size_t off = 0;
-    const DWORD start = GetTickCount();
-    while (off < len) {
-        if (!running.load()) return -1;
-        if (timeout_ms > 0 && (int)(GetTickCount() - start) > timeout_ms)
-            return 0;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(s, &rd);
-        struct timeval tv = {0, 200000};
-        int sel = select(0, &rd, nullptr, nullptr, &tv);
-        if (sel < 0) return -1;
-        if (sel == 0) continue;
-        int n = recv(s, p + off, (int)(len - off), 0);
-        if (n <= 0) return -1;
-        off += (size_t)n;
-    }
-    return 1;
-}
-
 static int clampInt(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -188,102 +111,8 @@ static bool isExtendedVk(DWORD vk)
 
 namespace {
 
-/* SPSC ring between the hook thread and the socket drain thread. Mouse moves
- * are coalesced on the consumer side: a run of pending moves collapses to the
- * newest one, so a 1000 Hz mouse cannot grow the queue without bound. The
- * producer must never touch a published slot — an in-place "overwrite the
- * newest" optimisation races with the drain thread copying that same slot
- * (the consumer can advance tail between the producer's tail load and its
- * write, tearing a coordinate pair). */
-class EventQueue {
-public:
-    /* Large enough for one real drag image (DROP_DRAG_IMAGE_MAX_PIXELS * 4 /
-     * 12 frames) plus input headroom. The batch drain below sends it in one
-     * pass, so this is capacity, not a latency cost. */
-    static const unsigned CAP = 16384;
-
-    bool push(const KvmEvent &e)
-    {
-        unsigned h = head.load(std::memory_order_relaxed);
-        unsigned t = tail.load(std::memory_order_acquire);
-        if (h - t >= CAP) return false;
-        buf[h % CAP] = e;
-        head.store(h + 1, std::memory_order_release);
-        return true;
-    }
-
-    bool pushMove(uint32_t x, uint32_t y)
-    {
-        /* Keep headroom for key/button events. While the drain thread is
-         * blocked in a slow send, a 1-4 kHz mouse would otherwise fill the
-         * ring with moves and silently discard a key-up / button-up queued
-         * behind it, leaving the peer's Ctrl or left button held down. Moves
-         * are lossy by design (pop() already keeps only the newest of a run),
-         * key and button events are not. */
-        unsigned h = head.load(std::memory_order_relaxed);
-        unsigned t = tail.load(std::memory_order_acquire);
-        if (h - t >= CAP - 512) return false;
-        KvmEvent e = {};
-        e.type = KVM_EV_MOVE;
-        e.a = x;
-        e.b = y;
-        buf[h % CAP] = e;
-        head.store(h + 1, std::memory_order_release);
-        return true;
-    }
-
-    /* Free ring slots. The producer is a single thread, so a caller that
-     * checks this and then pushes the same number of events cannot be raced
-     * by another producer. Used to keep a burst of visual-only icon frames
-     * from crowding out a key/button event. */
-    unsigned freeSlots() const
-    {
-        const unsigned h = head.load(std::memory_order_relaxed);
-        const unsigned t = tail.load(std::memory_order_acquire);
-        return CAP - (h - t);
-    }
-
-    /* Conservative snapshot used to skip the select() wait before a drain. */
-    bool empty() const
-    {
-        return head.load(std::memory_order_acquire) ==
-               tail.load(std::memory_order_relaxed);
-    }
-
-    bool pop(KvmEvent &e)
-    {
-        unsigned t = tail.load(std::memory_order_relaxed);
-        unsigned h = head.load(std::memory_order_acquire);
-        if (t == h) return false;
-        e = buf[t % CAP];
-        ++t;
-        /* Consumer side is the only tail writer, so reading past t up to h is
-         * safe; keep the last move of a contiguous run. */
-        while (t != h) {
-            const KvmEvent &n = buf[t % CAP];
-            if (e.type != KVM_EV_MOVE || n.type != KVM_EV_MOVE) break;
-            e = n;
-            ++t;
-        }
-        tail.store(t, std::memory_order_release);
-        return true;
-    }
-
-    /* Drop events left by a previous session. Only safe while no hooks are
-     * installed and the drain thread is not running (session start). A
-     * reconnect must never replay a stale button-up/key-up against the new
-     * session. */
-    void reset()
-    {
-        head.store(0, std::memory_order_relaxed);
-        tail.store(0, std::memory_order_relaxed);
-    }
-
-private:
-    KvmEvent buf[CAP] = {};
-    std::atomic<unsigned> head{0};
-    std::atomic<unsigned> tail{0};
-};
+/* The SPSC ring shared with the Linux XInput2 backend. */
+using EventQueue = KvmEventQueue;
 
 /* ── drag-ghost icon payload ───────────────────────────────────────────────
  * The dragged item's own shell image travels as fixed 16-byte KvmEvents: an
@@ -2246,233 +2075,6 @@ static void drainLoop()
     }
 }
 
-/* Connect with a short timeout so a powered-off peer does not hang the
- * launcher for the OS's full TCP retry budget. */
-static kvm_sock_t connectTimeout(const char *ip, int port,
-                                 const std::atomic<bool> &running, int ms)
-{
-    kvm_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == KVM_INVALID_SOCK) return KVM_INVALID_SOCK;
-
-    u_long nonblocking = 1;
-    ioctlsocket(s, FIONBIO, &nonblocking);
-
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
-        kvmClose(s);
-        return KVM_INVALID_SOCK;
-    }
-
-    int rc = connect(s, (sockaddr *)&addr, sizeof(addr));
-    if (rc == 0) {
-        u_long blocking = 0;
-        ioctlsocket(s, FIONBIO, &blocking);
-        return s;
-    }
-    if (WSAGetLastError() != WSAEWOULDBLOCK) {
-        kvmClose(s);
-        return KVM_INVALID_SOCK;
-    }
-
-    const DWORD start = GetTickCount();
-    while ((int)(GetTickCount() - start) < ms) {
-        if (!running.load()) {
-            kvmClose(s);
-            return KVM_INVALID_SOCK;
-        }
-        fd_set wr;
-        FD_ZERO(&wr);
-        FD_SET(s, &wr);
-        struct timeval tv = {0, 100000};
-        int sel = select(0, nullptr, &wr, nullptr, &tv);
-        if (sel > 0) {
-            int err = 0;
-            int len = sizeof(err);
-            getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
-            if (err != 0) {
-                kvmClose(s);
-                return KVM_INVALID_SOCK;
-            }
-            u_long blocking = 0;
-            ioctlsocket(s, FIONBIO, &blocking);
-            return s;
-        }
-        if (sel < 0) break;
-    }
-    kvmClose(s);
-    return KVM_INVALID_SOCK;
-}
-
-/* This machine's name, sent to the target's 授权 popup (same cap as the 8081
- * extension frame). */
-static std::string kvmLocalDeviceName()
-{
-    char name[256] = {0};
-    DWORD n = (DWORD)sizeof(name);
-    if (!GetComputerNameA(name, &n) || name[0] == '\0')
-        return "Mivara";
-    name[n < sizeof(name) ? n : sizeof(name) - 1] = '\0';
-    std::string s(name);
-    if (s.size() > 31) s.resize(31);
-    return s;
-}
-
-/* The device name comes straight off the wire and is echoed into STAT lines
- * (and the app's approval dialog), where '|' separates fields. Replace control
- * characters and '|' the same way the 8081 receiver does, so a hostile client
- * cannot smuggle extra keys into `auth|...|dev=` and spoof the address text. */
-static std::string kvmDeviceNameFromWire(const HsRequestExtV3 &ext)
-{
-    std::string d;
-    for (size_t i = 0; i < sizeof(ext.device); i++) {
-        const unsigned char c = (unsigned char)ext.device[i];
-        if (!c) break;
-        d.push_back((c < 0x20 || c == 0x7f || c == '|') ? '?' : (char)c);
-    }
-    if (d.size() > 31) d.resize(31);
-    return d;
-}
-
-static bool kvmSendHsResponse(kvm_sock_t s, uint32_t status, uint32_t w,
-                              uint32_t h)
-{
-    HsResponseV2 res = {};
-    res.magic = htonl(TVHS_MAGIC);
-    res.version = htonl(TVHS_VERSION);
-    res.recv_width = htonl(w);
-    res.recv_height = htonl(h);
-    res.status = htonl(status);
-    return kvmSendAll(s, &res, sizeof(res));
-}
-
-/* Human-readable text for the authorization verdicts. Never includes a
- * password: only the receiver's status code is used. */
-static void kvmAuthErrorText(uint32_t status, std::string &out)
-{
-    switch (status) {
-    case HS_ERR_AUTH:
-        out = "连接密码错误，或尝试次数过多";
-        break;
-    case HS_ERR_AUTH_TIMEOUT:
-        out = "对方未在 30 秒内确认拼接请求";
-        break;
-    case HS_ERR_DENIED:
-        out = "对方拒绝了拼接请求";
-        break;
-    case HS_ERR_BUSY:
-        out = "对方正在接收其他连接";
-        break;
-    case HS_ERR_AUTH_CONFIG:
-        out = "对方接收授权配置异常，请在设置中重新设置连接密码";
-        break;
-    case HS_ERR_VERSION:
-        out = "拼接协议版本不一致，请将两端更新到同一版本";
-        break;
-    default:
-        out = "拼接请求被拒绝（错误码 " + std::to_string(status) + "）";
-        break;
-    }
-}
-
-enum class AuthOutcome { Ok, Status, Cancelled, Transport, Protocol };
-
-/* Controller half of the v2 authorization exchange: identity frame, optional
- * password proof, then the receiver's verdict. The client's verdict is left in
- * `status` for AuthOutcome::Status and a user-facing reason in `why`. */
-static AuthOutcome kvmClientAuthorize(kvm_sock_t s, const KvmHello &hello,
-                                      const HsAuthStart &as,
-                                      const std::atomic<bool> &running,
-                                      const KvmClientAuth *auth,
-                                      uint32_t &status, std::string &why)
-{
-    const auto report = [auth](const char *state) {
-        if (auth && auth->report) auth->report(state, nullptr, auth->ctx);
-    };
-
-    HsRequestExtV3 ext = {};
-    ext.magic = htonl(TVHX_MAGIC);
-    ext.version = htonl(TVHA_VERSION);
-    const std::string device = kvmLocalDeviceName();
-    std::memcpy(ext.device, device.data(),
-                device.size() < sizeof(ext.device) ? device.size()
-                                                   : sizeof(ext.device));
-    if (!kvmSendAll(s, &ext, sizeof(ext))) {
-        why = "拼接授权请求发送失败";
-        return AuthOutcome::Transport;
-    }
-
-    const uint32_t mode = ntohl(as.mode);
-    if (mode == AUTH_MODE_PASSWORD) {
-        const uint32_t iter = ntohl(as.kdf_iter);
-        if (iter < HS_KDF_ITER_MIN || iter > HS_KDF_ITER_MAX) {
-            why = "对方下发的密码参数无效";
-            return AuthOutcome::Protocol;
-        }
-        std::string pw;
-        if (!auth || !auth->password) {
-            report("cancelled");
-            why = "对方要求连接密码，但当前客户端无法输入";
-            return AuthOutcome::Cancelled;
-        }
-        report("need_password");
-        if (!auth->password(&pw, auth->ctx) || pw.empty()) {
-            if (!pw.empty()) {
-                volatile char *v = &pw[0];
-                for (size_t i = 0; i < pw.size(); i++) v[i] = 0;
-            }
-            report("cancelled");
-            why = "已取消输入连接密码";
-            return AuthOutcome::Cancelled;
-        }
-        report("authenticating");
-
-        uint8_t key[32] = {}, proof[32] = {};
-        mivaraPasswordKey(pw, as.salt, sizeof(as.salt), iter, key);
-        {
-            volatile char *v = &pw[0];
-            for (size_t i = 0; i < pw.size(); i++) v[i] = 0;
-        }
-        uint8_t bound[sizeof(KvmHello) + sizeof(HsRequestExtV3)];
-        std::memcpy(bound, &hello, sizeof(hello));
-        std::memcpy(bound + sizeof(hello), &ext, sizeof(ext));
-        mivaraAuthProof(key, MIVARA_AUTH_PURPOSE_STITCH, as.nonce, bound,
-                        sizeof(bound), proof);
-        std::memset(key, 0, sizeof(key));
-
-        HsAuthProof hp = {};
-        hp.magic = htonl(TVHA_MAGIC);
-        hp.version = htonl(TVHA_VERSION);
-        std::memcpy(hp.proof, proof, sizeof(proof));
-        std::memset(proof, 0, sizeof(proof));
-        if (!kvmSendAll(s, &hp, sizeof(hp))) {
-            why = "拼接授权应答发送失败";
-            return AuthOutcome::Transport;
-        }
-    } else {
-        report("waiting");
-    }
-
-    HsResponseV2 res = {};
-    const int rv = kvmRecvAllPoll(s, &res, sizeof(res), running, 35000);
-    if (rv == 0) {
-        why = (mode == AUTH_MODE_MANUAL)
-                  ? "对方未在 30 秒内确认拼接请求"
-                  : "对方未在 35 秒内回应拼接授权";
-        return AuthOutcome::Transport;
-    }
-    if (rv < 0) {
-        why = "拼接授权过程中连接已断开";
-        return AuthOutcome::Transport;
-    }
-    if (ntohl(res.magic) != TVHS_MAGIC || ntohl(res.version) != TVHS_VERSION) {
-        why = "拼接授权应答无效";
-        return AuthOutcome::Protocol;
-    }
-    status = ntohl(res.status);
-    return status == HS_OK ? AuthOutcome::Ok : AuthOutcome::Status;
-}
 
 } /* namespace */
 
@@ -2587,7 +2189,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
     KvmReply reply = {};
     uint32_t status = KVM_ERR_BUSY;
     for (int attempt = 0; attempt < 2; attempt++) {
-        g_sock = connectTimeout(peer_ip, peer_port, running, 5000);
+        g_sock = kvmConnectTimeout(peer_ip, peer_port, running, 5000);
         if (g_sock == KVM_INVALID_SOCK) {
             /* connectTimeout also fails when the owner cleared *running mid-
              * connect; that is a stop, not a connection error. */
@@ -2748,7 +2350,7 @@ int kvmRunController(const char *peer_ip, int peer_port, int side,
         if (ao != AuthOutcome::Ok) {
             if (auth && auth->report && ao != AuthOutcome::Cancelled)
                 auth->report("cancelled", nullptr, auth->ctx);
-            if (ao == AuthOutcome::Status) kvmAuthErrorText(auth_status, why);
+            if (ao == AuthOutcome::Rejected) kvmAuthErrorText(auth_status, why);
             if (running.load()) emitStatError(why);
             kvmClose(g_sock);
             g_sock = KVM_INVALID_SOCK;
@@ -3225,8 +2827,12 @@ struct HeldInput {
     bool key_ext[256] = {};
     bool btn[8] = {};
 };
+/* Only one target session runs at a time (kvm_target.cpp enforces it), so a
+ * single held-input table is enough. releaseAll() clears it. */
+static HeldInput g_held;
 
-static void injectMove(int x, int y, uint32_t w, uint32_t h)
+static void winInjectMove(int x, int y, uint32_t w, uint32_t h,
+                          int sx, int sy)
 {
     INPUT in = {};
     in.type = INPUT_MOUSE;
@@ -3237,9 +2843,12 @@ static void injectMove(int x, int y, uint32_t w, uint32_t h)
     in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
                     MOUSEEVENTF_VIRTUALDESK;
     SendInput(1, &in, sizeof(in));
+    /* The ping-pong: the target-side ghost tracks the injected cursor, which
+     * is always in the target's virtual-desktop coordinates. */
+    ghostMove(sx + x, sy + y);
 }
 
-static void injectButton(uint32_t btn, bool down, HeldInput &held)
+static void winInjectButton(uint32_t btn, bool down)
 {
     if (btn < 1 || btn > 5) return;
     INPUT in = {};
@@ -3255,10 +2864,10 @@ static void injectButton(uint32_t btn, bool down, HeldInput &held)
         break;
     }
     SendInput(1, &in, sizeof(in));
-    held.btn[btn] = down;
+    g_held.btn[btn] = down;
 }
 
-static void injectWheel(int delta, bool horizontal)
+static void winInjectWheel(int delta, bool horizontal)
 {
     INPUT in = {};
     in.type = INPUT_MOUSE;
@@ -3267,8 +2876,7 @@ static void injectWheel(int delta, bool horizontal)
     SendInput(1, &in, sizeof(in));
 }
 
-static void injectKey(uint32_t down, uint32_t vk, uint32_t scan, bool ext,
-                      HeldInput &held)
+static void winInjectKey(bool down, uint32_t vk, uint32_t scan, bool ext)
 {
     INPUT in = {};
     in.type = INPUT_KEYBOARD;
@@ -3283,30 +2891,31 @@ static void injectKey(uint32_t down, uint32_t vk, uint32_t scan, bool ext,
     if (!down) in.ki.dwFlags |= KEYEVENTF_KEYUP;
     SendInput(1, &in, sizeof(in));
     if (vk < 256) {
-        held.key[vk] = (down != 0);
+        g_held.key[vk] = down;
         if (down) {
-            held.key_scan[vk] = (WORD)(scan & 0xFFFF);
-            held.key_ext[vk] = ext;
+            g_held.key_scan[vk] = (WORD)(scan & 0xFFFF);
+            g_held.key_ext[vk] = ext;
         }
     }
 }
 
-static void releaseAll(HeldInput &held)
+static void winReleaseAll()
 {
     for (int b = 1; b < 8; b++)
-        if (held.btn[b]) injectButton((uint32_t)b, false, held);
+        if (g_held.btn[b]) winInjectButton((uint32_t)b, false);
     for (int vk = 0; vk < 256; vk++) {
-        if (!held.key[vk]) continue;
+        if (!g_held.key[vk]) continue;
         /* Replay the key-up with the stored scan code. Fall back to the
          * VK mapping only for entries created before the first down. */
-        WORD scan = held.key_scan[vk];
-        bool ext = held.key_ext[vk];
+        WORD scan = g_held.key_scan[vk];
+        bool ext = g_held.key_ext[vk];
         if (!scan) {
             scan = (WORD)MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
             ext = isExtendedVk((DWORD)vk);
         }
-        injectKey(0, (uint32_t)vk, scan, ext, held);
+        winInjectKey(false, (uint32_t)vk, scan, ext);
     }
+    g_held = HeldInput{};
 }
 
 /* ── drag ghost overlay (visual only) ──────────────────────────────────────
@@ -3736,91 +3345,6 @@ static void ghostEnd()
     }
 }
 
-struct HeartbeatState {
-    bool enabled = false;
-    ULONGLONG last_rx = 0;
-    ULONGLONG next_tx = 0;
-    /* Why the receive loop ended, for the target's session-end log. Stable
-     * tokens: local_stop / deadline / heartbeat_timeout / ping_send_error /
-     * peer_closed / recv_error. */
-    const char *reason = nullptr;
-    int err = 0;
-};
-
-/* deadline_ms == 0 means "until shutdown/EOF"; used for the hello so a peer
- * that connects and stays silent cannot pin the only KVM session slot.
- * ULONGLONG (GetTickCount64) rather than DWORD: a receiver can run for weeks
- * and a 49-day tick wrap must not stretch a deadline. */
-static bool recvAllRunning(kvm_sock_t s, void *buf, size_t len,
-                           std::atomic<bool> &running,
-                           ULONGLONG deadline_ms = 0,
-                           HeartbeatState *hb = nullptr,
-                           size_t *got = nullptr,
-                           bool *timed_out = nullptr,
-                           std::mutex *tx = nullptr)
-{
-    char *p = (char *)buf;
-    size_t off = 0;
-    const ULONGLONG start = GetTickCount64();
-    ULONGLONG last_iter = start;
-    const auto finish = [&](bool ok, bool deadline) {
-        if (got) *got = off;
-        if (timed_out) *timed_out = deadline;
-        return ok;
-    };
-    const auto fail = [&](const char *why, int err) {
-        if (hb) {
-            hb->reason = why;
-            hb->err = err;
-        }
-        return finish(false, false);
-    };
-    while (off < len) {
-        const ULONGLONG now = GetTickCount64();
-        /* Suspend/starve: the process, not the peer, was frozen. Restart the
-         * heartbeat clock; a socket that really died still errors below. */
-        if (hb && hb->enabled && now - last_iter > 3000) {
-            hb->last_rx = now;
-            hb->next_tx = now + KVM_HEARTBEAT_INTERVAL_MS;
-        }
-        last_iter = now;
-        if (!running.load()) return fail("local_stop", 0);
-        if (deadline_ms && now - start > deadline_ms) {
-            if (hb) hb->reason = "deadline";
-            return finish(false, true);
-        }
-        if (hb && hb->enabled) {
-            if (now - hb->last_rx >= KVM_HEARTBEAT_TIMEOUT_MS)
-                return fail("heartbeat_timeout", 0);
-            if (now >= hb->next_tx) {
-                KvmEvent ping = {};
-                ping.type = htonl(KVM_EV_PING);
-                bool sent;
-                if (tx) {
-                    /* Same connection as the reverse watcher's icon frames;
-                     * keep whole 16-byte events from interleaving. */
-                    std::lock_guard<std::mutex> lk(*tx);
-                    sent = kvmSendAll(s, &ping, sizeof(ping));
-                } else {
-                    sent = kvmSendAll(s, &ping, sizeof(ping));
-                }
-                if (!sent) return fail("ping_send_error", WSAGetLastError());
-                hb->next_tx = now + KVM_HEARTBEAT_INTERVAL_MS;
-            }
-        }
-        int n = recv(s, p + off, (int)(len - off), 0);
-        if (n == 0) return fail("peer_closed", 0);
-        if (n < 0) {
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
-            return fail("recv_error", err);
-        }
-        if (hb) hb->last_rx = GetTickCount64();
-        off += (size_t)n;
-    }
-    return finish(true, false);
-}
-
 /* Dismiss the consent box as if its default button (No) was clicked.
  *
  * Posting WM_CLOSE (or WM_SYSCOMMAND/SC_CLOSE) to a MessageBox does NOT
@@ -3852,33 +3376,6 @@ enum ConsentResult {
     CONSENT_CANCELLED,  /* controller disconnected / local shutdown */
     CONSENT_PROMPT_FAILED /* MessageBoxW returned 0: no human was asked */
 };
-
-/* Non-blocking check for a peer that has already closed (or reset) the
- * connection. Used before creating the topmost dialog, so a peer that sends a
- * hello and immediately hangs up cannot make the box flash on screen. */
-static bool peerClosed(kvm_sock_t client)
-{
-    /* Drain (rather than MSG_PEEK) so a FIN queued behind protocol-violating
-     * bytes is still seen; nothing legitimate arrives before the reply. The
-     * loop is bounded so a peer that keeps sending cannot stall this check. */
-    char sink[256];
-    for (int i = 0; i < 8; i++) {
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(client, &rd);
-        struct timeval zero = {0, 0};
-        if (select(0, &rd, nullptr, nullptr, &zero) <= 0) return false;
-        if (!FD_ISSET(client, &rd)) return false;
-        const int n = recv(client, sink, sizeof(sink), 0);
-        if (n == 0) return true; /* orderly close / FIN */
-        if (n < 0) {
-            const int err = WSAGetLastError();
-            return err != WSAEWOULDBLOCK && err != WSAETIMEDOUT &&
-                   err != WSAEINTR;
-        }
-    }
-    return false;
-}
 
 /* Minimum spacing between two consent dialogs from ANY source. The per-IP
  * backoff only covers a repeat from the same address, and even the global
@@ -3917,30 +3414,30 @@ static ConsentResult askConsent(const std::string &peer_ip, int side,
     msg += L"，或按 Ctrl+Alt+Shift+Q 即可交还控制。\n\n"
            L"仅在你信任这台设备时选择「是」。";
 
-    if (!running.load() || peerClosed(client)) return CONSENT_CANCELLED;
+    if (!running.load() || kvmPeerClosed(client)) return CONSENT_CANCELLED;
 
     /* Global prompt pacing (see g_kvm_last_prompt); abort early if the peer
      * leaves while we wait, so a vanished peer never holds the slot. */
     if (g_kvm_last_prompt) {
-        ULONGLONG elapsed = GetTickCount64() - g_kvm_last_prompt;
+        uint64_t elapsed = kvmNowMs() - g_kvm_last_prompt;
         while (elapsed < KVM_PROMPT_INTERVAL_MS) {
-            if (!running.load() || peerClosed(client)) return CONSENT_CANCELLED;
-            const ULONGLONG left = KVM_PROMPT_INTERVAL_MS - elapsed;
-            Sleep(left < 50 ? (DWORD)left : 50);
-            elapsed = GetTickCount64() - g_kvm_last_prompt;
+            if (!running.load() || kvmPeerClosed(client)) return CONSENT_CANCELLED;
+            const uint64_t left = KVM_PROMPT_INTERVAL_MS - elapsed;
+            kvmSleepMs(left < 50 ? (unsigned)left : 50);
+            elapsed = kvmNowMs() - g_kvm_last_prompt;
         }
     }
-    g_kvm_last_prompt = GetTickCount64();
+    g_kvm_last_prompt = kvmNowMs();
 
     const DWORD owner_tid = GetCurrentThreadId();
     std::atomic<bool> done{false};
     std::atomic<int> reason{0}; /* 0 = answered, 1 timeout, 2 peer, 3 shutdown */
     std::thread watcher([&] {
-        const ULONGLONG start = GetTickCount64();
+        const uint64_t start = kvmNowMs();
         int why = 0;
         while (!done.load()) {
             if (!running.load()) { why = 3; break; }
-            if (GetTickCount64() - start > 30000) { why = 1; break; }
+            if (kvmNowMs() - start > 30000) { why = 1; break; }
             fd_set rd;
             FD_ZERO(&rd);
             FD_SET(client, &rd);
@@ -3948,7 +3445,7 @@ static ConsentResult askConsent(const std::string &peer_ip, int side,
             const int sel = select(0, &rd, nullptr, nullptr, &tv);
             if (sel < 0) {
                 /* Don't spin if select itself fails on this socket. */
-                Sleep(100);
+                kvmSleepMs(100);
                 continue;
             }
             if (sel > 0 && FD_ISSET(client, &rd)) {
@@ -3970,12 +3467,12 @@ static ConsentResult askConsent(const std::string &peer_ip, int side,
         if (done.load()) return; /* the user answered it */
         reason = why ? why : 1;
         /* The box may not exist yet if we fire right at start-up; retry. */
-        const ULONGLONG give_up = GetTickCount64() + 3000;
+        const uint64_t give_up = kvmNowMs() + 3000;
         for (;;) {
             DismissCtx ctx{owner_tid, 0};
             EnumThreadWindows(owner_tid, dismissThreadDlg, (LPARAM)&ctx);
-            if (ctx.posted || GetTickCount64() >= give_up) return;
-            Sleep(50);
+            if (ctx.posted || kvmNowMs() >= give_up) return;
+            kvmSleepMs(50);
         }
     });
     const int r = MessageBoxW(nullptr, msg.c_str(), L"Mivara - 拼接请求",
@@ -3997,1250 +3494,394 @@ static ConsentResult askConsent(const std::string &peer_ip, int side,
     return CONSENT_PROMPT_FAILED;
 }
 
-/* Per-source throttles for the consent dialog. Keyed on the source address so
- * one hostile host cannot auto-deny (or prompt-flood) every other controller
- * on the LAN. A fixed table (no allocation, bounded memory) is enough: the
- * listener serves one connection at a time, so only the session thread ever
- * touches it.
- *
- *   deny_tick   — an explicit "No": silently refuse this source for 60 s.
- *   cancel_tick — the peer hung up before answering: delay the next prompt
- *                 for this source by a few seconds (not a refusal). A global
- *                 tick (g_kvm_last_cancel) applies the same delay to every
- *                 source, so rotating addresses cannot bypass it. */
-struct PeerThrottle {
-    std::string ip;
-    DWORD deny_tick = 0;
-    DWORD cancel_tick = 0;
-};
-static PeerThrottle g_kvm_peers[8];
-static unsigned g_kvm_peer_next = 0;
+/* ── Windows target ops ──────────────────────────────────────────────────── */
 
-/* Password failures on 8084 go through the process-wide per-source throttle
- * in auth.cpp, the same instance the 8081 handshake uses: alternating ports
- * must not grant two free budgets or two cooldowns. Those helpers serialise
- * access internally, so no local mutex or throttle instance may be kept here.
- * Only a real password-proof failure feeds this budget; the local handshake
- * abuse counter below is separate (an abandoned handshake is not a guess). */
-static const DWORD KVM_DENY_COOLDOWN_MS = 60000;
-static const DWORD KVM_CANCEL_BACKOFF_MS = 3000;
-
-/* The cancel backoff is ALSO global: the per-source table alone is bypassed by
- * a host that rotates source addresses, which would then re-prompt after only
- * the 1.5 s dialog pacing. One shared tick means any cancelled prompt delays
- * the next one regardless of where it comes from. */
-static ULONGLONG g_kvm_last_cancel = 0;
-
-static void noteCancel(ULONGLONG now)
+static bool winInit()
 {
-    g_kvm_last_cancel = now;
-}
-
-static PeerThrottle *peerThrottle(const std::string &ip, bool create)
-{
-    for (auto &p : g_kvm_peers)
-        if (!p.ip.empty() && p.ip == ip) return &p;
-    if (!create) return nullptr;
-    for (auto &p : g_kvm_peers) {
-        if (p.ip.empty()) {
-            p.ip = ip;
-            return &p;
-        }
-    }
-    /* Full: evict round-robin. Only a hostile host that keeps changing
-     * addresses can reach this. */
-    PeerThrottle &p = g_kvm_peers[g_kvm_peer_next++ % 8];
-    p = PeerThrottle{};
-    p.ip = ip;
-    return &p;
-}
-
-/* ── handshake budget and per-source admission ─────────────────────────────
- * kvmServiceRun() still serves one connection at a time (the session thread
- * stays responsive to everyone else with a busy reply), so an unauthenticated
- * peer that stalls would otherwise hold the only slot for the whole identity
- * or proof deadline. Every stage is bounded, the whole exchange has one
- * budget, and a source that keeps abandoning a handshake is refused early.
- * GetTickCount64 is used because a DWORD tick wraps after 49 days and would
- * make a long-running receiver misjudge a deadline. */
-static const ULONGLONG KVM_HELLO_TIMEOUT_MS = 3000;
-static const ULONGLONG KVM_IDENTITY_TIMEOUT_MS = 10000;
-/* The controller's password prompt allows 120 s, so the proof window must not
- * close earlier than that (the per-source admission and abandon cooldown, not
- * a short timeout, are what bound a hostile peer). */
-static const ULONGLONG KVM_PROOF_TIMEOUT_MS = 125000;
-static const ULONGLONG KVM_HANDSHAKE_BUDGET_MS = 140000;
-
-static const int KVM_HS_SLOTS = 8;
-static const int KVM_HS_MAX_PENDING_PER_IP = 1;   /* same source: one at a time */
-static const int KVM_HS_FREE_ABANDONS = 2;        /* tolerate transients first */
-static const ULONGLONG KVM_HS_COOLDOWN_BASE_MS = 2000;
-static const ULONGLONG KVM_HS_COOLDOWN_MAX_MS = 60000;
-
-struct HsEntry {
-    std::string ip;
-    int         pending = 0;
-    int         strikes = 0;
-    ULONGLONG   until = 0;   /* abuse-cooldown end (0 = none) */
-    ULONGLONG   last = 0;    /* last admission, for eviction */
-    ULONGLONG   last_success = 0; /* completed session; see hsRelease */
-};
-static HsEntry g_kvm_hs[KVM_HS_SLOTS];
-static unsigned g_kvm_hs_next = 0;
-static std::mutex g_kvm_hs_mtx;
-
-static HsEntry *hsFind(const std::string &ip)
-{
-    for (auto &e : g_kvm_hs)
-        if (!e.ip.empty() && e.ip == ip) return &e;
-    return nullptr;
-}
-
-/* Caller holds g_kvm_hs_mtx. Evicts the least recently used idle entry; an
- * entry with an unfinished handshake is never evicted. */
-static HsEntry *hsSlot(const std::string &ip)
-{
-    if (HsEntry *e = hsFind(ip)) return e;
-    for (auto &e : g_kvm_hs) {
-        if (e.ip.empty()) {
-            e.ip = ip;
-            return &e;
-        }
-    }
-    HsEntry *victim = nullptr;
-    for (auto &e : g_kvm_hs) {
-        if (e.pending > 0) continue;
-        if (!victim || e.last < victim->last) victim = &e;
-    }
-    if (!victim) victim = &g_kvm_hs[g_kvm_hs_next++ % KVM_HS_SLOTS];
-    *victim = HsEntry{};
-    victim->ip = ip;
-    return victim;
-}
-
-/* Admit one handshake from `ip`. False when the source is in its local abuse
- * cooldown or already has an unfinished handshake. */
-static bool hsAdmit(const std::string &ip)
-{
-    std::lock_guard<std::mutex> lk(g_kvm_hs_mtx);
-    HsEntry *e = hsSlot(ip);
-    const ULONGLONG now = GetTickCount64();
-    if (e->until) {
-        if (now < e->until) return false;
-        e->until = 0;
-        e->strikes = 0;
-    }
-    if (e->pending >= KVM_HS_MAX_PENDING_PER_IP) return false;
-    e->pending++;
-    e->last = now;
+    raiseThreadDpiAwareness();
     return true;
 }
 
-/* Release an admission. `abandoned` is only for a protocol-stage timeout/EOF
- * before authorization; a refusal, cancellation or claim failure must not
- * punish the source, and a completed authorization clears its strikes. */
-static void hsRelease(const std::string &ip, bool admitted, bool abandoned,
-                      bool success)
+static KvmApprovalResult winAskConsent(const std::string &ip, int side,
+                                       std::atomic<bool> &running,
+                                       kvm_sock_t client)
 {
-    /* A source that never reached admission and did not abandon anything
-     * (version mismatch, cross-mode busy) leaves no trace. */
-    if (!admitted && !abandoned && !success) return;
-    std::lock_guard<std::mutex> lk(g_kvm_hs_mtx);
-    HsEntry *e = hsSlot(ip);
-    if (admitted && e->pending > 0) e->pending--;
-    if (success) {
-        e->strikes = 0;
-        e->until = 0;
-        e->last_success = GetTickCount64();
-        return;
+    switch (askConsent(ip, side, running, client)) {
+    case CONSENT_YES:           return KVM_APPROVAL_ALLOW;
+    case CONSENT_NO:            return KVM_APPROVAL_DENY;
+    case CONSENT_TIMEOUT:       return KVM_APPROVAL_TIMEOUT;
+    case CONSENT_CANCELLED:     return KVM_APPROVAL_CANCELLED;
+    case CONSENT_PROMPT_FAILED: return KVM_APPROVAL_FAILED;
     }
-    if (!abandoned) return;
-    /* Abandons right after a completed session are a reconnect over a flaky
-     * link, not handshake abuse; punishing them turns a 20 s outage into a
-     * minute-long cooldown. */
-    if (e->last_success &&
-        GetTickCount64() - e->last_success < 60000)
-        return;
-    e->strikes++;
-    if (e->strikes > KVM_HS_FREE_ABANDONS) {
-        const int step = e->strikes - KVM_HS_FREE_ABANDONS - 1; /* 0,1,2... */
-        ULONGLONG cd = KVM_HS_COOLDOWN_BASE_MS << std::min(step, 5);
-        if (cd > KVM_HS_COOLDOWN_MAX_MS) cd = KVM_HS_COOLDOWN_MAX_MS;
-        e->until = GetTickCount64() + cd;
-    }
+    return KVM_APPROVAL_FAILED;
 }
 
-/* Milliseconds left in the whole-handshake budget; 0 = already spent. */
-static ULONGLONG hsRemaining(ULONGLONG start)
-{
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG elapsed = now >= start ? now - start : 0;
-    return elapsed >= KVM_HANDSHAKE_BUDGET_MS
-               ? 0 : KVM_HANDSHAKE_BUDGET_MS - elapsed;
-}
-
-/* recv bounded by both the stage limit and the remaining total budget. */
-static bool recvHandshake(kvm_sock_t s, void *buf, size_t len,
-                          std::atomic<bool> &running, ULONGLONG stage_ms,
-                          ULONGLONG start, size_t *got = nullptr,
-                          bool *timed_out = nullptr)
-{
-    const ULONGLONG left = hsRemaining(start);
-    if (left == 0) {
-        if (got) *got = 0;
-        if (timed_out) *timed_out = true;
-        return false;
-    }
-    const ULONGLONG wait = stage_ms < left ? stage_ms : left;
-    return recvAllRunning(s, buf, len, running, wait, nullptr, got, timed_out);
-}
-
-/* Releases the source's pending slot on every serveClient exit path. */
-struct HsGuard {
-    explicit HsGuard(const std::string &peer) : ip(peer) {}
-    ~HsGuard() { hsRelease(ip, admitted, abandoned, success); }
-
-    bool admit() { admitted = hsAdmit(ip); return admitted; }
-    void markAbandoned() { abandoned = true; }
-    void markSuccess() { success = true; }
-
-    std::string ip;
-    bool admitted = false;
-    bool abandoned = false;
-    bool success = false;
+/* Reverse (target → controller) drag copy: the same Medium-integrity
+ * stitchcap helper, placed on the edge that FACES the controller (the
+ * back-crossing edge). A watcher thread tells the controller when a reverse
+ * drag starts/cancels (KVM_EV_RDRAG), and once the OLE Drop fires it sends
+ * the captured files to the controller's own 8087 listener. */
+struct WinReverseState {
+    std::atomic<bool> run{false};
+    std::thread       watcher;
+    bool              cap_started = false;
 };
 
-/* Releases the process-wide session lease on every exit path after the claim
- * (HS_OK/metrics send failure, protocol error, session end). */
-struct SessionLeaseGuard {
-    MivaraSessionLease lease{};
-    bool held = false;
-    bool drop = false;
-    ~SessionLeaseGuard()
-    {
-        if (drop) dropGateClear(lease.epoch);
-        if (held) mivaraSessionRelease(lease);
-    }
-};
-
-static void serveClient(kvm_sock_t client, const std::string &peer_ip,
-                        std::atomic<bool> &running,
-                        const KvmTargetAuth *auth)
+static void *winSessionBegin(const KvmTargetGrant &grant,
+                             const std::string &peer_ip, kvm_sock_t client,
+                             const KvmTargetAuth *auth,
+                             std::atomic<bool> &running, std::mutex &tx)
 {
-    /* One budget covers hello + identity + proof; each stage additionally has
-     * its own (shorter) limit. A stalled client must not pin the port forever,
-     * and a controller that vanishes without a FIN must be detected (the
-     * session is idle whenever the user is not typing, so TCP has nothing else
-     * to time out). The guard releases this source's pending slot even when we
-     * return early. */
-    const ULONGLONG hs_start = GetTickCount64();
-    HsGuard hs(peer_ip);
+    (void)auth;
+    /* A fresh session never inherits a half-finished key/button state from
+     * the previous one. */
+    g_held = HeldInput{};
+    if (!grant.reverse_ok) return nullptr;
 
-    kvmSetTimeouts(client, 1000, 2000);
-    kvmEnableKeepAlive(client);
+    const int cap_side =
+        (grant.side == KVM_SIDE_LEFT) ? KVM_SIDE_RIGHT :
+        (grant.side == KVM_SIDE_RIGHT) ? KVM_SIDE_LEFT :
+        (grant.side == KVM_SIDE_TOP) ? KVM_SIDE_BOTTOM : KVM_SIDE_TOP;
 
-    KvmHello hello = {};
-    size_t got = 0;
-    bool timed_out = false;
-    if (!recvHandshake(client, &hello, sizeof(hello), running,
-                       KVM_HELLO_TIMEOUT_MS, hs_start, &got, &timed_out)) {
-        /* A bare TCP probe (the GUI tests the port that way) connects and
-         * closes without sending a byte; that is not an abandoned handshake
-         * and must not arm the cooldown, otherwise normal discovery would
-         * lock out the real controller. A partial hello or a source that
-         * stays silent until the deadline is a real abandonment. A local
-         * shutdown is not the peer's fault either. */
-        if (running.load() && (got > 0 || timed_out)) hs.markAbandoned();
-        return;
-    }
-
-    KvmReply reply = {};
-    reply.magic = htonl(KVM_MAGIC);
-    reply.version = htonl(KVM_VERSION);
-    reply.reserved = htonl((ntohl(hello.reserved[1]) & KVM_FEATURE_HEARTBEAT)
-                               ? KVM_FEATURE_HEARTBEAT : 0);
-
-    /* A v1 peer (or a foreign service) is refused before authorization, so an
-     * old client can never reach the event stream around the policy. */
-    if (ntohl(hello.magic) != KVM_MAGIC ||
-        ntohl(hello.version) != KVM_VERSION) {
-        reply.status = htonl(KVM_ERR_VERSION);
-        kvmSendAll(client, &reply, sizeof(reply));
-        return;
-    }
-
-    /* 8081 and 8084 share one process-wide session slot (auth.h). Refuse
-     * before asking for a password or showing a prompt: neither a video
-     * session nor a video handshake that already claimed the slot may be
-     * joined. HsResponseV2(HS_ERR_BUSY) is the cross-mode "receiving another
-     * connection" answer the controller understands. */
-    if (mivaraSessionOwner() != MIVARA_SESSION_NONE) {
-        kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
-        std::cout << "[kvm] request from " << peer_ip
-                  << " refused: another session is active\n" << std::flush;
-        return;
-    }
-
-    /* Same source: at most one unfinished handshake plus a local cooldown
-     * after repeated protocol-stage abandons. Keep the bare KvmReply so the
-     * controller retains its single 300 ms retry (a TVHS refusal ends it). */
-    if (!hs.admit()) {
-        reply.status = htonl(KVM_ERR_BUSY);
-        kvmSendAll(client, &reply, sizeof(reply));
-        std::cout << "[kvm] request from " << peer_ip
-                  << " refused: source busy or in handshake cooldown\n"
+    std::string why;
+    auto *st = new WinReverseState();
+    if (!dropHelperStart(cap_side, why)) {
+        std::cout << "[kvm] reverse capture unavailable: " << why << "\n"
                   << std::flush;
-        return;
+        delete st;
+        return nullptr;
     }
+    st->cap_started = true;
+    st->run = true;
 
-    PeerThrottle *throttle = peerThrottle(peer_ip, false);
-    if (throttle && throttle->deny_tick &&
-        (DWORD)(GetTickCount() - throttle->deny_tick) < KVM_DENY_COOLDOWN_MS) {
-        reply.status = htonl(KVM_ERR_DENIED);
-        kvmSendAll(client, &reply, sizeof(reply));
-        std::cout << "[kvm] request from " << peer_ip
-                  << " auto-declined (recent refusal)\n" << std::flush;
-        return;
-    }
+    std::vector<uint8_t> rev_token(grant.drop_token,
+                                   grant.drop_token + DROP_TOKEN_BYTES);
+    const uint32_t rev_port = grant.rev_port;
+    const bool drag_icon_ok = grant.drag_icon_ok;
+    const bool drag_image_ok = grant.drag_image_ok;
 
-    /* Where the peer sits relative to the controller (informational: it only
-     * tailors the approval text). The controller encodes side + 1 so a zeroed
-     * field (older build, or a raw KvmHello = {}) means "unspecified" rather
-     * than KVM_SIDE_LEFT; anything out of range falls back to the default. */
-    const uint32_t raw_side = ntohl(hello.reserved[0]);
-    const int side = (raw_side >= 1 && raw_side <= (uint32_t)KVM_SIDE_BOTTOM + 1)
-                         ? (int)raw_side - 1
-                         : (int)KVM_SIDE_RIGHT;
-
-    /* ══ 接收策略 (same one 8081 uses) ═══════════════════════════════════
-     * No hook means manual: the v1 native prompt is kept, but a caller that
-     * forgets the hooks must not expose an open desktop. */
-    MivaraAuthMode mode = MIVARA_AUTH_MANUAL;
-    uint8_t salt[16] = {}, hash[32] = {};
-    uint32_t iter = 0;
-    bool record_ok = false;
-    if (auth && auth->policy &&
-        !auth->policy(&mode, salt, hash, &iter, &record_ok, auth->ctx))
-        mode = MIVARA_AUTH_MANUAL;
-
-    if (mode == MIVARA_AUTH_PASSWORD && !record_ok) {
-        /* Fail closed: a missing/corrupt record is never a downgrade. */
-        kvmSendHsResponse(client, HS_ERR_AUTH_CONFIG, 0, 0);
-        std::cout << "[kvm] request from " << peer_ip
-                  << " refused: password record unusable\n" << std::flush;
-        return;
-    }
-
-    int sx, sy;
-    uint32_t sw, sh;
-    targetMetrics(sx, sy, sw, sh);
-
-    /* The process-wide slot is acquired before a manual prompt (so the human
-     * decision cannot be stolen by a video handshake that finishes first) or,
-     * for password/open, right before the grant. It is released on every exit
-     * path by the guard. */
-    SessionLeaseGuard lease;
-
-    if (mode != MIVARA_AUTH_OPEN) {
-        HsAuthStart as = {};
-        as.magic = htonl(TVHA_MAGIC);
-        as.version = htonl(TVHA_VERSION);
-        as.mode = htonl(mode == MIVARA_AUTH_PASSWORD ? AUTH_MODE_PASSWORD
-                                                     : AUTH_MODE_MANUAL);
-        as.kdf_iter = htonl(iter);
-        if (mode == MIVARA_AUTH_PASSWORD)
-            std::memcpy(as.salt, salt, sizeof(as.salt));
-        if (!mivaraRandomBytes(as.nonce, sizeof(as.nonce))) {
-            std::cout << "[kvm] request from " << peer_ip
-                      << " refused: no CSPRNG\n" << std::flush;
-            return;
-        }
-        if (!kvmSendAll(client, &as, sizeof(as))) return;
-
-        /* The identity frame arrives before any verdict so a manual prompt
-         * can name the device and a password proof can bind it. The sender
-         * sends it immediately, so a short stage limit is enough; the proof
-         * gets the long one because it waits for a typed password. Both are
-         * additionally bounded by what is left of the total budget. */
-        HsRequestExtV3 ext = {};
-        if (!recvHandshake(client, &ext, sizeof(ext), running,
-                           KVM_IDENTITY_TIMEOUT_MS, hs_start)) {
-            if (running.load()) hs.markAbandoned();
-            return;
-        }
-        if (ntohl(ext.magic) != TVHX_MAGIC ||
-            ntohl(ext.version) != TVHA_VERSION) {
-            kvmSendHsResponse(client, HS_ERR_VERSION, 0, 0);
-            return;
-        }
-        std::string device = kvmDeviceNameFromWire(ext);
-        if (device.empty()) device = peer_ip;
-        std::cout << "[kvm] stitch request from " << peer_ip << " (" << device
-                  << ", peer on the " << kvmSideKey(side) << ")\n" << std::flush;
-
-        if (mode == MIVARA_AUTH_PASSWORD) {
-            /* One process-wide budget shared with the 8081 handshake: a source
-             * cannot alternate ports for extra free guesses or a shorter
-             * cooldown. The helpers lock internally. */
-            const int wait_s = mivaraAuthThrottleRetryAfter(peer_ip);
-            if (wait_s > 0) {
-                kvmSendHsResponse(client, HS_ERR_AUTH, 0, 0);
-                std::cout << "[kvm] request from " << peer_ip
-                          << " throttled after failed passwords\n" << std::flush;
-                return;
-            }
-            HsAuthProof proof = {};
-            if (!recvHandshake(client, &proof, sizeof(proof), running,
-                               KVM_PROOF_TIMEOUT_MS, hs_start)) {
-                if (running.load()) hs.markAbandoned();
-                return;
-            }
-            if (ntohl(proof.magic) != TVHA_MAGIC ||
-                ntohl(proof.version) != TVHA_VERSION) {
-                mivaraAuthThrottleNoteAbuse(peer_ip);
-                kvmSendHsResponse(client, HS_ERR_AUTH, 0, 0);
-                return;
-            }
-            uint8_t bound[sizeof(KvmHello) + sizeof(HsRequestExtV3)];
-            std::memcpy(bound, &hello, sizeof(hello));
-            std::memcpy(bound + sizeof(hello), &ext, sizeof(ext));
-            uint8_t expect[32] = {};
-            /* The password itself never reaches this machine; the proof is
-             * domain-separated for 8084 (see auth.h). */
-            mivaraAuthProof(hash, MIVARA_AUTH_PURPOSE_STITCH, as.nonce, bound,
-                            sizeof(bound), expect);
-            if (!mivaraConstEq(expect, proof.proof, sizeof(expect))) {
-                mivaraAuthThrottleNoteFailure(peer_ip);
-                kvmSendHsResponse(client, HS_ERR_AUTH, 0, 0);
-                std::cout << "[kvm] request from " << peer_ip
-                          << " refused: bad password\n" << std::flush;
-                return;
-            }
-            mivaraAuthThrottleNoteSuccess(peer_ip);
-        } else {
-            /* Manual policy. Before opening a modal prompt, make sure the peer
-             * is still there: a controller that sent the identity frame and
-             * hung up must not hold the slot for the whole 30 s deadline. */
-            if (peerClosed(client)) {
-                std::cout << "[kvm] request from " << peer_ip
-                          << " cancelled before approval\n" << std::flush;
-                return;
-            }
-            /* Reserve the slot across the prompt: a video handshake that
-             * grants while the user is deciding must not swallow the result. */
-            if (!lease.held) {
-                if (!mivaraSessionClaim(MIVARA_SESSION_STITCH, 60000,
-                                        &lease.lease)) {
-                    kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
-                    std::cout << "[kvm] request from " << peer_ip
-                              << " refused: another session claimed the slot\n"
-                              << std::flush;
-                    return;
-                }
-                lease.held = true;
-            }
-            KvmApprovalResult verdict = KVM_APPROVAL_DENY;
-            if (auth && auth->approve) {
-                verdict = auth->approve(peer_ip.c_str(), device.c_str(),
-                                        (intptr_t)client, auth->ctx);
-            } else {
-                /* Native-prompt fallback (no GUI hooks): keep the v1 cancel
-                 * backoff so a peer that connects + closes cannot flash the
-                 * topmost dialog in a loop. */
-                DWORD backoff = 0;
-                if (throttle && throttle->cancel_tick) {
-                    const DWORD age =
-                        (DWORD)(GetTickCount() - throttle->cancel_tick);
-                    if (age < KVM_CANCEL_BACKOFF_MS)
-                        backoff = KVM_CANCEL_BACKOFF_MS - age;
-                }
-                if (g_kvm_last_cancel) {
-                    const ULONGLONG age = GetTickCount64() - g_kvm_last_cancel;
-                    if (age < KVM_CANCEL_BACKOFF_MS &&
-                        (DWORD)(KVM_CANCEL_BACKOFF_MS - age) > backoff)
-                        backoff = (DWORD)(KVM_CANCEL_BACKOFF_MS - age);
-                }
-                while (backoff > 0) {
-                    if (!running.load() || peerClosed(client)) {
-                        noteCancel(GetTickCount64());
-                        if (PeerThrottle *p = peerThrottle(peer_ip, true))
-                            p->cancel_tick = GetTickCount();
-                        return;
-                    }
-                    const DWORD slice = backoff < 100 ? backoff : 100;
-                    Sleep(slice);
-                    backoff -= slice;
-                }
-                const ConsentResult cr =
-                    askConsent(peer_ip, side, running, client);
-                if (cr == CONSENT_CANCELLED) {
-                    noteCancel(GetTickCount64());
-                    if (PeerThrottle *p = peerThrottle(peer_ip, true))
-                        p->cancel_tick = GetTickCount();
-                    std::cout << "[kvm] request from " << peer_ip
-                              << " cancelled before consent\n" << std::flush;
-                    return;
-                }
-                switch (cr) {
-                case CONSENT_YES: verdict = KVM_APPROVAL_ALLOW; break;
-                case CONSENT_NO: verdict = KVM_APPROVAL_DENY; break;
-                case CONSENT_TIMEOUT: verdict = KVM_APPROVAL_TIMEOUT; break;
-                case CONSENT_CANCELLED: verdict = KVM_APPROVAL_CANCELLED; break;
-                case CONSENT_PROMPT_FAILED:
-                    verdict = KVM_APPROVAL_FAILED;
-                    break;
-                }
-            }
-
-            /* Handle the verdict value by value. Folding timeout, cancel and
-             * prompt failure into "deny" would arm the 60 s cooldown for a
-             * request that nobody actually refused. */
-            switch (verdict) {
-            case KVM_APPROVAL_ALLOW:
-                break;
-            case KVM_APPROVAL_DENY:
-                /* Only an explicit human "No" starts the per-peer cooldown. */
-                if (PeerThrottle *p = peerThrottle(peer_ip, true))
-                    p->deny_tick = GetTickCount();
-                kvmSendHsResponse(client, HS_ERR_DENIED, 0, 0);
-                std::cout << "[kvm] request " << peer_ip << " declined\n"
-                          << std::flush;
-                return;
-            case KVM_APPROVAL_TIMEOUT:
-                /* An unanswered prompt is not a refusal: no cooldown. */
-                kvmSendHsResponse(client, HS_ERR_AUTH_TIMEOUT, 0, 0);
-                std::cout << "[kvm] request " << peer_ip << " timed out\n"
-                          << std::flush;
-                return;
-            case KVM_APPROVAL_CANCELLED:
-                /* Peer hung up or the receiver is stopping. Not a refusal and
-                 * not the peer's fault; the socket is usually already gone, so
-                 * skip the reply and free the slot now (the guard does it on
-                 * return) instead of waiting out the 30 s deadline. */
-                std::cout << "[kvm] request " << peer_ip
-                          << " cancelled during approval\n" << std::flush;
-                return;
-            case KVM_APPROVAL_FAILED:
-                /* No human was asked because the prompt could not be created.
-                 * Log the real cause but answer like a refusal; a local
-                 * failure must not arm the peer cooldown. */
-                kvmSendHsResponse(client, HS_ERR_DENIED, 0, 0);
-                std::cout << "[kvm] request " << peer_ip
-                          << " denied: approval prompt failed\n" << std::flush;
-                return;
-            case KVM_APPROVAL_BUSY:
-                /* Another device is already asking the local user. Answer
-                 * "busy" instead of dropping the request silently; not a
-                 * refusal, so no cooldown. */
-                kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
-                std::cout << "[kvm] request " << peer_ip
-                          << " refused: another approval is pending\n"
-                          << std::flush;
-                return;
-            default:
-                kvmSendHsResponse(client, HS_ERR_DENIED, 0, 0);
-                std::cout << "[kvm] request " << peer_ip
-                          << " denied: unknown approval verdict\n" << std::flush;
-                return;
-            }
-        }
-    }
-
-    /* Authorization succeeded (or the policy is open). Password/open claim
-     * here; manual already holds the slot from before its prompt. Promote
-     * before telling the controller it may start. */
-    if (!lease.held) {
-        if (!mivaraSessionClaim(MIVARA_SESSION_STITCH, 30000, &lease.lease)) {
-            kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
-            std::cout << "[kvm] request from " << peer_ip
-                      << " refused: another session claimed the slot\n"
-                      << std::flush;
-            return;
-        }
-        lease.held = true;
-    }
-    if (!mivaraSessionPromote(lease.lease)) {
-        /* The claim expired while we were authorizing; the destructor releases
-         * whatever is left, and the caller is told the slot is busy. */
-        kvmSendHsResponse(client, HS_ERR_BUSY, 0, 0);
-        std::cout << "[kvm] request from " << peer_ip
-                  << " refused: session claim expired\n" << std::flush;
-        return;
-    }
-    hs.markSuccess();
-
-    /* File drop is a separate 8085 service and a separate opt-in. Install its
-     * token before the KVM reply goes out, so a controller that dials 8085
-     * immediately cannot race the gate. The guard clears it on every exit. */
-    bool drop_ok = (auth &&
-                    auth->accept_files.load(std::memory_order_relaxed) != 0) &&
-                   dropServiceStatus().state == 1 &&
-                   (ntohl(hello.reserved[1]) & KVM_FEATURE_FILE_DROP) != 0;
-    /* Reverse (this machine → controller): independent of the forward gate —
-     * it needs OUR file_drop_send, the 8085 listener and the controller's
-     * advertised REVERSE bit, not file_drop_accept. */
-    bool reverse_ok =
-        (auth && auth->file_send.load(std::memory_order_relaxed) != 0) &&
-        dropServiceStatus().state == 1 &&
-        (ntohl(hello.reserved[1]) & KVM_FEATURE_REVERSE_DROP) != 0;
-    /* The session token is needed for EITHER direction: a reverse-only session
-     * (drop_ok = false) must still get a real random token, otherwise both
-     * sides would end up with an all-zero token and the 8085 gate would be no
-     * protection at all. */
-    uint8_t drop_token[DROP_TOKEN_BYTES] = {};
-    const bool need_token = drop_ok || reverse_ok;
-    if (need_token && !mivaraRandomBytes(drop_token, sizeof(drop_token))) {
-        drop_ok = false;
-        reverse_ok = false;
-    }
-    if (drop_ok) {
-        if (dropGateInstall(drop_token, lease.lease.epoch)) lease.drop = true;
-        else drop_ok = false;
-    }
-    uint32_t feat = (ntohl(hello.reserved[1]) & KVM_FEATURE_HEARTBEAT)
-                        ? KVM_FEATURE_HEARTBEAT : 0u;
-    if (drop_ok) feat |= KVM_FEATURE_FILE_DROP;
-    if (reverse_ok) feat |= KVM_FEATURE_REVERSE_DROP;
-    /* Echo the icon capability only to a controller that advertised it: an
-     * older controller deletes the session on an unknown event type. */
-    if (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_ICON)
-        feat |= KVM_FEATURE_DRAG_ICON;
-    if (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_IMAGE)
-        feat |= KVM_FEATURE_DRAG_IMAGE;
-    reply.reserved = htonl(feat);
-
-    if (mode != MIVARA_AUTH_OPEN) {
-        if (!kvmSendHsResponse(client, HS_OK, sw, sh)) return;
-    }
-
-    reply.status = htonl(KVM_OK);
-    reply.screen_x = (int32_t)htonl((uint32_t)sx);
-    reply.screen_y = (int32_t)htonl((uint32_t)sy);
-    reply.screen_w = htonl(sw);
-    reply.screen_h = htonl(sh);
-    HeartbeatState hb;
-    hb.enabled = (ntohl(reply.reserved) & KVM_FEATURE_HEARTBEAT) != 0;
-    hb.last_rx = GetTickCount64();
-    hb.next_tx = hb.last_rx + KVM_HEARTBEAT_INTERVAL_MS;
-    if (!kvmSendAll(client, &reply, sizeof(reply))) {
-        mivaraSecureZero(drop_token, sizeof(drop_token));
-        return;
-    }
-
-    /* Fixed 1 + 8 event sequence: the controller reads it before it starts
-     * drainLoop(), so the 16-byte event parser never sees a variable frame.
-     * Sent for EITHER direction: a reverse-only session needs the token too. */
-    if (drop_ok || reverse_ok) {
-        KvmEvent info = {};
-        info.type = htonl(KVM_EV_DROP_INFO);
-        info.a = htonl(0x4D564B58u);   /* 'MVKX' marker */
-        info.b = htonl(1u);
-        info.c = htonl(8u);
-        if (!kvmSendAll(client, &info, sizeof(info))) {
-            mivaraSecureZero(drop_token, sizeof(drop_token));
-            return;
-        }
-        for (int i = 0; i < 8; i++) {
-            uint32_t word = 0;
-            std::memcpy(&word, drop_token + i * 4, 4);
+    st->watcher = std::thread([&, client, peer_ip, rev_token, rev_port,
+                               drag_icon_ok, drag_image_ok, st] {
+        bool announced = false;
+        bool name_sent = false;
+        bool icon_tried = false;
+        bool image_sent = false;
+        uint64_t announced_tick = 0;
+        uint64_t name_deadline = 0;
+        auto sendRDrag = [&](uint32_t on) -> bool {
             KvmEvent ev = {};
-            ev.type = htonl(KVM_EV_DROP_INFO);
-            ev.a = htonl((uint32_t)i);
-            ev.b = htonl(word);
-            if (!kvmSendAll(client, &ev, sizeof(ev))) {
-                mivaraSecureZero(drop_token, sizeof(drop_token));
-                return;
+            ev.type = htonl(KVM_EV_RDRAG);
+            ev.a = htonl(on);
+            std::lock_guard<std::mutex> lk(tx);
+            return kvmSendAll(client, &ev, sizeof(ev));
+        };
+        auto sendDragInfo = [&](const std::string &first,
+                                uint32_t count) -> bool {
+            KvmEvent info = {};
+            info.type = htonl(KVM_EV_DRAG_INFO);
+            info.a = htonl(1u);
+            info.b = htonl(count);
+            info.c = htonl(first.empty() ? 0u : 4u);
+            {
+                std::lock_guard<std::mutex> lk(tx);
+                if (!kvmSendAll(client, &info, sizeof(info)))
+                    return false;
             }
+            if (first.empty()) return true;
+            std::string text = first;
+            const size_t max_bytes = 4 * 12;
+            if (text.size() > max_bytes) {
+                size_t cut = max_bytes;
+                while (cut > 0 && ((unsigned char)text[cut] & 0xC0) == 0x80)
+                    cut--;
+                text.resize(cut);
+            }
+            bool ok = true;
+            for (int i = 0; i < 4 && ok; i++) {
+                char chunk[12] = {};
+                const size_t off = (size_t)i * 12;
+                if (off < text.size())
+                    std::memcpy(chunk, text.data() + off,
+                                std::min<size_t>(12, text.size() - off));
+                KvmEvent t = {};
+                t.type = htonl(KVM_EV_DRAG_TEXT);
+                std::memcpy(&t.a, chunk, 4);
+                std::memcpy(&t.b, chunk + 4, 4);
+                std::memcpy(&t.c, chunk + 8, 4);
+                std::lock_guard<std::mutex> lk(tx);
+                ok = kvmSendAll(client, &t, sizeof(t));
+            }
+            return ok;
+        };
+        auto sendDragEnd = [&]() -> bool {
+            KvmEvent end = {};
+            end.type = htonl(KVM_EV_DRAG_INFO);   /* a=0: hide */
+            std::lock_guard<std::mutex> lk(tx);
+            return kvmSendAll(client, &end, sizeof(end));
+        };
+        /* Bounded extraction: a provider on a dead/cloud path must not delay
+         * the drop check or the session join. */
+        auto trySendIcon = [&]() -> bool {
+            if (!drag_icon_ok || icon_tried || image_sent) return true;
+            std::string path;
+            if (!dropHelperFirstFilePath(path)) return true;
+            icon_tried = true;   /* one attempt per drag */
+            DragIconData icon;
+            if (!dragIconExtractTimed(path, icon, 250)) return true;
+            return dragIconSendDirect(client, icon, tx);
+        };
+        /* The source helper publishes the drag image together with the file
+         * list (before FILES_END), so retry until it exists. */
+        auto trySendImage = [&]() -> bool {
+            if (!drag_image_ok || image_sent) return true;
+            DropDragImage img;
+            if (!dropHelperTakeDragImage(img) || !img.valid()) return true;
+            image_sent = true;
+            return dragImageSendDirect(client, img, tx);
+        };
+        while (st->run.load() && running.load()) {
+            const bool seen = dropHelperDragSeen();
+            const bool live = dropHelperDragLive();
+            const bool pending = dropHelperDragPending();
+            const bool dropped = dropHelperDropped();
+            const uint64_t now = kvmNowMs();
+
+            if (seen && !announced) {
+                announced = true;
+                announced_tick = now;
+                name_sent = false;
+                icon_tried = false;
+                image_sent = false;
+                /* The helper publishes CF_HDROP only on FILES_END, which can
+                 * be seconds after DRAG; bound the wait so a wedged capture
+                 * cannot suppress back-crossing for the whole session. */
+                name_deadline = now + DRAG_CAPTURE_HARD_MS;
+                if (!sendRDrag(1)) break;
+                /* Tell the controller what is travelling so it can draw the
+                 * same ghost next to its own cursor. */
+                std::string first;
+                dropHelperFirstFileName(first);
+                if (!sendDragInfo(first, (uint32_t)dropHelperFileCount()))
+                    break;
+                name_sent = !first.empty();
+                /* The real image is already captured and cheaper to forward
+                 * than extracting an icon, so try it first. */
+                if (!trySendImage()) break;
+                if (!trySendIcon()) break;
+            }
+
+            /* FILES_END landed after the first poll (slow CF_HDROP render):
+             * send a fresh header so the controller replaces the placeholder
+             * name and can show the real icon. */
+            if (announced && !name_sent && live) {
+                std::string first;
+                dropHelperFirstFileName(first);
+                if (!first.empty()) {
+                    if (!sendDragInfo(first,
+                                      (uint32_t)dropHelperFileCount()))
+                        break;
+                    name_sent = true;
+                }
+            }
+            if (announced && !trySendImage()) break;
+            if (announced && !trySendIcon()) break;
+
+            /* NODRAG leaves drag_seen sticky (the target has no local
+             * mouseProc to reset it), so clear it here; otherwise the next
+             * reverse drag would never be announced. 100 ms of slack: the
+             * helper stores drag_seen before drag_pending, and NODRAG can
+             * otherwise look like an instant cancel on the same poll. */
+            const bool cancelled =
+                announced && !live && !pending && !dropped &&
+                now - announced_tick >= 100;
+            const bool stalled =
+                announced && !live && !dropped && now > name_deadline;
+            if (cancelled || stalled) {
+                announced = false;
+                name_sent = false;
+                if (!sendRDrag(0)) break;
+                if (!sendDragEnd()) break;
+                dropHelperDiscard();
+            }
+            if (!seen && announced) {
+                announced = false;
+                if (!sendRDrag(0)) break;
+                KvmEvent end = {};
+                end.type = htonl(KVM_EV_DRAG_INFO);   /* a=0: hide */
+                std::lock_guard<std::mutex> lk(tx);
+                if (!kvmSendAll(client, &end, sizeof(end))) break;
+            }
+            if (dropHelperDragLive() && dropHelperDropped()) {
+                std::vector<std::string> files;
+                if (dropHelperTakeFiles(files) && !files.empty()) {
+                    announced = false;
+                    name_sent = false;
+                    if (!sendRDrag(0)) break;
+                    if (!sendDragEnd()) break;
+                    DropOptions opt;
+                    opt.peer_ip = peer_ip.c_str();
+                    opt.port = (uint16_t)rev_port;
+                    opt.flags = DROP_FLAG_REVERSE;
+                    opt.transfer_id =
+                        (uint32_t)(kvmNowMs() ^
+                                   (uint64_t)GetCurrentProcessId());
+                    std::cout << "[drop] reverse transfer -> "
+                              << peer_ip << ":" << rev_port << "\n"
+                              << std::flush;
+                    /* Release point is resolved by the CONTROLLER from its
+                     * own cursor, so x/y stay unused here. */
+                    /* Session-scoped liveness, not the receiver's
+                     * process-wide flag: when the 8084 session dies, teardown
+                     * must be able to abort an in-flight reverse copy and
+                     * free the single-session slot. */
+                    const DropResult r =
+                        dropSendFiles(opt, files, rev_token.data(), st->run);
+                    std::cout << "[drop] reverse transfer to " << peer_ip
+                              << " status=" << r.status
+                              << " committed=" << r.committed
+                              << " failed=" << r.failed
+                              << (r.message.empty()
+                                      ? "" : " msg=" + r.message)
+                              << "\n" << std::flush;
+                }
+                dropHelperDiscard();
+            }
+            kvmSleepMs(20);
         }
+    });
+    return st;
+}
+
+static void winSessionEnd(void *p)
+{
+    auto *st = (WinReverseState *)p;
+    if (st) {
+        st->run = false;
+        if (st->watcher.joinable()) st->watcher.join();
+        if (st->cap_started) dropHelperStop();
+        delete st;
     }
-    std::vector<uint8_t> rev_token;
-    if (reverse_ok) rev_token.assign(drop_token, drop_token + DROP_TOKEN_BYTES);
-    mivaraSecureZero(drop_token, sizeof(drop_token));
-
-    /* ── reverse (this machine → controller) drag copy ─────────────────────
-     * The same Medium-integrity stitchcap helper, placed on the edge that
-     * FACES the controller (the back-crossing edge). A watcher thread tells
-     * the controller when a reverse drag starts/cancels (KVM_EV_RDRAG), and
-     * once the OLE Drop fires it sends the captured files to the controller's
-     * own 8085 listener. rev_token was copied before drop_token was zeroed. */
-    std::mutex tx_mtx;
-    std::atomic<bool> reverse_session{false};
-    std::thread reverse_watcher;
-    bool reverse_cap_started = false;
-    /* Where the controller's own reverse listener lives (its KvmHello carries
-     * it in reserved[1] bits 16..31). 0 => a pre-8087 peer, use the default. */
-    uint32_t rev_port = ntohl(hello.reserved[1]) >> 16;
-    if (rev_port < 1 || rev_port > 65535u) rev_port = (uint32_t)DROP_PORT;
-    /* Only talk icon frames to a controller that advertised the capability;
-     * an older controller would treat them as a protocol error and drop the
-     * session. */
-    const bool drag_icon_ok =
-        (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_ICON) != 0;
-    const bool drag_image_ok =
-        (ntohl(hello.reserved[1]) & KVM_FEATURE_DRAG_IMAGE) != 0;
-
-    std::cout << "[kvm] stitch session started (" << sw << "x" << sh
-              << "); the peer now controls this desktop\n" << std::flush;
-
-    if (reverse_ok) {
-        /* The edge that faces the controller (the back-crossing edge). */
-        const int cap_side =
-            (side == KVM_SIDE_LEFT) ? KVM_SIDE_RIGHT :
-            (side == KVM_SIDE_RIGHT) ? KVM_SIDE_LEFT :
-            (side == KVM_SIDE_TOP) ? KVM_SIDE_BOTTOM : KVM_SIDE_TOP;
-        std::string why;
-        if (dropHelperStart(cap_side, why)) {
-            reverse_cap_started = true;
-            reverse_session = true;
-            reverse_watcher = std::thread([&, client, peer_ip, rev_token,
-                                           rev_port, drag_icon_ok] {
-                bool announced = false;
-                bool name_sent = false;
-                bool icon_tried = false;
-                bool image_sent = false;
-                ULONGLONG announced_tick = 0;
-                ULONGLONG name_deadline = 0;
-                auto sendRDrag = [&](uint32_t on) -> bool {
-                    KvmEvent ev = {};
-                    ev.type = htonl(KVM_EV_RDRAG);
-                    ev.a = htonl(on);
-                    std::lock_guard<std::mutex> lk(tx_mtx);
-                    return kvmSendAll(client, &ev, sizeof(ev));
-                };
-                auto sendDragInfo = [&](const std::string &first,
-                                        uint32_t count) -> bool {
-                    KvmEvent info = {};
-                    info.type = htonl(KVM_EV_DRAG_INFO);
-                    info.a = htonl(1u);
-                    info.b = htonl(count);
-                    info.c = htonl(first.empty() ? 0u : 4u);
-                    {
-                        std::lock_guard<std::mutex> lk(tx_mtx);
-                        if (!kvmSendAll(client, &info, sizeof(info)))
-                            return false;
-                    }
-                    if (first.empty()) return true;
-                    std::string text = first;
-                    const size_t max_bytes = 4 * 12;
-                    if (text.size() > max_bytes) {
-                        size_t cut = max_bytes;
-                        while (cut > 0 &&
-                               ((unsigned char)text[cut] & 0xC0) == 0x80)
-                            cut--;
-                        text.resize(cut);
-                    }
-                    bool ok = true;
-                    for (int i = 0; i < 4 && ok; i++) {
-                        char chunk[12] = {};
-                        const size_t off = (size_t)i * 12;
-                        if (off < text.size())
-                            std::memcpy(chunk, text.data() + off,
-                                        std::min<size_t>(
-                                            12, text.size() - off));
-                        KvmEvent t = {};
-                        t.type = htonl(KVM_EV_DRAG_TEXT);
-                        std::memcpy(&t.a, chunk, 4);
-                        std::memcpy(&t.b, chunk + 4, 4);
-                        std::memcpy(&t.c, chunk + 8, 4);
-                        std::lock_guard<std::mutex> lk(tx_mtx);
-                        ok = kvmSendAll(client, &t, sizeof(t));
-                    }
-                    return ok;
-                };
-                auto sendDragEnd = [&]() -> bool {
-                    KvmEvent end = {};
-                    end.type = htonl(KVM_EV_DRAG_INFO);   /* a=0: hide */
-                    std::lock_guard<std::mutex> lk(tx_mtx);
-                    return kvmSendAll(client, &end, sizeof(end));
-                };
-                /* Bounded extraction: a provider on a dead/cloud path must
-                 * not delay the drop check or the session join. */
-                auto trySendIcon = [&]() -> bool {
-                    if (!drag_icon_ok || icon_tried || image_sent) return true;
-                    std::string path;
-                    if (!dropHelperFirstFilePath(path)) return true;
-                    icon_tried = true;   /* one attempt per drag */
-                    DragIconData icon;
-                    if (!dragIconExtractTimed(path, icon, 250)) return true;
-                    return dragIconSendDirect(client, icon, tx_mtx);
-                };
-                /* The source helper publishes the drag image together with the
-                 * file list (before FILES_END), so retry until it exists. */
-                auto trySendImage = [&]() -> bool {
-                    if (!drag_image_ok || image_sent) return true;
-                    DropDragImage img;
-                    if (!dropHelperTakeDragImage(img) || !img.valid())
-                        return true;
-                    image_sent = true;
-                    return dragImageSendDirect(client, img, tx_mtx);
-                };
-                while (reverse_session.load() && running.load()) {
-                    const bool seen = dropHelperDragSeen();
-                    const bool live = dropHelperDragLive();
-                    const bool pending = dropHelperDragPending();
-                    const bool dropped = dropHelperDropped();
-                    const ULONGLONG now = GetTickCount64();
-
-                    if (seen && !announced) {
-                        announced = true;
-                        announced_tick = now;
-                        name_sent = false;
-                        icon_tried = false;
-                        image_sent = false;
-                        /* The helper publishes CF_HDROP only on FILES_END,
-                         * which can be seconds after DRAG; bound the wait so
-                         * a wedged capture cannot suppress back-crossing for
-                         * the whole session. */
-                        name_deadline = now + DRAG_CAPTURE_HARD_MS;
-                        if (!sendRDrag(1)) break;
-                        /* Tell the controller what is travelling so it can
-                         * draw the same ghost next to its own cursor. */
-                        std::string first;
-                        dropHelperFirstFileName(first);
-                        if (!sendDragInfo(first,
-                                          (uint32_t)dropHelperFileCount()))
-                            break;
-                        name_sent = !first.empty();
-                        /* The real image is already captured and cheaper to
-                         * forward than extracting an icon, so try it first. */
-                        if (!trySendImage()) break;
-                        if (!trySendIcon()) break;
-                    }
-
-                    /* FILES_END landed after the first poll (slow CF_HDROP
-                     * render): send a fresh header so the controller replaces
-                     * the placeholder name and can show the real icon. */
-                    if (announced && !name_sent && live) {
-                        std::string first;
-                        dropHelperFirstFileName(first);
-                        if (!first.empty()) {
-                            if (!sendDragInfo(first,
-                                              (uint32_t)dropHelperFileCount()))
-                                break;
-                            name_sent = true;
-                        }
-                    }
-                    if (announced && !trySendImage()) break;
-                    if (announced && !trySendIcon()) break;
-
-                    /* NODRAG leaves drag_seen sticky (the target has no local
-                     * mouseProc to reset it), so clear it here; otherwise the
-                     * next reverse drag would never be announced. */
-                    /* 100 ms of slack: the helper stores drag_seen before
-                     * drag_pending, and NODRAG can otherwise look like an
-                     * instant cancel on the same poll that announced. */
-                    const bool cancelled =
-                        announced && !live && !pending && !dropped &&
-                        now - announced_tick >= 100;
-                    const bool stalled =
-                        announced && !live && !dropped &&
-                        now > name_deadline;
-                    if (cancelled || stalled) {
-                        announced = false;
-                        name_sent = false;
-                        if (!sendRDrag(0)) break;
-                        if (!sendDragEnd()) break;
-                        dropHelperDiscard();
-                    }
-                    if (!seen && announced) {
-                        announced = false;
-                        if (!sendRDrag(0)) break;
-                        KvmEvent end = {};
-                        end.type = htonl(KVM_EV_DRAG_INFO);   /* a=0: hide */
-                        std::lock_guard<std::mutex> lk(tx_mtx);
-                        if (!kvmSendAll(client, &end, sizeof(end))) break;
-                    }
-                    if (dropHelperDragLive() && dropHelperDropped()) {
-                        std::vector<std::string> files;
-                        if (dropHelperTakeFiles(files) && !files.empty()) {
-                            announced = false;
-                            name_sent = false;
-                            if (!sendRDrag(0)) break;
-                            if (!sendDragEnd()) break;
-                            DropOptions opt;
-                            opt.peer_ip = peer_ip.c_str();
-                            opt.port = (uint16_t)rev_port;
-                            opt.flags = DROP_FLAG_REVERSE;
-                            opt.transfer_id =
-                                (uint32_t)(GetTickCount64() ^
-                                           (uint64_t)GetCurrentProcessId());
-                            std::cout << "[drop] reverse transfer -> "
-                                      << peer_ip << ":" << rev_port << "\n"
-                                      << std::flush;
-                            /* Release point is resolved by the CONTROLLER
-                             * from its own cursor, so x/y stay unused here. */
-                            /* Session-scoped liveness, not the receiver's
-                             * process-wide flag: when the 8084 session dies,
-                             * teardown must be able to abort an in-flight
-                             * reverse copy and free the single-session slot. */
-                            const DropResult r =
-                                dropSendFiles(opt, files, rev_token.data(),
-                                              reverse_session);
-                            std::cout << "[drop] reverse transfer to " << peer_ip
-                                      << " status=" << r.status
-                                      << " committed=" << r.committed
-                                      << " failed=" << r.failed
-                                      << (r.message.empty()
-                                              ? "" : " msg=" + r.message)
-                                      << "\n" << std::flush;
-                        }
-                        dropHelperDiscard();
-                    }
-                    Sleep(20);
-                }
-            });
-        } else {
-            std::cout << "[kvm] reverse capture unavailable: " << why << "\n"
-                      << std::flush;
-        }
-    }
-
-    HeldInput held;
-    KvmEvent wire;
-    bool io_ok = true;
-    while (io_ok) {
-        if (!running.load()) break;
-        if (!recvAllRunning(client, &wire, sizeof(wire), running, 0, &hb,
-                            nullptr, nullptr, &tx_mtx)) break;
-        KvmEvent e;
-        e.type = ntohl(wire.type);
-        e.a = ntohl(wire.a);
-        e.b = ntohl(wire.b);
-        e.c = ntohl(wire.c);
-        switch (e.type) {
-        case KVM_EV_MOVE:
-            injectMove((int)e.a, (int)e.b, sw, sh);
-            /* KVM_EV_MOVE carries virtual-desktop-relative coordinates;
-             * UpdateLayeredWindow needs screen coordinates. The controller's
-             * reverse ghost already passes GetCursorPos(), so both roles now
-             * feed ghostMove the same space. */
-            ghostMove(sx + (int)e.a, sy + (int)e.b);
-            break;
-        case KVM_EV_BUTTON:
-            injectButton(e.a, e.b != 0, held);
-            break;
-        case KVM_EV_WHEEL:
-            injectWheel((int)(int32_t)e.a, e.b != 0);
-            break;
-        case KVM_EV_KEY:
-            injectKey(e.a, e.b, e.c & 0xFFFFu, (e.c & 0x10000u) != 0, held);
-            break;
-        case KVM_EV_RELEASE_ALL:
-            releaseAll(held);
-            break;
-        case KVM_EV_PING:
-            if (hb.enabled) {
-                KvmEvent pong = {};
-                pong.type = htonl(KVM_EV_PONG);
-                std::lock_guard<std::mutex> lk(tx_mtx);
-                io_ok = kvmSendAll(client, &pong, sizeof(pong));
-                if (!io_ok) {
-                    hb.reason = "pong_send_error";
-                    hb.err = WSAGetLastError();
-                }
-            }
-            break;
-        case KVM_EV_DRAG_INFO:
-            if (e.a) {
-                g_ghost.frames_left = (int)e.c;
-                g_ghost.icon_acc.reset();
-                g_ghost.real_acc.reset();
-                ghostSetText(std::string(), (int)e.b);
-                ghostSetIcon(DragIconData{});
-                ghostSetRealImage(DragIconData{}, 0, 0);
-                /* The first MOVE may still be in flight; anchor the new card
-                 * at the real cursor instead of the previous drag's position
-                 * (screen coordinates, matching ghostMove). */
-                POINT cur = {};
-                if (GetCursorPos(&cur)) {
-                    g_ghost.x = cur.x;
-                    g_ghost.y = cur.y;
-                }
-                ghostShow(g_ghost.x, g_ghost.y, (int)e.b);
-            } else {
-                ghostHide();
-            }
-            break;
-        case KVM_EV_DRAG_TEXT:
-            if (g_ghost.frames_left > 0) {
-                char chunk[12];
-                std::memcpy(chunk, &e.a, 4);
-                std::memcpy(chunk + 4, &e.b, 4);
-                std::memcpy(chunk + 8, &e.c, 4);
-                g_ghost.name.append(chunk, 12);
-                if (--g_ghost.frames_left == 0) {
-                    /* Drop the NUL padding of the fixed-size frames. */
-                    while (!g_ghost.name.empty() &&
-                           g_ghost.name.back() == '\0')
-                        g_ghost.name.pop_back();
-                    /* Appended in place, so the cached card is stale even
-                     * though ghostSetText() would compare equal. */
-                    g_ghost.card_valid = false;
-                    ghostShow(g_ghost.x, g_ghost.y, g_ghost.count);
-                }
-            }
-            break;
-        case KVM_EV_DRAG_ICON_INFO:
-            if (!g_ghost.icon_acc.begin(e.a, e.b, e.c))
-                g_ghost.icon_acc.reset();
-            break;
-        case KVM_EV_DRAG_ICON_DATA:
-            if (g_ghost.icon_acc.frames_left > 0) {
-                uint8_t chunk[DRAG_ICON_CHUNK];
-                std::memcpy(chunk, &e.a, 4);
-                std::memcpy(chunk + 4, &e.b, 4);
-                std::memcpy(chunk + 8, &e.c, 4);
-                DragIconData icon;
-                if (g_ghost.icon_acc.feed(chunk) &&
-                    g_ghost.icon_acc.take(icon)) {
-                    ghostSetIcon(icon);
-                    /* Frames for an already-cancelled drag must not pop the
-                     * window back up (ghostPaint always shows it). */
-                    if (g_ghost.visible) ghostPaint();
-                }
-            }
-            break;
-        case KVM_EV_DRAG_IMAGE_INFO: {
-            int w = 0, h = 0, ox = 0, oy = 0;
-            dragImageUnpackDimOff(e.a, w, ox);
-            dragImageUnpackDimOff(e.b, h, oy);
-            if (!g_ghost.real_acc.begin((uint32_t)w, (uint32_t)h, e.c)) {
-                g_ghost.real_acc.reset();
-            } else {
-                g_ghost.real_acc_ox = ox;
-                g_ghost.real_acc_oy = oy;
-            }
-            break;
-        }
-        case KVM_EV_DRAG_IMAGE_DATA:
-            if (g_ghost.real_acc.frames_left > 0) {
-                uint8_t chunk[DRAG_ICON_CHUNK];
-                std::memcpy(chunk, &e.a, 4);
-                std::memcpy(chunk + 4, &e.b, 4);
-                std::memcpy(chunk + 8, &e.c, 4);
-                DragIconData image;
-                if (g_ghost.real_acc.feed(chunk) &&
-                    g_ghost.real_acc.take(image)) {
-                    ghostSetRealImage(image, g_ghost.real_acc_ox,
-                                      g_ghost.real_acc_oy);
-                    if (g_ghost.visible) ghostPaint();
-                }
-            }
-            break;
-        case KVM_EV_PONG:
-            break;
-        default:
-            break;
-        }
-    }
-    /* Release injected input before any join/helper teardown: the KVM session
-     * is already over, and a reverse transfer can take seconds to wind down.
-     * reverse_session is the drop's liveness flag, so clearing it aborts the
-     * transfer and bounds the watcher join. */
-    releaseAll(held);
-    reverse_session = false;
+    /* The controller's reverse-drag ghost lives on this thread too; always
+     * release its layered window, even for a session with no reverse path. */
     ghostEnd();
-    if (reverse_watcher.joinable()) reverse_watcher.join();
-    if (reverse_cap_started) dropHelperStop();
-    const char *end_reason =
-        hb.reason ? hb.reason : (io_ok ? "local_stop" : "pong_send_error");
-    std::cout << "[kvm] stitch session from " << peer_ip << " ended (reason="
-              << end_reason
-              << (hb.err ? ", err=" + std::to_string(hb.err) : "") << ")\n"
-              << std::flush;
+}
+
+/* Drag/drop visual frames from the controller (forward drag) or from the
+ * target's own reverse watcher. The shared loop only calls this for the drag
+ * event types; unknown subtypes are ignored here. */
+static void winDragEvent(const KvmEvent &e)
+{
+    switch (e.type) {
+    case KVM_EV_DRAG_INFO:
+        if (e.a) {
+            g_ghost.frames_left = (int)e.c;
+            g_ghost.icon_acc.reset();
+            g_ghost.real_acc.reset();
+            ghostSetText(std::string(), (int)e.b);
+            ghostSetIcon(DragIconData{});
+            ghostSetRealImage(DragIconData{}, 0, 0);
+            /* The first MOVE may still be in flight; anchor the new card at
+             * the real cursor instead of the previous drag's position. */
+            POINT cur = {};
+            if (GetCursorPos(&cur)) {
+                g_ghost.x = cur.x;
+                g_ghost.y = cur.y;
+            }
+            ghostShow(g_ghost.x, g_ghost.y, (int)e.b);
+        } else {
+            ghostHide();
+        }
+        break;
+    case KVM_EV_DRAG_TEXT:
+        if (g_ghost.frames_left > 0) {
+            char chunk[12];
+            std::memcpy(chunk, &e.a, 4);
+            std::memcpy(chunk + 4, &e.b, 4);
+            std::memcpy(chunk + 8, &e.c, 4);
+            g_ghost.name.append(chunk, 12);
+            if (--g_ghost.frames_left == 0) {
+                /* Drop the NUL padding of the fixed-size frames. */
+                while (!g_ghost.name.empty() &&
+                       g_ghost.name.back() == '\0')
+                    g_ghost.name.pop_back();
+                /* Appended in place, so the cached card is stale even though
+                 * ghostSetText() would compare equal. */
+                g_ghost.card_valid = false;
+                ghostShow(g_ghost.x, g_ghost.y, g_ghost.count);
+            }
+        }
+        break;
+    case KVM_EV_DRAG_ICON_INFO:
+        if (!g_ghost.icon_acc.begin(e.a, e.b, e.c))
+            g_ghost.icon_acc.reset();
+        break;
+    case KVM_EV_DRAG_ICON_DATA:
+        if (g_ghost.icon_acc.frames_left > 0) {
+            uint8_t chunk[DRAG_ICON_CHUNK];
+            std::memcpy(chunk, &e.a, 4);
+            std::memcpy(chunk + 4, &e.b, 4);
+            std::memcpy(chunk + 8, &e.c, 4);
+            DragIconData icon;
+            if (g_ghost.icon_acc.feed(chunk) &&
+                g_ghost.icon_acc.take(icon)) {
+                ghostSetIcon(icon);
+                /* Frames for an already-cancelled drag must not pop the
+                 * window back up (ghostPaint always shows it). */
+                if (g_ghost.visible) ghostPaint();
+            }
+        }
+        break;
+    case KVM_EV_DRAG_IMAGE_INFO: {
+        int w = 0, h = 0, ox = 0, oy = 0;
+        dragImageUnpackDimOff(e.a, w, ox);
+        dragImageUnpackDimOff(e.b, h, oy);
+        if (!g_ghost.real_acc.begin((uint32_t)w, (uint32_t)h, e.c)) {
+            g_ghost.real_acc.reset();
+        } else {
+            g_ghost.real_acc_ox = ox;
+            g_ghost.real_acc_oy = oy;
+        }
+        break;
+    }
+    case KVM_EV_DRAG_IMAGE_DATA:
+        if (g_ghost.real_acc.frames_left > 0) {
+            uint8_t chunk[DRAG_ICON_CHUNK];
+            std::memcpy(chunk, &e.a, 4);
+            std::memcpy(chunk + 4, &e.b, 4);
+            std::memcpy(chunk + 8, &e.c, 4);
+            DragIconData image;
+            if (g_ghost.real_acc.feed(chunk) &&
+                g_ghost.real_acc.take(image)) {
+                ghostSetRealImage(image, g_ghost.real_acc_ox,
+                                  g_ghost.real_acc_oy);
+                if (g_ghost.visible) ghostPaint();
+            }
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 } /* namespace */
 
-/* Real listener state, readable from any thread before, during or after
- * kvmServiceRun(). state: 0 = not started yet (starting), 1 = listening,
- * -1 = failed; stage: 0 none, 1 socket, 3 bind, 4 listen. */
-static std::atomic<int> g_kvm_start_state{0};
-static std::atomic<int> g_kvm_start_stage{0};
-static std::atomic<int> g_kvm_start_error{0};
-
-static void kvmReportStartup(int state, int stage, int error)
+const KvmTargetOps &kvmTargetOps()
 {
-    g_kvm_start_error.store(error);
-    g_kvm_start_stage.store(stage);
-    g_kvm_start_state.store(state);   /* publish the state last */
-}
-
-KvmStartupStatus kvmServiceStatus()
-{
-    KvmStartupStatus st = {};
-    st.state = g_kvm_start_state.load();
-    st.stage = g_kvm_start_stage.load();
-    st.error_code = g_kvm_start_error.load();
-    st.port = (uint16_t)KVM_PORT;
-    return st;
-}
-
-void kvmServiceRun(std::atomic<bool> &running, const KvmTargetAuth *auth)
-{
-    raiseThreadDpiAwareness();
-    kvmReportStartup(0, 0, 0);
-
-    kvm_sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv == KVM_INVALID_SOCK) {
-        const int err = WSAGetLastError();
-        kvmReportStartup(-1, 1, err);
-        std::cout << "[kvm] socket init failed (" << err
-                  << "); stitch disabled\n" << std::flush;
-        return;
-    }
-    /* SO_EXCLUSIVEADDRUSE, not SO_REUSEADDR: on Windows the latter allows a
-     * second bind on the same port (and would let this process hide an
-     * existing listener behind it), so a real port conflict would look like
-     * success. Exclusive use makes bind() fail and the GUI sees the truth. */
-    BOOL exclusive = TRUE;
-    if (setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-                   (const char *)&exclusive, sizeof(exclusive)) != 0) {
-        const int err = WSAGetLastError();
-        kvmReportStartup(-1, 1, err);
-        std::cout << "[kvm] SO_EXCLUSIVEADDRUSE failed (" << err
-                  << "); stitch disabled\n" << std::flush;
-        kvmClose(srv);
-        return;
-    }
-
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(KVM_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(srv, (sockaddr *)&addr, sizeof(addr)) < 0) {
-        const int err = WSAGetLastError();
-        kvmReportStartup(-1, 3, err);
-        std::cout << "[kvm] bind failed on " << KVM_PORT << " (error " << err
-                  << "); stitch disabled\n" << std::flush;
-        kvmClose(srv);
-        return;
-    }
-    if (listen(srv, 4) < 0) {
-        const int err = WSAGetLastError();
-        kvmReportStartup(-1, 4, err);
-        std::cout << "[kvm] listen failed on " << KVM_PORT << " (error " << err
-                  << "); stitch disabled\n" << std::flush;
-        kvmClose(srv);
-        return;
-    }
-    kvmReportStartup(1, 4, 0);
-    std::cout << "[kvm] stitch listener on TCP " << KVM_PORT << "\n"
-              << std::flush;
-
-    /* The session runs on its own thread so the listener stays responsive:
-     * a second controller gets an immediate KVM_ERR_BUSY instead of sitting
-     * in the accept backlog for the whole (possibly hours-long) session, and
-     * shutdown never has to wait for the modal consent box to be answered.
-     * Only one serveClient runs at a time. `session_active` is the same-port
-     * admission only; the cross-mode (8081 vs 8084) slot is the shared gate
-     * in auth.h, checked and claimed inside serveClient. */
-    std::atomic<bool> session_active{false};
-    std::thread session;
-
-    while (running.load()) {
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(srv, &rd);
-        struct timeval tv = {1, 0};
-        int sel = select(0, &rd, nullptr, nullptr, &tv);
-        if (sel <= 0) continue;
-
-        sockaddr_in cli = {};
-        int cli_len = sizeof(cli);
-        kvm_sock_t client = accept(srv, (sockaddr *)&cli, &cli_len);
-        if (client == KVM_INVALID_SOCK) continue;
-
-        char ip[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof(ip));
-
-        if (session_active.load()) {
-            /* Read the peer's hello first. Closing with unread data makes
-             * Windows send an RST, which discards the BUSY reply in flight
-             * and surfaces as WSAECONNRESET on the controller. */
-            kvmSetTimeouts(client, 500, 500);
-            KvmHello hello = {};
-            recvAllRunning(client, &hello, sizeof(hello), running, 1500);
-
-            KvmReply busy = {};
-            busy.magic = htonl(KVM_MAGIC);
-            busy.version = htonl(KVM_VERSION);
-            busy.status = htonl(KVM_ERR_BUSY);
-            kvmSendAll(client, &busy, sizeof(busy));
-
-            /* Drain anything still in flight before the graceful close. The
-             * socket carries a 500 ms receive timeout, but a peer that keeps
-             * sending would spin this loop forever — bound it by time and by
-             * the service's running flag so shutdown is never pinned. */
-            shutdown(client, SD_SEND);
-            char sink[64];
-            const ULONGLONG drain_deadline = GetTickCount64() + 1000;
-            while (running.load() && GetTickCount64() < drain_deadline &&
-                   recv(client, sink, sizeof(sink), 0) > 0) {}
-            kvmClose(client);
-            std::cout << "[kvm] busy, refused extra controller " << ip << "\n"
-                      << std::flush;
-            continue;
-        }
-
-        if (session.joinable()) session.join();
-        session_active = true;
-        std::string peer(ip);
-        session = std::thread([client, peer, &running, &session_active, auth] {
-            serveClient(client, peer, running, auth);
-            kvmClose(client);
-            session_active = false;
-        });
-    }
-
-    if (session.joinable()) session.join();
-    kvmClose(srv);
-    std::cout << "[kvm] stitch listener stopped\n" << std::flush;
-}
-
-#else /* !_WIN32 */
-
-int kvmRunController(const char *peer_ip, int peer_port, int side,
-                     const std::atomic<bool> &running,
-                     const KvmClientAuth *auth)
-{
-    (void)peer_ip;
-    (void)peer_port;
-    (void)side;
-    (void)running;
-    (void)auth;
-    std::cout << "STAT|event=error|msg=拼接模式目前仅支持 Windows\n"
-              << std::flush;
-    return 3;
-}
-
-int kvmRunControllerResilient(const char *peer_ip, int peer_port, int side,
-                              const std::atomic<bool> &running,
-                              const KvmClientAuth *auth)
-{
-    return kvmRunController(peer_ip, peer_port, side, running, auth);
-}
-
-void kvmSetControllerSide(int side)
-{
-    (void)side;
-}
-
-void kvmServiceRun(std::atomic<bool> &running, const KvmTargetAuth *auth)
-{
-    (void)running;
-    (void)auth;
-}
-
-/* 拼接 is Windows-only, so there is no listener to report on other platforms. */
-KvmStartupStatus kvmServiceStatus()
-{
-    KvmStartupStatus st = {};
-    st.state = 2;   /* not supported */
-    st.stage = 0;
-    st.error_code = 0;
-    st.port = (uint16_t)KVM_PORT;
-    return st;
+    static const KvmTargetOps ops = {
+        winInit,
+        targetMetrics,
+        KVM_FEATURE_DRAG_ICON | KVM_FEATURE_DRAG_IMAGE,
+        winInjectMove,
+        winInjectButton,
+        winInjectWheel,
+        winInjectKey,
+        winReleaseAll,
+        winDragEvent,
+        winAskConsent,
+        winSessionBegin,
+        winSessionEnd
+    };
+    return ops;
 }
 
 #endif /* _WIN32 */
