@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>画质与编码 · Mivara 幻屏</title>
+<!--
+  应用内「画质与编码」卡片的帮助页，由 app.exe 的 ? 按钮打开。
+  纯静态、零外部依赖，可离线使用；配色跟随系统明暗模式。
+  修改设置项文案时请同步 src/app.cpp 与 docs/zh/usage.md、docs/en/usage.md。
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f2f2f7;
+    --surface: #ffffff;
+    --surface-alt: #f5f5f9;
+    --text: #2f2f30;
+    --dim: #63636b;
+    --border: #dcdce3;
+    --accent: #1a6ee0;
+    --accent-soft: #e8f0fd;
+    --ok: #15703a;
+    --ok-soft: #e3f4e9;
+    --warn: #96500b;
+    --warn-soft: #fdf0dd;
+    --danger: #b32736;
+    --code: #eeeef4;
+    --shadow: 0 1px 2px rgba(31, 35, 45, .05), 0 8px 24px rgba(31, 35, 45, .05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c;
+      --surface: #202126;
+      --surface-alt: #282930;
+      --text: #e8e8ec;
+      --dim: #a6a6b0;
+      --border: #3a3b43;
+      --accent: #6aa6ff;
+      --accent-soft: #22324a;
+      --ok: #7bd88f;
+      --ok-soft: #1d3325;
+      --warn: #f0b45e;
+      --warn-soft: #3a2e1a;
+      --danger: #ff9aa4;
+      --code: #2a2b31;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 10px 28px rgba(0, 0, 0, .25);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.72 "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+          "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
+    padding: 32px 18px 56px;
+  }
+  main { max-width: 920px; margin: 0 auto; }
+
+  header.top {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 30px 32px 28px;
+    box-shadow: var(--shadow);
+    position: relative;
+    overflow: hidden;
+  }
+  header.top::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 100%;
+    height: 4px;
+    background: linear-gradient(90deg, var(--accent), transparent 78%);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: .04em;
+  }
+  .brand .mark {
+    width: 18px; height: 18px;
+    border: 2px solid currentColor;
+    border-radius: 5px;
+    display: inline-block;
+    position: relative;
+  }
+  .brand .mark::after {
+    content: "";
+    position: absolute;
+    inset: 3px -5px -5px 3px;
+    border: 2px solid currentColor;
+    border-radius: 5px;
+    opacity: .55;
+  }
+  h1 {
+    font-size: 30px;
+    line-height: 1.28;
+    margin: 14px 0 10px;
+    letter-spacing: -.01em;
+  }
+  .lead { margin: 0; color: var(--dim); max-width: 760px; }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 18px;
+  }
+  .meta span {
+    font-size: 13px;
+    color: var(--dim);
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 11px;
+  }
+
+  section { margin-top: 26px; }
+  section > h2 {
+    font-size: 20px;
+    margin: 0 0 6px;
+    letter-spacing: -.01em;
+  }
+  .section-lead {
+    margin: 0 0 14px;
+    color: var(--dim);
+    font-size: 14.5px;
+  }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+
+  .preset {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .preset h3 { margin: 0 0 6px; font-size: 16px; }
+  .preset p { margin: 0; color: var(--dim); font-size: 14px; }
+  .preset .spec {
+    display: block;
+    margin-top: 9px;
+    color: var(--text);
+    font-size: 13.5px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    background: var(--code);
+    border-radius: 8px;
+    padding: 7px 10px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+
+  article.opt {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 18px 20px 16px;
+    margin-bottom: 12px;
+    box-shadow: var(--shadow);
+  }
+  .opt-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .opt-head h3 { margin: 0; font-size: 18px; }
+  .badge {
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.5;
+    border-radius: 999px;
+    padding: 1px 9px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    color: var(--dim);
+    white-space: nowrap;
+  }
+  .badge.rec { background: var(--ok-soft); border-color: transparent; color: var(--ok); }
+  .badge.warn { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+  .badge.info { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+
+  article.opt p { margin: 7px 0 0; font-size: 14.7px; }
+  .k {
+    display: inline-block;
+    min-width: 4.4em;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 13.5px;
+    margin-right: 2px;
+  }
+  .opt .tip {
+    margin-top: 10px;
+    padding: 8px 12px;
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: 0 8px 8px 0;
+    color: var(--text);
+    font-size: 14px;
+  }
+  .opt .tip.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+
+  code {
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    font-size: .92em;
+    background: var(--code);
+    border-radius: 5px;
+    padding: .08em .38em;
+  }
+
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    overflow-x: auto;
+  }
+  table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 14px; }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 13px; color: var(--dim); font-weight: 700; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:nth-child(even) { background: var(--surface-alt); }
+  td strong { font-weight: 700; }
+
+  details {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0 16px;
+    margin-bottom: 10px;
+    box-shadow: var(--shadow);
+  }
+  details + details { margin-top: -2px; }
+  summary {
+    cursor: pointer;
+    font-weight: 700;
+    font-size: 15px;
+    padding: 13px 0;
+    list-style-position: inside;
+  }
+  summary::marker { color: var(--accent); }
+  details p { margin: 0 0 14px; color: var(--dim); font-size: 14.5px; }
+  details p:first-of-type { margin-top: 2px; }
+
+  footer {
+    margin-top: 30px;
+    color: var(--dim);
+    font-size: 13px;
+    text-align: center;
+    line-height: 1.8;
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header class="top">
+  <div class="brand"><span class="mark" aria-hidden="true"></span>Mivara 幻屏</div>
+  <h1>画质与编码</h1>
+  <p class="lead">
+    这些选项决定画面在发送端如何压缩、以多大码率和帧率传输，以及接收端看到的清晰度与延迟。
+    本页说明「设置 → 画质与编码」中的每一项，并给出按场景的选择建议。
+  </p>
+  <div class="meta">
+    <span>设置位置：设置 → 画质与编码</span>
+    <span>生效方式：点「保存设置」后生效</span>
+    <span>会话中可热更新，无需断开重连</span>
+  </div>
+</header>
+
+<section id="quick">
+  <h2>快速选择</h2>
+  <p class="section-lead">不想逐项研究时，直接照着下面某一组配置即可。</p>
+  <div class="grid">
+    <div class="preset">
+      <h3>默认 / 日常</h3>
+      <p>最稳、延迟最低，适合办公、网页、视频和大多数局域网使用。</p>
+      <span class="spec">自动（= H.264） · 硬件加速开<br>画质 23 · 60 fps · 码率 0 · 100% · 4:2:0</span>
+    </div>
+    <div class="preset">
+      <h3>文字 / 代码为主</h3>
+      <p>彩色小字和子像素抗锯齿更锐利，代价是发送端 CPU 略高。</p>
+      <span class="spec">H.264 或 H.265 · 硬件加速关<br>画质 20–23 · 60 fps · 码率 0 · 100% · 4:4:4</span>
+    </div>
+    <div class="preset">
+      <h3>Wi-Fi / 带宽紧张</h3>
+      <p>优先降帧率和缩放，比一味拉低画质更划算，也更不容易卡顿。</p>
+      <span class="spec">H.265（或支持硬编的 AV1） · 硬件加速开<br>画质 26–28 · 30 fps · 码率 0 或 6000–10000 · 75% · 4:2:0</span>
+    </div>
+    <div class="preset">
+      <h3>高刷游戏</h3>
+      <p>帧率与显示器刷新率对齐，优先使用有线千兆或 2.5G。</p>
+      <span class="spec">自动 / H.264 · 硬件加速开<br>画质 20–23 · 120–144 fps · 码率 0 · 100% · 4:2:0</span>
+    </div>
+  </div>
+</section>
+
+<section id="codec">
+  <h2>编码方式</h2>
+  <p class="section-lead">
+    编码方式决定压缩算法。它只影响「投屏 / 扩展」的画面传输；「拼接」只共享键鼠、不传画面，与这些设置无关。
+  </p>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>自动</h3>
+      <span class="badge rec">推荐</span>
+      <span class="badge info">当前等同 H.264</span>
+    </div>
+    <p><span class="k">是什么</span>由程序选择编码方式。目前的实现中，「自动」与「H.264」使用完全相同的逻辑：优先硬件编码，失败时回退软件编码。</p>
+    <p><span class="k">怎么选</span>不确定时选它即可。保留这个选项是为了以后能按两端的设备能力自动挑选编码。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>H.264</h3>
+      <span class="badge rec">默认</span>
+    </div>
+    <p><span class="k">是什么</span>兼容性最好、解码最轻的编码。发送端优先使用 GPU 硬件编码（NVIDIA NVENC / Intel QSV / AMD AMF，Linux 为 VAAPI），硬件不可用时回退软件 libx264。接收端使用软件解码，H.264 的软解负担在常见编码里最低。</p>
+    <p><span class="k">怎么选</span>绝大多数情况都用它：办公、网页、视频、游戏都合适。老机器、老显卡、或者不想折腾时，它是最稳的选择。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>H.265 / HEVC</h3>
+      <span class="badge">省带宽</span>
+    </div>
+    <p><span class="k">是什么</span>同码率下通常比 H.264 更清晰，适合带宽有限或想降低网络占用的场景。发送端同样硬件优先（NVENC / QSV / AMF / VAAPI），回退软件 libx265。</p>
+    <p><span class="k">怎么选</span>两端机器都不太老、并且带宽紧张时选它。代价是编码和解码负载更高；较老的显卡可能没有 H.265 硬件编码，较老的接收端 CPU 也可能跟不上高分辨率。出现卡顿就换回 H.264。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>AV1</h3>
+      <span class="badge">压缩率最高</span>
+      <span class="badge warn">硬件要求高</span>
+    </div>
+    <p><span class="k">是什么</span>当前压缩率最高的编码，静态桌面和文字内容尤其省带宽。硬件编码需要较新的 GPU（例如 RTX 40 系、Intel Arc、RX 7000 系及更新型号）；没有硬件编码时使用软件 SVT-AV1，编码很吃发送端 CPU。接收端目前只能软件解码，4K 或高帧率下负担最重。</p>
+    <p><span class="k">怎么选</span>发送端有 AV1 硬件编码、并且确实需要省带宽时再选。AV1 的 CRF 刻度与 H.264 不完全可比：想省带宽可从 30–35 起步，追求画质用 23–28。老机器、高分辨率或高帧率场景不建议。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>原始</h3>
+      <span class="badge warn">带宽极大</span>
+    </div>
+    <p><span class="k">是什么</span>不压缩的 RGB 画面直接传输，不经过编码器：完全无损、没有编码延迟，但带宽需求极高。1080p60 约 370 MB/s，而千兆网实际只有约 110 MB/s，远远不够。</p>
+    <p><span class="k">怎么选</span>只建议在 2.5G / 10G 有线局域网、低分辨率或本机测试时使用。此模式下「画质」「码率」「色度」「缩放」都不生效，帧率上限仍然有效。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>RLE</h3>
+      <span class="badge">无损压缩</span>
+    </div>
+    <p><span class="k">是什么</span>逐帧无损压缩，桌面文字和 UI 通常能省 30–70% 带宽；照片和视频的压缩率低，带宽仍远高于 H.264。压缩可以交给接收端 CPU 完成，发送端负担很小；如果接收端的压缩服务不可用，会退回未压缩发送。</p>
+    <p><span class="k">怎么选</span>想要零压缩损失、同时发送端 CPU 很弱时，可以在有线局域网里使用。与「原始」一样，「画质」「码率」「色度」「缩放」不生效（帧率上限有效）。</p>
+  </article>
+</section>
+
+<section id="quality">
+  <h2>画质与流畅度</h2>
+  <p class="section-lead">下面三项只对编码流（H.264 / H.265 / AV1）有意义；「原始」和「RLE」不走编码器。</p>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>画质 (CRF)</h3>
+      <span class="badge info">0–51 · 越小越清晰</span>
+    </div>
+    <p><span class="k">是什么</span>压缩强度的刻度。数字越小，画面越清晰、占用带宽越高；数字越大，越省带宽、细节丢失越多。默认 23。</p>
+    <p><span class="k">怎么选</span>文字 / 代码为主用 18–22；日常 23；带宽紧张用 26–30。它只在「码率 = 0（质量模式）」时生效；码率大于 0 时会被码率模式取代。不同编码器的内部实现不同（x264 CRF、NVENC CQ、QSV global_quality、AMF QP），所以这个数字适合在同一编码方式内部比较。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>帧率上限</h3>
+      <span class="badge info">1–240 · 默认 60</span>
+    </div>
+    <p><span class="k">是什么</span>发送端每秒最多采集、编码并发送多少帧。降低它可以同时减少带宽、CPU 和 GPU 占用；提高它只对高速运动画面有明显意义。</p>
+    <p><span class="k">怎么选</span>办公和视频 30–60；游戏和高刷屏用 120–144，或与显示器刷新率一致。帧率上限只是上限，实际帧率还取决于画面变化和机器性能。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>码率</h3>
+      <span class="badge info">0 = 质量模式</span>
+    </div>
+    <p><span class="k">是什么</span>限制每秒传输的数据量，单位 kbps，步进 1000。设为 0 表示不限制，由「画质」控制压缩强度，画面复杂时自动多用带宽；设为大于 0 时，编码器会尽量贴近目标码率（NVIDIA 硬件编码为恒定码率，其他编码器为受限码率），此时「画质」不生效。</p>
+    <p><span class="k">怎么选</span>局域网优先用 0（质量模式），画质更稳定。网络有限、多人共用或需要可预测占用时再设上限：1080p60 桌面约 8–15 Mbps，1080p30 约 4–8 Mbps，4K60 约 25–40 Mbps；游戏和高速运动需要更高。画面出现块状模糊时，先提高码率或降低帧率。</p>
+  </article>
+</section>
+
+<section id="image">
+  <h2>图像细节</h2>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>缩放</h3>
+      <span class="badge info">100% / 75% / 50%</span>
+    </div>
+    <p><span class="k">是什么</span>发送端先把画面缩小到对应比例再编码，接收端再放大到窗口大小。缩放能显著降低带宽和两端的编解码压力，但文字和小图标会变糊。</p>
+    <p><span class="k">怎么选</span>平时 100%。4K 桌面投到 1080p 接收端、或 Wi-Fi 带宽不足时可用 75%。50% 只适合看视频或远距离观看，不适合阅读文字。「原始 / RLE」不使用缩放。</p>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>色度</h3>
+      <span class="badge info">4:2:0 / 4:4:4</span>
+    </div>
+    <p><span class="k">是什么</span>色度决定颜色信息的采样精度。4:2:0 把颜色分辨率减半，兼容所有硬件编码器，是默认值；4:4:4 保留完整颜色细节，彩色小字和子像素抗锯齿边缘更锐利，但带宽和接收端 CPU 略高。</p>
+    <p><span class="k">怎么选</span>默认 4:2:0。以文字、代码为主并且追求锐利度时，可以尝试 4:4:4。</p>
+    <div class="tip warn">
+      4:4:4 只对软件 H.264 / H.265 编码器真正生效。开启硬件加速时，GPU 编码器仍按 4:2:0 编码；AV1（软件 SVT-AV1）也不支持 4:4:4。
+      要真正启用：关闭右侧「传输」卡片里的「硬件加速」，编码方式选 H.264 或 H.265，再选 4:4:4。若出现无法连接或画面异常，换回 4:2:0。
+    </div>
+  </article>
+
+  <article class="opt">
+    <div class="opt-head">
+      <h3>硬件加速（右侧「传输」卡片）</h3>
+      <span class="badge">与画质设置相关</span>
+    </div>
+    <p><span class="k">开启</span>优先使用 GPU 编码（NVENC / QSV / AMF / VAAPI），不可用时自动回退软件编码。延迟低、发送端 CPU 占用小，适合游戏、视频和高帧率；但 GPU 编码固定使用 4:2:0，不能启用 4:4:4。</p>
+    <p><span class="k">关闭</span>强制软件编码，CPU 占用更高，但可以使用 4:4:4，也不受显卡驱动和 GPU 编码器限制。文字优先、机器性能足够时选它。</p>
+    <div class="tip">显卡驱动过旧可能导致硬件编码失败。遇到「编码器无法打开」或画面异常时，可以关闭硬件加速，或先升级显卡驱动。</div>
+  </article>
+</section>
+
+<section id="scenarios">
+  <h2>典型场景推荐</h2>
+  <p class="section-lead">码率设为 0 表示使用质量模式（由画质值决定）；最后一列的 4:2:0 在开启硬件加速时是固定值。</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>场景</th><th>编码</th><th>硬件加速</th><th>画质</th>
+          <th>帧率</th><th>码率</th><th>缩放</th><th>色度</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>日常办公 / 网页 / 视频</strong></td>
+          <td>自动（H.264）</td><td>开</td><td>23</td><td>60</td><td>0</td><td>100%</td><td>4:2:0</td>
+        </tr>
+        <tr>
+          <td><strong>文字 / 代码（追求锐利）</strong></td>
+          <td>H.264 或 H.265</td><td>关</td><td>20–23</td><td>60</td><td>0</td><td>100%</td><td>4:4:4</td>
+        </tr>
+        <tr>
+          <td><strong>Wi-Fi / 带宽紧张</strong></td>
+          <td>H.265（AV1 需硬编）</td><td>开</td><td>26–28</td><td>30</td><td>0 或 6000–10000</td><td>75%</td><td>4:2:0</td>
+        </tr>
+        <tr>
+          <td><strong>高刷游戏</strong></td>
+          <td>自动 / H.264</td><td>开</td><td>20–23</td><td>120–144</td><td>0</td><td>100%</td><td>4:2:0</td>
+        </tr>
+        <tr>
+          <td><strong>无损（仅高速有线）</strong></td>
+          <td>原始 / RLE</td><td>无关</td><td>不生效</td><td>按需</td><td>不生效</td><td>不生效</td><td>不生效</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="faq">
+  <h2>常见问题</h2>
+
+  <details>
+    <summary>改完设置为什么没有立刻生效？</summary>
+    <p>这些选项需要点「保存设置」才会写入并应用。会话进行中保存后通常几秒内热生效，连接不会断；切换编码方式、缩放或色度时，接收端需要重建解码器，可能瞬断一两帧，属于正常现象。</p>
+  </details>
+
+  <details>
+    <summary>选了 4:4:4，为什么画面没有变化？</summary>
+    <p>开启「硬件加速」时，GPU 编码器固定按 4:2:0 编码，4:4:4 不会生效。请关闭硬件加速，并把编码方式设为 H.264 或 H.265。AV1 的软件编码器也不支持 4:4:4。</p>
+  </details>
+
+  <details>
+    <summary>画面卡顿、花屏或偶尔断连怎么办？</summary>
+    <p>先把编码方式换回 H.264，帧率降到 30，缩放设为 75%，并给码率设一个上限（例如 1080p 用 8000）。优先使用千兆有线或 5 GHz Wi-Fi，避免 2.4 GHz 和拥挤的信道。如果仍然异常，检查两端机器的 CPU/GPU 占用和显卡驱动。</p>
+  </details>
+
+  <details>
+    <summary>怎样降低带宽占用？</summary>
+    <p>最有效的是降帧率（60 → 30）和缩放（100% → 75%）；其次是换 H.265 或 AV1、把画质调到 26–30，或直接设置码率上限。避免使用「原始」和「RLE」，它们的带宽需求远高于编码流。</p>
+  </details>
+
+  <details>
+    <summary>接收端 CPU 占用太高怎么办？</summary>
+    <p>接收端始终是软件解码，编码方式越新越重。优先选 H.264（解码最轻），降低分辨率和帧率，避免在高分辨率、高帧率下使用 AV1。缩放也会降低接收端的解码和显示压力。</p>
+  </details>
+
+  <details>
+    <summary>为什么「原始 / RLE」调画质、码率、色度没有用？</summary>
+    <p>这两种方式不经过 H.264/H.265/AV1 编码器，所以画质、码率、色度和缩放都不参与。它们只受帧率上限和网络带宽影响。</p>
+  </details>
+
+  <details>
+    <summary>换了 H.265 或 AV1 后连不上、黑屏或很卡？</summary>
+    <p>可能是接收端性能不足或解码器不可用。先换回 H.264 验证连接；确认两端的 Mivara 都是较新的版本。较老的接收设备在 4K 或高帧率下尤其容易跟不上。</p>
+  </details>
+</section>
+
+<footer>
+  <p>本页由 Mivara 随程序本地提供，打开时不联网。</p>
+  <p>如果界面与本页描述不一致，以程序内「设置 → 画质与编码」的实际选项为准。</p>
+</footer>
+
+</main>
+</body>
+</html>

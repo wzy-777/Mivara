@@ -171,11 +171,12 @@ proof       = HMAC-SHA256(purpose_key, "Mivara/v1/auth-proof" ‖ purpose
         回读校验），必要时重启设备一次
       → 移除驱动自动建立的 MTT 复制路径，恢复原有显示布局
       → 从实际 CCD 路径选择未占用的源并分配独立复制组
-      → 定位到现有桌面右侧；优先使用接收端分辨率，否则用最接近的比例
+      → 定位到上次记住的位置（默认现有桌面右侧，记住方向 / 间距 / 偏移）；
+        优先使用接收端分辨率，否则用最接近的比例
       → 回读独立拓扑、实际 GDI 设备名与原布局，再锁定采集源
   → 握手、推流（窗口/鼠标可穿越到虚拟屏）
   → 会话结束 / Ctrl+C / 断开连接 / 关闭控制台窗口
-  → vddShutdown()：仅拆除 MTT 路径 + 禁用 Root\MttVDD 设备 + 恢复原布局
+  → vddShutdown()：记住当前位置 + 仅拆除 MTT 路径 + 禁用 Root\MttVDD 设备 + 恢复原布局
       → 虚拟屏从「设置 → 屏幕」彻底消失（不是仅从桌面分离）
 ```
 
@@ -221,7 +222,7 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
         →  SDL_UpdateTexture/YUVTexture → RenderCopy → RenderPresent
 ```
 
-Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`）：直接从合成器取帧并复制到 staging 纹理，光标由采集端自行合成，因此一次采集只需约 2–6 ms，不再等待垂直周期；打开复制会话时先用一次 GDI 回读填充初始背景，避免静止桌面只有空帧时黑屏。GDI（`GetDC(NULL)` + `BitBlt`）作为自动回退，实测其回读固定耗时约 17–33 ms 且与请求面积无关。采集帧统一打包为 BGR24 后交给 swscale，RAW/RLE 仍使用 packed RGB24。采集目标桌面与“位于采集输出内”的光标都未变化时不编码、不发送，只每 500 毫秒发送一个接收端会忽略的控制包以保活；`ACCESS_LOST` 或首次打开失败后按 2→60 秒指数退避重试复制。接收端保留垂直同步，如果后续字节已经到达，会有界地跳过旧画面的纹理上传与呈现来追赶最新帧，但编码流仍逐 AU 解码，不丢参考帧。`MIVARA_CAPTURE=gdi` 可强制回退 GDI 做对比。
+Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`）：直接从合成器取帧并复制到 staging 纹理，光标由采集端自行合成，因此一次采集只需约 2–6 ms，不再等待垂直周期；打开复制会话时先用一次 GDI 回读填充初始背景，避免静止桌面只有空帧时黑屏。GDI（`GetDC(NULL)` + `BitBlt`）作为自动回退，实测其回读固定耗时约 17–33 ms 且与请求面积无关。硬件编码（NV12）时，编码流把复制得到的 BGRA 直接交给 swscale（`encodeBGRA`），省去每帧的 BGR24 打包；软件编码（YUV420P）与 RAW/RLE 仍走打包后的 BGR24/RGB24，因为 swscale 的 BGRA→YUV420P 内核与 BGR24 最多相差 29 级。采集目标桌面与“位于采集输出内”的光标都未变化时不编码、不发送，只每 500 毫秒发送一个接收端会忽略的控制包以保活；`ACCESS_LOST` 或首次打开失败后按 2→60 秒指数退避重试复制。接收端保留垂直同步，如果后续字节已经到达，会有界地跳过旧画面的纹理上传与呈现来追赶最新帧，但编码流仍逐 AU 解码，不丢参考帧。`MIVARA_CAPTURE=gdi` 可强制回退 GDI 做对比。
 
 控制包：`0xFFFFFFFF` + `ctrl_type` + 负载。`CTRL_RESIZE`（扩展模式分辨率变化）与 `CTRL_RECONFIG`（运行时参数变化）都携带完整 `HsRequestV2`，接收端据此重建解码器并跳到下一个关键帧。
 
@@ -266,7 +267,7 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 - 低层钩子 `WH_MOUSE_LL` / `WH_KEYBOARD_LL` 捕获本机键鼠；钩子回调**绝不做网络 I/O**（超过系统 `LowLevelHooksTimeout` 会被静默卸载），只把事件压入无锁 SPSC 环形队列，由独立线程发送。
 - 光标被系统钳制在虚拟桌面边缘时，钩子的坐标不再变化；因此用 `RIDEV_INPUTSINK` Raw Input 的设备增量判断"继续朝所选方向推"并驱动远端光标。越过所选边缘 3 像素即进入远程状态，本地输入被吞掉；朝其他方向移动会清零累计值。
 - 远程时把对方光标移出**进入时那条边**，或按 `Ctrl+Alt+Shift+Q`，即交还控制；进入/离开时重新同步物理按住的修饰键与鼠标键，避免对端卡键。四条边的对应关系：右侧→本机右缘出、对方左缘入/出；左侧→本机左缘出、对方右缘入/出；上方→本机上缘出、对方下缘入/出；下方→本机下缘出、对方上缘入/出。
-- 方向由 `--stitch-side left|right|top|bottom` 指定（默认 `right`）；GUI 在启动前弹窗选择并写入 `config.ini` 的 `stitch_side`，下次作为默认。会话中切换方向走 GUI→sender 的 stdin 行 `STITCH|side=…`：stdin 线程调用 `kvmSetControllerSide()` 排队，消息循环在 50 ms 定时器里应用——若此刻正在控制对方，会先交还并释放按键，再挂上新边。
+- 方向由 `--stitch-side left|right|top|bottom` 指定（默认 `right`）；GUI 启动时直接沿用 `config.ini` 的 `stitch_side`，不再弹窗询问。会话中切换方向走 GUI→sender 的 stdin 行 `STITCH|side=…`：stdin 线程调用 `kvmSetControllerSide()` 排队，消息循环在 50 ms 定时器里应用——若此刻正在控制对方，会先交还并释放按键，再挂上新边。
 - 连接失败、握手失败、对方拒绝都会输出对应 `STAT|event=error`；事件状态变化输出 `STAT|event=stitch|state=local|remote|waiting|…|side=…`，GUI 的主页拼接卡片据此显示当前方向并提供四个切换选项（投屏、扩展、拼接都在主页，没有单独的会话页）。已建立的会话因网卡切换/对端重启/Wi-Fi 漫游丢失连接时不会结束会话：`kvmRunControllerResilient` 以 1/2/4/8/16/30 秒退避自动重连，期间输出 `state=reconnecting|reason=…|err=…|retry=…|delay_ms=…`，GUI 保持该卡片和「停止拼接」按钮；断线期间的 `STITCH|side=…` 会应用到下一次连接。首次连接失败（拒绝连接、对方忙、授权拒绝）仍按原样报错，不进入重试。
 - Linux/X11 控制端（`kvm_x11_ctl.cpp`）：XInput2 raw events 提供相对位移；进入远程时用 `XGrabKeyboard` 吞键并改用其 KeyPress/KeyRelease 事件转发（活动键盘抓取会抑制 raw key），鼠标键用 `XGrabButton` 被动抓取（活动 `XGrabPointer` 会抑制 raw motion，因此不用）；进入前用 XTest 释放本机已按下的键/鼠标键并回放给对端，离开时发 `RELEASE_ALL` 并把本机光标 warp 回边缘；XFixes 隐藏本机光标，Ctrl+Alt+Shift+Q 同样生效。Wayland 原生会话不支持。
 
@@ -331,6 +332,6 @@ Windows 采集优先使用 **DXGI Desktop Duplication**（`src/capture_dda.cpp`�
 | **原始** | 无损 RGB24，带宽最大 | |
 | **RLE** | 无损压缩（可远程卸载到接收端 CPU） | |
 
-低延迟调优：无 B 帧、`zerolatency`、GOP=2×fps、resize 后立即 IDR。桌面文字建议在设置中开启 4:4:4 色度（仅软件编码）。
+低延迟调优：无 B 帧、`zerolatency`、GOP=2×fps、resize 后立即 IDR。软件编码器使用切片线程（按 CPU 核心数取 2–4 个），避免帧线程带来的额外延迟。接收端默认使用多线程软件解码（帧 + 切片线程），单帧延迟约多一帧，但 1440p 直播流用单线程解码无法跟上；Windows 可用 `MIVARA_DECODE=hw` 启用 D3D11VA 硬件解码（实测 1440p 每帧回读约 11.7 ms，四线程软解约 5.3 ms，因此不作为默认）。4:4:4 始终走软件解码。硬件解码器打开后若连续 8 帧没有输出（某些驱动会静默失败），会自动重建为软件解码并等待下一个关键帧，不会因此黑屏或断开会话。桌面文字建议在设置中开启 4:4:4 色度（仅软件编码）。
 
 带宽与延迟数据见 [性能](performance.md)。

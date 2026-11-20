@@ -15,6 +15,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -33,12 +34,16 @@ struct DdaState {
     int w = 0, h = 0;
     RECT out_rect = {0, 0, 0, 0};
 
-    /* Clean desktop image (no cursor) and the returned cursor-composited copy. */
-    std::vector<uint8_t> bg;
+    /* The DIB holds the cursor-composited image. Only the rectangle under the
+     * cursor is saved before drawing, so a cursor move does not have to copy
+     * the whole frame; a newly acquired desktop frame overwrites it all. */
     HDC     mdc = nullptr;
     HBITMAP dib = nullptr;
     HGDIOBJ old_bmp = nullptr;
     uint8_t *out_bits = nullptr;
+    std::vector<uint8_t> cursor_save;
+    int     save_x = 0, save_y = 0, save_w = 0, save_h = 0;
+    bool    cursor_painted = false;
 
     bool    have_frame = false;
     bool    dirty = false;   /* bg or cursor changed since the last compose */
@@ -63,8 +68,10 @@ struct DdaState {
         if (ctx)     { ctx->Release(); ctx = nullptr; }
         if (device)  { device->Release(); device = nullptr; }
         if (factory) { factory->Release(); factory = nullptr; }
-        bg.clear();
-        bg.shrink_to_fit();
+        cursor_save.clear();
+        cursor_save.shrink_to_fit();
+        save_x = save_y = save_w = save_h = 0;
+        cursor_painted = false;
         mdc = nullptr;
         dib = nullptr;
         old_bmp = nullptr;
@@ -237,7 +244,6 @@ bool createSurface(std::string *error)
         if (error) *error = "SelectObject(DIB) failed";
         return false;
     }
-    g.bg.assign((size_t)g.w * g.h * 4, 0);
     g.cursor_w = GetSystemMetrics(SM_CXCURSOR);
     g.cursor_h = GetSystemMetrics(SM_CYCURSOR);
     return true;
@@ -314,16 +320,42 @@ bool updateCursor()
 void composeCursor()
 {
     const size_t row = (size_t)g.w * 4;
-    std::memcpy(g.out_bits, g.bg.data(), row * (size_t)g.h);
+
+    /* Put back the desktop pixels the previous cursor covered. A static
+     * desktop that only moves the mouse therefore touches a cursor-sized
+     * rectangle instead of copying a full 1440p frame every time. */
+    if (g.cursor_painted) {
+        for (int y = 0; y < g.save_h; ++y)
+            std::memcpy(g.out_bits + (size_t)(g.save_y + y) * row +
+                            (size_t)g.save_x * 4,
+                        g.cursor_save.data() + (size_t)y * g.save_w * 4,
+                        (size_t)g.save_w * 4);
+        g.cursor_painted = false;
+    }
+
     if (g.cursor && g.cursor_in_output) {
         const int cx = g.cursor_pos.x - (int)g.out_rect.left - g.cursor_hotspot.x;
         const int cy = g.cursor_pos.y - (int)g.out_rect.top - g.cursor_hotspot.y;
         /* A hotspot just outside the output can still have its image overlap
          * it; GDI clips the rest. */
-        if (cx < g.w && cy < g.h &&
-            cx + g.cursor_w > 0 && cy + g.cursor_h > 0) {
+        const int x0 = std::max(0, cx);
+        const int y0 = std::max(0, cy);
+        const int x1 = std::min(g.w, cx + g.cursor_w);
+        const int y1 = std::min(g.h, cy + g.cursor_h);
+        if (x1 > x0 && y1 > y0) {
+            g.save_x = x0;
+            g.save_y = y0;
+            g.save_w = x1 - x0;
+            g.save_h = y1 - y0;
+            g.cursor_save.resize((size_t)g.save_w * (size_t)g.save_h * 4);
+            for (int y = 0; y < g.save_h; ++y)
+                std::memcpy(g.cursor_save.data() + (size_t)y * g.save_w * 4,
+                            g.out_bits + (size_t)(g.save_y + y) * row +
+                                (size_t)g.save_x * 4,
+                            (size_t)g.save_w * 4);
             DrawIconEx(g.mdc, cx, cy, g.cursor,
                        g.cursor_w, g.cursor_h, 0, nullptr, DI_NORMAL);
+            g.cursor_painted = true;
         }
     }
     /* DrawIconEx is a GDI call; flush before the CPU reads the DIB bits. */
@@ -371,14 +403,18 @@ bool copyFrame(IDXGIResource *res)
     g.ctx->CopyResource(g.staging, tex);
     D3D11_MAPPED_SUBRESOURCE map = {};
     if (SUCCEEDED(g.ctx->Map(g.staging, 0, D3D11_MAP_READ, 0, &map))) {
+        /* Copy straight into the DIB: it *is* the clean background until the
+         * cursor is composed onto it. The duplicated image never contains a
+         * cursor, so the previous one is gone with this write. */
         const size_t row = (size_t)g.w * 4;
         for (int y = 0; y < g.h; y++)
-            std::memcpy(g.bg.data() + (size_t)y * row,
+            std::memcpy(g.out_bits + (size_t)y * row,
                         (const uint8_t *)map.pData + (size_t)y * map.RowPitch,
                         row);
         g.ctx->Unmap(g.staging, 0);
         g.have_frame = true;
         g.dirty = true;
+        g.cursor_painted = false;
     } else {
         ok = false;
     }
@@ -417,7 +453,8 @@ bool seedFromGDI()
                         SRCCOPY | CAPTUREBLT) != FALSE;
             if (ok) {
                 GdiFlush();
-                std::memcpy(g.bg.data(), bits, (size_t)g.w * g.h * 4);
+                std::memcpy(g.out_bits, bits, (size_t)g.w * g.h * 4);
+                g.cursor_painted = false;
             }
             SelectObject(mdc, old);
         }

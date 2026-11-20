@@ -13,6 +13,7 @@
  */
 #include "codec.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 
@@ -21,6 +22,8 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
+#include <libavutil/cpu.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
@@ -140,6 +143,7 @@ struct Encoder::Priv {
     AVPacket       *pkt   = nullptr;
     SwsContext     *sws   = nullptr;
     SwsContext     *sws_bgr = nullptr;
+    SwsContext     *sws_bgra = nullptr;
     int src_w = 0, src_h = 0;
     int dst_w = 0, dst_h = 0;
     int64_t pts = 0;
@@ -164,11 +168,16 @@ bool Encoder::isHw() const { return p_->hw; }
 int Encoder::width() const { return p_->dst_w; }
 int Encoder::height() const { return p_->dst_h; }
 int Encoder::gopFrames() const { return p_->ctx ? p_->ctx->gop_size : 0; }
+bool Encoder::outputsNV12() const
+{
+    return p_->ctx && p_->ctx->pix_fmt == AV_PIX_FMT_NV12;
+}
 
 void Encoder::forceKeyframe() { p_->force_idr = true; }
 
 void Encoder::close()
 {
+    if (p_->sws_bgra) { sws_freeContext(p_->sws_bgra); p_->sws_bgra = nullptr; }
     if (p_->sws_bgr) { sws_freeContext(p_->sws_bgr); p_->sws_bgr = nullptr; }
     if (p_->sws)   { sws_freeContext(p_->sws); p_->sws = nullptr; }
     if (p_->pkt)   { av_packet_free(&p_->pkt); }
@@ -320,10 +329,14 @@ std::string Encoder::open(const EncoderConfig &cfg)
         ctx->flags &= ~AV_CODEC_FLAG_GLOBAL_HEADER;
         ctx->gop_size = cfg.gop_frames > 0 ? cfg.gop_frames : 2 * cfg.fps;
         ctx->keyint_min = ctx->gop_size;
-        /* frame threading adds latency; slice threading does not */
+        /* Slice threading only: frame threading would add a frame of latency.
+         * Two slices (the previous value) leave most cores idle at 1440p and
+         * above; four slices roughly halve the per-frame encode time at a
+         * small bitrate cost, which is the right trade for a live stream. */
         if (std::strcmp(codec->name, "libx264") == 0 ||
             std::strcmp(codec->name, "libx265") == 0) {
-            ctx->thread_count = 2;
+            const int cores = av_cpu_count();
+            ctx->thread_count = std::min(4, std::max(2, cores / 2));
             ctx->thread_type  = FF_THREAD_SLICE;
         } else {
             ctx->thread_count = 1;
@@ -457,6 +470,21 @@ std::string Encoder::encodeBGR24(const uint8_t *bgr24, int src_stride,
     return p_->encodeFrame(bgr24, src_stride, p_->sws_bgr, out);
 }
 
+std::string Encoder::encodeBGRA(const uint8_t *bgra, int src_stride,
+                                std::vector<uint8_t> &out)
+{
+    out.clear();
+    if (!p_->ctx || !bgra) return "encoder: not open";
+    if (!p_->sws_bgra) {
+        p_->sws_bgra = sws_getContext(
+            p_->src_w, p_->src_h, AV_PIX_FMT_BGRA,
+            p_->dst_w, p_->dst_h, p_->ctx->pix_fmt,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!p_->sws_bgra) return "encoder: BGRA swscale init failed";
+    }
+    return p_->encodeFrame(bgra, src_stride, p_->sws_bgra, out);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * DECODER
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -464,23 +492,160 @@ std::string Encoder::encodeBGR24(const uint8_t *bgr24, int src_stride,
 struct Decoder::Priv {
     AVCodecContext *ctx = nullptr;
     AVCodecParserContext *parser = nullptr;
-    AVFrame *frame = nullptr;
+    AVFrame *frame = nullptr;      /* decoded frame (hw or sw)              */
+    AVFrame *sw_frame = nullptr;   /* download target when decoding on GPU  */
     std::vector<uint8_t> in_scratch;   /* padded parser input  */
-    std::vector<uint8_t> pkt_scratch;  /* padded packet buffer */
     CodecId codec = CODEC_RAW;
+    int width = 0, height = 0;
+    int threads = 0;
+    bool hw = false;
+    /* Set after a hardware path turns out not to decode this stream: the AU
+     * that failed is dropped and frames are swallowed until an IDR arrives,
+     * so a mis-negotiated profile costs one GOP, not the session. */
+    bool resync = false;
+    /* Consecutive AUs fed without a decoded frame. A hardware decoder that
+     * accepted the stream but cannot really handle its profile fails
+     * silently, so "opened successfully" proves nothing. */
+    int aus_since_frame = 0;
+    std::string impl;
+
+    void release();
+    std::string openSoftware(const AVCodec *c, int w, int h);
+    std::string openHardware(const AVCodec *c, int w, int h);
 };
+
+void Decoder::Priv::release()
+{
+    if (parser) { av_parser_close(parser); parser = nullptr; }
+    if (sw_frame) { av_frame_free(&sw_frame); }
+    if (frame)  { av_frame_free(&frame); }
+    if (ctx)    { avcodec_free_context(&ctx); }
+    hw = false;
+    resync = false;
+    aus_since_frame = 0;
+    threads = 0;
+    impl.clear();
+}
 
 Decoder::Decoder() : p_(new Priv) {}
 Decoder::~Decoder() { close(); }
 
-void Decoder::close()
+void Decoder::close() { p_->release(); }
+
+const char *Decoder::implName() const
 {
-    if (p_->parser) { av_parser_close(p_->parser); p_->parser = nullptr; }
-    if (p_->frame)  { av_frame_free(&p_->frame); }
-    if (p_->ctx)    { avcodec_free_context(&p_->ctx); }
+    return p_->impl.empty() ? "none" : p_->impl.c_str();
+}
+bool Decoder::isHw() const { return p_->hw; }
+int Decoder::threadCount() const { return p_->threads; }
+
+std::string Decoder::Priv::openSoftware(const AVCodec *c, int w, int h)
+{
+    AVCodecContext *cctx = avcodec_alloc_context3(c);
+    if (!cctx) return "alloc failed";
+    cctx->width  = w;
+    cctx->height = h;
+    /* Frame + slice threading: frame threading costs about one frame of
+     * extra latency, but a single-threaded 1440p HEVC decoder cannot keep up
+     * with a live stream on a laptop CPU, and the resulting dropped presents
+     * feel far worse than one frame of added delay. Slice threading is kept
+     * for streams that carry several slices. */
+    const int cores = av_cpu_count();
+    const int threads = std::min(4, std::max(1, cores / 2));
+    cctx->thread_count = threads;
+    cctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    cctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+    int ret = avcodec_open2(cctx, c, nullptr);
+    if (ret < 0) {
+        avcodec_free_context(&cctx);
+        return "open: " + avErr(ret);
+    }
+    AVFrame *f = av_frame_alloc();
+    AVCodecParserContext *pc = av_parser_init(c->id);
+    if (!f || !pc) {
+        if (f) av_frame_free(&f);
+        if (pc) av_parser_close(pc);
+        avcodec_free_context(&cctx);
+        return "frame/parser alloc failed";
+    }
+    ctx = cctx;
+    frame = f;
+    parser = pc;
+    this->threads = threads;
+    hw = false;
+    impl = std::string(c->name) + " (sw, " + std::to_string(threads) +
+           " threads)";
+    return "";
 }
 
-std::string Decoder::open(CodecId codec, int width, int height)
+#ifdef _WIN32
+/* Ask for a D3D11VA frame; every other format in the list means the decoder
+ * could not use the hardware path for this stream. */
+static enum AVPixelFormat pickD3d11Format(AVCodecContext *,
+                                          const enum AVPixelFormat *fmt)
+{
+    for (const enum AVPixelFormat *p = fmt; *p != AV_PIX_FMT_NONE; ++p)
+        if (*p == AV_PIX_FMT_D3D11) return *p;
+    return fmt[0];
+}
+#endif
+
+std::string Decoder::Priv::openHardware(const AVCodec *c, int w, int h)
+{
+#ifdef _WIN32
+    AVBufferRef *dev = nullptr;
+    int ret = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA,
+                                     nullptr, nullptr, 0);
+    if (ret < 0) return "d3d11va device: " + avErr(ret);
+
+    AVCodecContext *cctx = avcodec_alloc_context3(c);
+    if (!cctx) { av_buffer_unref(&dev); return "alloc failed"; }
+    cctx->width  = w;
+    cctx->height = h;
+    cctx->thread_count = 1;
+    cctx->thread_type  = 0;
+    cctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    cctx->hw_device_ctx = av_buffer_ref(dev);
+    av_buffer_unref(&dev);
+    cctx->get_format = pickD3d11Format;
+
+    /* Let the decoder build its own frames context via
+     * avcodec_get_hw_frames_parameters(): a hand-built NV12 pool is rejected
+     * by some drivers (CreateTexture2D returns E_INVALIDARG), while the
+     * decoder knows the profile-specific sw_format and bind flags. */
+
+    ret = avcodec_open2(cctx, c, nullptr);
+    if (ret < 0) {
+        avcodec_free_context(&cctx);
+        return "hw open: " + avErr(ret);
+    }
+
+    AVFrame *f = av_frame_alloc();
+    AVFrame *sw = av_frame_alloc();
+    AVCodecParserContext *pc = av_parser_init(c->id);
+    if (!f || !sw || !pc) {
+        if (f) av_frame_free(&f);
+        if (sw) av_frame_free(&sw);
+        if (pc) av_parser_close(pc);
+        avcodec_free_context(&cctx);
+        return "frame/parser alloc failed";
+    }
+    ctx = cctx;
+    frame = f;
+    sw_frame = sw;
+    parser = pc;
+    hw = true;
+    threads = 0;
+    impl = std::string(c->name) + "_d3d11va";
+    return "";
+#else
+    (void)c; (void)w; (void)h;
+    return "hardware decode unsupported on this platform";
+#endif
+}
+
+std::string Decoder::open(CodecId codec, int width, int height, bool want_hw)
 {
     close();
     if (width <= 0 || height <= 0) return "decoder: invalid dimensions";
@@ -491,32 +656,26 @@ std::string Decoder::open(CodecId codec, int width, int height)
     const AVCodec *c = avcodec_find_decoder(av_id);
     if (!c) return "decoder: no decoder for codec";
 
-    p_->ctx = avcodec_alloc_context3(c);
-    if (!p_->ctx) return "decoder: alloc failed";
-    p_->ctx->thread_count = 1;   /* frame threading adds latency */
-    p_->ctx->thread_type  = 0;
-    p_->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-
-    int ret = avcodec_open2(p_->ctx, c, nullptr);
-    if (ret < 0) {
-        std::string e = "decoder: open: " + avErr(ret);
-        close();
-        return e;
-    }
-
-    p_->parser = av_parser_init(av_id);
-    if (!p_->parser) {
-        close();
-        return "decoder: parser init failed";
-    }
-
-    p_->frame = av_frame_alloc();
-    if (!p_->frame) {
-        close();
-        return "decoder: frame alloc failed";
-    }
     p_->codec = codec;
-    return "";
+    p_->width = width;
+    p_->height = height;
+
+    std::string hw_err;
+    /* AV1 software decoding (dav1d) is already tile-parallel and fast; the
+     * D3D11VA AV1 path is far less universal, so keep it on software. */
+    if (want_hw && codec != CODEC_AV1) {
+        hw_err = p_->openHardware(c, width, height);
+        if (hw_err.empty()) return "";
+        p_->release();
+        p_->codec = codec;
+        p_->width = width;
+        p_->height = height;
+    }
+    std::string sw_err = p_->openSoftware(c, width, height);
+    if (sw_err.empty()) return "";
+    std::string e = "decoder: " + sw_err;
+    if (!hw_err.empty()) e += " (hw: " + hw_err + ")";
+    return e;
 }
 
 static DecodedFrame mapFrame(const AVFrame *f)
@@ -549,8 +708,10 @@ static DecodedFrame mapFrame(const AVFrame *f)
 
 /* Feed one access-unit to the decoder. Never drops a packet on EAGAIN: drains
  * ready frames first, then retries the send. The latest decoded frame is
- * stored in `out` (got=true). */
+ * stored in `out` (got=true). Hardware frames are downloaded to `sw_frame`
+ * first; `sw_frame` may be null for a software decoder. */
 static std::string feedPacket(AVCodecContext *ctx, AVFrame *frame,
+                              AVFrame *sw_frame,
                               uint8_t *data, int size,
                               DecodedFrame &out, bool &got)
 {
@@ -562,7 +723,21 @@ static std::string feedPacket(AVCodecContext *ctx, AVFrame *frame,
     /* Receive one frame. Returns: 0=got frame, 1=EAGAIN/EOF, <0 error. */
     auto recv_one = [&](int &status) -> std::string {
         status = avcodec_receive_frame(ctx, frame);
-        if (status == 0) { out = mapFrame(frame); got = true; return ""; }
+        if (status == 0) {
+            if (frame->format == AV_PIX_FMT_D3D11 && sw_frame) {
+                /* GPU → system memory. The NV12 download is a few MB and
+                 * costs a couple of milliseconds, still far below software
+                 * decoding at 1440p. */
+                av_frame_unref(sw_frame);
+                const int tr = av_hwframe_transfer_data(sw_frame, frame, 0);
+                if (tr < 0) return "decoder: hw download: " + avErr(tr);
+                out = mapFrame(sw_frame);
+            } else {
+                out = mapFrame(frame);
+            }
+            got = true;
+            return "";
+        }
         if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) return "";
         return "decoder: receive_frame: " + avErr(status);
     };
@@ -608,8 +783,37 @@ std::string Decoder::decode(const uint8_t *data, size_t size, DecodedFrame &out)
     p_->in_scratch.assign(data, data + size);
     p_->in_scratch.resize(size + AV_INPUT_BUFFER_PADDING_SIZE, 0);
     bool got = false;
-    return feedPacket(p_->ctx, p_->frame, p_->in_scratch.data(),
-                      (int)size, out, got);
+    std::string err = feedPacket(p_->ctx, p_->frame, p_->sw_frame,
+                                 p_->in_scratch.data(), (int)size, out, got);
+
+    if (out.valid())          p_->aus_since_frame = 0;
+    else if (err.empty())     ++p_->aus_since_frame;
+
+    /* The accelerated decoder accepted the configuration at open time but
+     * cannot decode this profile (e.g. a 4:4:4 stream on a GPU that only
+     * advertises 4:2:0). Observed behaviour is a silent stall: no frame and
+     * no error, so a pure error check never fires. Eight AUs without one
+     * frame is not parser buffering. Rebuild in software, drop this AU and
+     * swallow frames until the next IDR; the sender's next keyframe (≤ 2 s)
+     * restores the picture instead of the whole session dying black. */
+    const bool hw_stalled = p_->hw && p_->aus_since_frame >= 8;
+    if ((!err.empty() || hw_stalled) && p_->hw) {
+        const CodecId codec = p_->codec;
+        const int w = p_->width, h = p_->height;
+        out = DecodedFrame();
+        const std::string serr = open(codec, w, h, false);
+        if (serr.empty()) {
+            p_->resync = true;
+            return "";
+        }
+        return err.empty() ? "decoder: hardware decode stalled" : err;
+    }
+    if (p_->resync) {
+        if (!err.empty()) { out = DecodedFrame(); return ""; }
+        if (out.valid() && out.keyframe) p_->resync = false;
+        else                             out = DecodedFrame();
+    }
+    return err;
 }
 
 std::string Decoder::flush(DecodedFrame &out)
@@ -618,7 +822,15 @@ std::string Decoder::flush(DecodedFrame &out)
     if (!p_->ctx) return "";
     avcodec_send_packet(p_->ctx, nullptr);
     int ret = avcodec_receive_frame(p_->ctx, p_->frame);
-    if (ret == 0) out = mapFrame(p_->frame);
+    if (ret == 0) {
+        if (p_->frame->format == AV_PIX_FMT_D3D11 && p_->sw_frame) {
+            av_frame_unref(p_->sw_frame);
+            if (av_hwframe_transfer_data(p_->sw_frame, p_->frame, 0) == 0)
+                out = mapFrame(p_->sw_frame);
+        } else {
+            out = mapFrame(p_->frame);
+        }
+    }
     return "";
 }
 

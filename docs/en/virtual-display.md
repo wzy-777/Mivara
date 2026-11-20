@@ -31,7 +31,7 @@ The script preserves existing resolution settings and verifies the `Root\MttVDD`
 
 ### Resolution Notes
 
-Extend mode **asks the receiver for its current resolution first** (a zero-window probe) and then configures the virtual display to the same size, so the extended screen is 1:1 instead of stretched when the two aspect ratios differ. The virtual display is placed right of the existing desktop.
+Extend mode **asks the receiver for its current resolution first** (a zero-window probe) and then configures the virtual display to the same size, so the extended screen is 1:1 instead of stretched when the two aspect ratios differ. The virtual display starts right of the existing desktop by default; after you move it in Windows Display settings (left / right / top / bottom, including gaps and offsets), Mivara remembers that placement when the session ends and restores it on the next extend session. The placement is stored in `%LOCALAPPDATA%\Mivara\extend.pos`; delete that file to return to the default right-of-desktop position.
 
 The driver reads its mode list from `vdd_settings.xml` once at start-up; a size that is not in the list cannot be applied. Therefore:
 

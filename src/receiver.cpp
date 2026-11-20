@@ -15,6 +15,7 @@
  *  - Is borderless and positioned at (0, 0) on the receiver display
  *  - Covers the full receiver display (SDL_WINDOW_FULLSCREEN_DESKTOP)
  *  - Has no title bar or window chrome, so it looks like a real monitor
+ *  - Opens above other windows (one-shot raise, never always-on-top)
  *
  * Mirror mode also opens borderless fullscreen by default; F11 in either
  * mode drops back to a normal resizable window (original behaviour).
@@ -55,6 +56,9 @@
 #include <sstream>
 
 #include <SDL2/SDL.h>
+#ifdef _WIN32
+#include <SDL2/SDL_syswm.h>   /* SDL_GetWindowWMInfo for the one-shot raise */
+#endif
 #include "auth.h"
 #include "config.h"
 #include "discover.h"
@@ -140,7 +144,11 @@ typedef int plat_sock_t;
 #define GPU_STATS_FILE "gpu_stats.json"
 #define GPU_STATS_INTERVAL 60 // Write stats every 60 seconds
 
-static const int SOCK_BUF = 4 * 1024 * 1024;
+/* 1 MB receive window: enough for the bandwidth-delay product of a LAN or
+ * Wi-Fi link, small enough that a decoding hiccup cannot hide seconds of
+ * stale frames in the kernel. The sender paces frames; it does not need a
+ * 4 MB pipe. */
+static const int SOCK_BUF = 1 * 1024 * 1024;
 
 /* ── GPU Statistics Structure ───────────────────────────────────────────── */
 struct GPUStats
@@ -1461,6 +1469,17 @@ static int sendHsStatus(plat_sock_t s, uint32_t status, CodecId codec)
     return send_all_p(s, &r, sizeof(r));
 }
 
+/* Hardware decoding is opt-in. D3D11VA downloads every decoded frame to
+ * system memory; on a 1440p stream that costs about as much as a four-thread
+ * software decode, without the portability. `MIVARA_DECODE=hw` enables it for
+ * machines whose CPU is the bottleneck and whose GPU download is cheap.
+ * `MIVARA_DECODE=sw` documents the default. */
+static bool decodeWantHw()
+{
+    const char *env = std::getenv("MIVARA_DECODE");
+    return env && std::strcmp(env, "hw") == 0;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * HANDSHAKE WORKER  –  v3 authorization (runs off the main thread)
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -1680,11 +1699,18 @@ static bool handshakeOne(plat_sock_t client)
     if (hs_status == HS_OK) {
         sess_codec = (CodecId)req.codec;
         if (req.codec >= (uint32_t)CODEC_H264) {
-            const std::string derr = decoder->open(sess_codec, w, h);
+            /* 4:4:4 has no D3D11VA representation; asking for hardware there
+             * would only produce a black gap until the next IDR. */
+            const bool want_hw = decodeWantHw() &&
+                (req.codec_flags & CODEC_FLAG_CHROMA_444) == 0;
+            const std::string derr = decoder->open(sess_codec, w, h, want_hw);
             if (!derr.empty()) {
                 std::lock_guard<std::mutex> lk(g_stat_mtx);
                 std::cerr << "Decoder open failed: " << derr << "\n";
                 hs_status = HS_ERR_DECODER;
+            } else {
+                std::lock_guard<std::mutex> lk(g_stat_mtx);
+                std::cout << "Decoder: " << decoder->implName() << "\n";
             }
         }
     }
@@ -1817,6 +1843,31 @@ static void requestSessionDisconnect()
         shutdown(g_active_client, SHUT_RDWR);
 #endif
     }
+}
+
+/* Put the session window above whatever the receiver user was looking at
+ * when the session opened — exactly once, never staying always-on-top.
+ * SDL_RaiseWindow() is SetForegroundWindow() on Windows, which the
+ * foreground lock refuses while the receiver runs in the background, and a
+ * plain HWND_TOP can likewise leave the window behind the foreground app.
+ * Briefly entering the topmost band works: dropping HWND_TOPMOST puts the
+ * window at the top of the normal z-order, and later window switches reorder
+ * it like any other window. */
+static void raiseSessionWindowOnce(SDL_Window *win)
+{
+#ifdef _WIN32
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS)
+    {
+        SetWindowPos(wm.info.win.window, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(wm.info.win.window, HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        return;
+    }
+#endif
+    SDL_RaiseWindow(win);
 }
 
 static bool runSession(GrantedSession &sess)
@@ -1974,6 +2025,12 @@ static bool runSession(GrantedSession &sess)
     SDL_RenderClear(ren);
     SDL_RenderPresent(ren);
 
+    /* Extend opens a second desktop: make sure it is visible the moment the
+     * session starts. One-shot only — later window switches reorder it like
+     * any other window, and nothing is kept always-on-top. */
+    if (DISPLAY_MODE == MODE_TRUE_EXTEND)
+        raiseSessionWindowOnce(win);
+
     /* ── Receive and render frames ── */
     size_t full_frame = (size_t)SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL;
     std::vector<uint8_t> frame;
@@ -2087,14 +2144,18 @@ static bool runSession(GrantedSession &sess)
 
                 if (sess_codec >= CODEC_H264)
                 {
+                    const bool want_hw = decodeWantHw() &&
+                        (rs.codec_flags & CODEC_FLAG_CHROMA_444) == 0;
                     std::string derr =
-                        decoder.open(sess_codec, SCREEN_WIDTH, SCREEN_HEIGHT);
+                        decoder.open(sess_codec, SCREEN_WIDTH, SCREEN_HEIGHT,
+                                     want_hw);
                     if (!derr.empty())
                     {
                         std::cerr << "Decoder rebuild failed: " << derr << "\n";
                         emitRxStat("error", "msg=decoder_rebuild_failed");
                         break;
                     }
+                    std::cout << "Decoder: " << decoder.implName() << "\n";
                     skip_until_key = 30;
                 }
                 else

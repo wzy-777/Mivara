@@ -41,8 +41,17 @@ constexpr UINT kMsgCallback = WM_APP + 21;  /* lParam = mouse message    */
 constexpr UINT kMsgShow     = WM_APP + 22;  /* another launch wants focus */
 constexpr UINT kMsgTip      = WM_APP + 23;
 constexpr UINT kMsgNotify   = WM_APP + 24;
-constexpr int  kIdShow = 1;
-constexpr int  kIdQuit = 2;
+constexpr int  kIdShow   = 1;
+constexpr int  kIdQuit   = 2;
+constexpr int  kIdStatus = 3;           /* 显示主界面 (status submenus) */
+constexpr int  kIdStopSender = 4;
+constexpr int  kIdStopReceiver = 5;
+/* Host submenu command ids: kIdHostBase + hostIndex * kHostIdStride + action.
+ * Actions 0/1/2 are 投屏/扩展/拼接, 3 is 文件传输. The stride leaves room to
+ * grow; 20 history entries stay far below the 32-bit command range. */
+constexpr int  kIdHostBase   = 100;
+constexpr int  kHostIdStride = 8;
+constexpr int  kHostActions  = 4;
 
 const wchar_t *kClassName = L"MivaraTrayWnd";
 const wchar_t *kMutexName = L"Local\\Mivara.App.SingleInstance";
@@ -91,6 +100,21 @@ void stopWake()
 std::mutex  g_tip_mtx;
 std::wstring g_tip;
 
+/* Menu snapshot + the launch request it can raise. Both cross the GUI/tray
+ * thread boundary under their own mutex; the tray thread never reads app
+ * state. */
+std::mutex    g_menu_mtx;
+TrayMenuState g_menu;
+std::mutex    g_launch_mtx;
+struct LaunchReq {
+    int         action = TRAY_LAUNCH_NONE;
+    int         stop = TRAY_STOP_NONE;
+    std::string ip, name;
+    int         port = 8081;
+};
+LaunchReq g_launch;
+bool      g_launch_pending = false;
+
 std::mutex  g_notify_mtx;
 struct PendingNotify {
     std::wstring title, text;
@@ -112,6 +136,85 @@ void copyTip(wchar_t (&dst)[128], const std::wstring &src)
     const size_t n = src.size() < 127 ? src.size() : 127;
     wmemcpy(dst, src.c_str(), n);
     dst[n] = L'\0';
+}
+
+/* Menu text is a Win32 resource string: a single '&' marks an accelerator,
+ * and control characters would break the layout. Peer names come off the
+ * network, so escape both instead of trusting them. */
+std::wstring menuWide(const std::string &s)
+{
+    const std::wstring src = wide(s);
+    std::wstring out;
+    out.reserve(src.size());
+    for (wchar_t c : src) {
+        if (c < 0x20) c = L' ';
+        out.push_back(c);
+        if (c == L'&') out.push_back(L'&');
+    }
+    return out;
+}
+
+/* Keep a pathological name from overflowing the menu string limit; never split
+ * a UTF-16 surrogate pair. */
+std::wstring clampLabel(std::wstring s)
+{
+    constexpr size_t kMax = 96;
+    if (s.size() <= kMax) return s;
+    s.resize(kMax);
+    /* Never split an escaped "&&" pair or a UTF-16 surrogate pair. */
+    if (!s.empty() && s.back() == L'&') s.pop_back();
+    if (!s.empty() && s.back() >= 0xD800 && s.back() <= 0xDBFF)
+        s.pop_back();
+    s += L'…';
+    return s;
+}
+
+std::wstring hostLabel(const TrayHostEntry &h)
+{
+    std::wstring name = menuWide(h.name);
+    if (name.empty() || h.name == h.ip) {
+        /* No usable friendly name (missing, equal to the IP, or not valid
+         * UTF-8): fall back to the endpoint alone. */
+        const std::wstring ip = menuWide(h.ip);
+        return clampLabel(ip.empty() ? L"Mivara 主机" : ip);
+    }
+    return clampLabel(name + L" (" + menuWide(h.ip) + L")");
+}
+
+bool sameMenuState(const TrayMenuState &a, const TrayMenuState &b)
+{
+    if (a.session != b.session || a.session_mode != b.session_mode ||
+        a.receiver != b.receiver || a.hosts.size() != b.hosts.size())
+        return false;
+    for (size_t i = 0; i < a.hosts.size(); i++) {
+        const TrayHostEntry &x = a.hosts[i], &y = b.hosts[i];
+        if (x.name != y.name || x.ip != y.ip || x.port != y.port ||
+            x.last_mode != y.last_mode || x.detail != y.detail)
+            return false;
+    }
+    return true;
+}
+
+const wchar_t *const kModeNames[3] = {L"投屏", L"扩展", L"拼接"};
+
+/* One history host: the floating submenu Windows opens on hover. The first
+ * line states what the last session was; the rest are the actions the user
+ * can run with a click. */
+void fillHostMenu(HMENU sub, const TrayHostEntry &h, int index)
+{
+    if (!h.detail.empty()) {
+        const std::wstring detail = menuWide(h.detail);
+        AppendMenuW(sub, MF_STRING | MF_DISABLED, 0, detail.c_str());
+        AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+    }
+    const int base = kIdHostBase + index * kHostIdStride;
+    for (int m = 0; m < 3; m++) {
+        std::wstring label = kModeNames[m];
+        if (m == h.last_mode) label += L"（上次）";
+        AppendMenuW(sub, MF_STRING, base + m, label.c_str());
+    }
+    AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(sub, MF_STRING, base + 3, L"文件传输");
 }
 
 NOTIFYICONDATAW makeIcon(HWND hwnd)
@@ -147,11 +250,62 @@ void showBalloon(HWND hwnd, const std::wstring &title, const std::wstring &text)
 
 void showMenu(HWND hwnd)
 {
+    /* Build from the GUI's snapshot, taken once: the menu must stay stable
+     * while it is open even if the app's state changes underneath. */
+    TrayMenuState st;
+    {
+        std::lock_guard<std::mutex> lk(g_menu_mtx);
+        st = g_menu;
+    }
     POINT pt{};
     GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, kIdShow, L"显示主界面");
+    /* Live sessions only; the whole block disappears when nothing is running
+     * (a failing/stopped child must not leave a stale 正在投屏 line behind). */
+    if (!st.session.empty() || !st.receiver.empty()) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        /* A live row is a hover submenu: the floating menu keeps the old
+         * click-to-show action and adds the matching stop action. */
+        if (!st.session.empty()) {
+            HMENU sub = CreatePopupMenu();
+            if (sub) {
+                AppendMenuW(sub, MF_STRING, kIdStatus, L"显示主界面");
+                AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+                std::wstring stop = L"停止";
+                stop += (st.session_mode >= 0 && st.session_mode <= 2)
+                            ? kModeNames[st.session_mode] : L"会话";
+                AppendMenuW(sub, MF_STRING, kIdStopSender, stop.c_str());
+                const std::wstring label = clampLabel(menuWide(st.session));
+                if (!AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, label.c_str()))
+                    DestroyMenu(sub);
+            }
+        }
+        if (!st.receiver.empty()) {
+            HMENU sub = CreatePopupMenu();
+            if (sub) {
+                AppendMenuW(sub, MF_STRING, kIdStatus, L"显示主界面");
+                AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(sub, MF_STRING, kIdStopReceiver, L"停止接收");
+                const std::wstring label = clampLabel(menuWide(st.receiver));
+                if (!AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, label.c_str()))
+                    DestroyMenu(sub);
+            }
+        }
+    }
+    if (!st.hosts.empty()) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"历史连接");
+        for (size_t i = 0; i < st.hosts.size(); i++) {
+            HMENU sub = CreatePopupMenu();
+            if (!sub) continue;
+            fillHostMenu(sub, st.hosts[i], (int)i);
+            const std::wstring label = hostLabel(st.hosts[i]);
+            if (!AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, label.c_str()))
+                DestroyMenu(sub);
+        }
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdQuit, L"退出");
     /* Without foregrounding, the menu stays up after a click elsewhere. */
@@ -159,8 +313,32 @@ void showMenu(HWND hwnd)
     const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                     pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
-    if (cmd == kIdShow)      g_show_req = true;
-    else if (cmd == kIdQuit) g_quit_req = true;
+    if (cmd == kIdShow || cmd == kIdStatus) {
+        g_show_req = true;
+    } else if (cmd == kIdQuit) {
+        g_quit_req = true;
+    } else if (cmd == kIdStopSender || cmd == kIdStopReceiver) {
+        std::lock_guard<std::mutex> lk(g_launch_mtx);
+        g_launch.stop = (cmd == kIdStopSender) ? TRAY_STOP_SENDER
+                                               : TRAY_STOP_RECEIVER;
+        g_launch_pending = true;
+    } else if (cmd >= (UINT)kIdHostBase) {
+        const int rel = (int)cmd - kIdHostBase;
+        const size_t idx = (size_t)(rel / kHostIdStride);
+        const int act = rel % kHostIdStride;
+        if (idx < st.hosts.size() && act >= 0 && act < kHostActions) {
+            const TrayHostEntry &h = st.hosts[idx];
+            std::lock_guard<std::mutex> lk(g_launch_mtx);
+            g_launch.action = (act == 0) ? TRAY_LAUNCH_MIRROR
+                            : (act == 1) ? TRAY_LAUNCH_EXTEND
+                            : (act == 2) ? TRAY_LAUNCH_STITCH
+                                         : TRAY_LAUNCH_FILES;
+            g_launch.ip = h.ip;
+            g_launch.name = h.name;
+            g_launch.port = h.port;
+            g_launch_pending = true;
+        }
+    }
 }
 
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -335,11 +513,30 @@ void trayNotify(const std::string &title, const std::string &text)
     if (hwnd) PostMessageW(hwnd, kMsgNotify, 0, 0);
 }
 
+void traySetMenuState(const TrayMenuState &state)
+{
+    std::lock_guard<std::mutex> lk(g_menu_mtx);
+    if (sameMenuState(g_menu, state)) return;
+    g_menu = state;
+}
+
 TrayRequests trayTakeRequests()
 {
     TrayRequests r;
     r.show = g_show_req.exchange(false);
     r.quit = g_quit_req.exchange(false);
+    {
+        std::lock_guard<std::mutex> lk(g_launch_mtx);
+        if (g_launch_pending) {
+            r.launch = g_launch.action;
+            r.stop = g_launch.stop;
+            r.ip = g_launch.ip;
+            r.name = g_launch.name;
+            r.port = g_launch.port;
+            g_launch = LaunchReq();
+            g_launch_pending = false;
+        }
+    }
     return r;
 }
 
@@ -355,6 +552,15 @@ void trayShutdown()
     }
     g_hwnd = nullptr;
     g_live = false;
+    {
+        std::lock_guard<std::mutex> lk(g_menu_mtx);
+        g_menu = TrayMenuState();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_launch_mtx);
+        g_launch = LaunchReq();
+        g_launch_pending = false;
+    }
 }
 
 #else  /* !_WIN32 */
@@ -364,6 +570,7 @@ void traySingleInstanceRelease() {}
 bool trayInit(const std::string &) { return false; }
 void traySetTooltip(const std::string &) {}
 void trayNotify(const std::string &, const std::string &) {}
+void traySetMenuState(const TrayMenuState &) {}
 TrayRequests trayTakeRequests() { return TrayRequests(); }
 void trayShutdown() {}
 

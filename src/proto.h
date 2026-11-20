@@ -100,7 +100,9 @@ enum CtrlType : uint32_t {
 };
 
 /* HsRequestV2.codec_flags */
-#define CODEC_FLAG_WANT_HW 0x1u   /* bit0: sender would like hardware encode */
+#define CODEC_FLAG_WANT_HW 0x1u     /* bit0: sender would like hardware encode */
+#define CODEC_FLAG_CHROMA_444 0x2u  /* bit1: stream is 4:4:4 (software only) —
+                                       the receiver must not use D3D11VA decode */
 
 /* Display-size probe convention (no extra packet type, no version bump):
  * a sender may send a normal HsRequestV2 with width=0 AND height=0 before

@@ -57,11 +57,22 @@ public:
 
     /* BGR24 variant for Windows capture. src_stride includes any row padding.
      * The swscale pass converts directly to the encoder's YUV format, avoiding
-     * a separate full-frame BGR->RGB copy. DXGI frames are packed to BGR24 by
-     * the caller first: swscale's BGRA kernel is not pixel-identical to its
-     * BGR24 kernel (measured max 29 levels on synthetic input). */
+     * a separate full-frame BGR->RGB copy. */
     std::string encodeBGR24(const uint8_t *bgr24, int src_stride,
                             std::vector<uint8_t> &out);
+
+    /* BGRA variant for DXGI Desktop Duplication. Feeding the duplicated
+     * surface straight to swscale skips the per-frame BGRA->BGR24 pack.
+     * Only safe when outputsNV12() is true: swscale's BGRA->YUV420P kernel
+     * differs from its BGR24 one (measured max 29, mean 0.57 levels on a
+     * full-channel gradient), while the BGRA->NV12 kernel is byte-identical
+     * (max 0). Callers must pack BGR24 for a YUV420P encoder. */
+    std::string encodeBGRA(const uint8_t *bgra, int src_stride,
+                           std::vector<uint8_t> &out);
+
+    /* True when the encoder consumes NV12 (every hardware encoder), i.e. the
+     * BGRA fast path is colour-exact for this configuration. */
+    bool outputsNV12() const;
 
     /* Request a keyframe for the next encode (best-effort IDR/I-frame). */
     void forceKeyframe();
@@ -105,8 +116,12 @@ public:
     Decoder(const Decoder &) = delete;
     Decoder &operator=(const Decoder &) = delete;
 
-    /* Returns "" on success, error string when no decoder is available. */
-    std::string open(CodecId codec, int width, int height);
+    /* Returns "" on success, error string when no decoder is available.
+     * The default is the multi-threaded software decoder (predictable across
+     * drivers). want_hw asks for a platform hardware decoder first (Windows
+     * D3D11VA); any failure silently falls back to software, so a caller
+     * never has to care why the fast path was unavailable. */
+    std::string open(CodecId codec, int width, int height, bool want_hw = false);
 
     /* Feed one access unit. `out.valid()` becomes true when a frame is
      * ready (parser buffering may yield no frame for some AUs). */
@@ -116,6 +131,11 @@ public:
     std::string flush(DecodedFrame &out);
 
     void close();
+
+    /* e.g. "hevc_d3d11va" or "hevc (sw, 4 threads)" – for logs only. */
+    const char *implName() const;
+    bool isHw() const;
+    int threadCount() const;
 
 private:
     struct Priv;

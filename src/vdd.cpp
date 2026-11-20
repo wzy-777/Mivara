@@ -4,9 +4,9 @@
  * Deep-integrated lifecycle for the indirect-display driver
  * (VirtualDrivers/Virtual-Display-Driver, device id "MTT1337"):
  *   - vddStartup()     : enable the PnP device, activate the virtual monitor
- *                        (CCD SetDisplayConfig), place it right of the real
- *                        desktop, aim capture
- *   - vddShutdown()    : detach + disable the device once the session ends
+ *                        (CCD SetDisplayConfig), place it at the remembered
+ *                        spot (default: right of the real desktop), aim capture
+ *   - vddShutdown()    : remember the placement, detach + disable the device
  *   - vddForceDetach() : unconditional detach/disable (GUI safety net)
  *
  * Detaching via CCD alone is NOT enough: the monitor node stays visible in
@@ -33,11 +33,13 @@
 #include <windows.h>
 #include <cfgmgr32.h>
 #include <setupapi.h>
+#include <shlobj.h>
 
 #include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -51,6 +53,11 @@
  * happened to activate it (us, or a leftover from a crashed session) – so
  * it is ALWAYS detached again when the session ends. */
 static std::atomic<bool> g_vdd_own{false};
+
+/* Set once vddStartup() successfully applied the final position. Teardown
+ * only then teaches the placement file; a failed startup must not replace
+ * the user's remembered position with a transient/default one. */
+static std::atomic<bool> g_vdd_configured{false};
 
 /* Enable / disable the MttVDD virtual-display adapter via SetupAPI.
  * The PnP instance is ROOT\DISPLAY\000x (class Display, hardware ID
@@ -912,28 +919,6 @@ static bool isVddMonitorDevice(const char *gdiDevice)
     return false;
 }
 
-/* Rightmost desktop edge EXCLUDING virtual-display monitors, so the VDD
- * can be placed right after the real desktop (not after itself). */
-struct EdgeScanCtx { int right; };
-static BOOL CALLBACK edgeScanProc(HMONITOR hmon, HDC, LPRECT rc, LPARAM lp)
-{
-    auto *ctx = (EdgeScanCtx *)lp;
-    MONITORINFOEXA mi;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoA(hmon, (MONITORINFO *)&mi) &&
-        !isVddMonitorDevice(mi.szDevice)) {
-        if (rc->right > ctx->right) ctx->right = rc->right;
-    }
-    return TRUE;
-}
-
-static int desktopRightEdge()
-{
-    EdgeScanCtx ctx = {0};
-    EnumDisplayMonitors(NULL, NULL, edgeScanProc, (LPARAM)&ctx);
-    return ctx.right;
-}
-
 /* Locate a monitor rect in the virtual desktop by GDI device name. */
 struct MonRectSearch { const char *dev; RECT rc; bool found; };
 static BOOL CALLBACK findMonRectProc(HMONITOR hmon, HDC, LPRECT, LPARAM lp)
@@ -963,12 +948,263 @@ bool vddFindMonitorRect(const std::string &dev, int &x, int &y, int &w, int &h)
     return true;
 }
 
-/* Full startup: enable device, attach VDD, place it right of the desktop,
- * report the rect. w/h = requested virtual display resolution. */
+/* ── Remembered placement ─────────────────────────────────────────────────
+ * The virtual display ceases to exist between sessions (the PnP device is
+ * disabled on every exit path), so Windows cannot remember where the user
+ * dragged it. Capture a side/gap/offset description at teardown and restore
+ * it on the next extend session. The description is relative to the current
+ * non-VDD desktop bounds, so it survives resolution and monitor-count
+ * changes: "left of everything, 0 px away, aligned 120 px below the primary
+ * top" means the same thing on any layout. */
+enum VddSide {
+    VDD_SIDE_RIGHT = 0,
+    VDD_SIDE_LEFT,
+    VDD_SIDE_TOP,
+    VDD_SIDE_BOTTOM
+};
+
+struct VddPlacement {
+    int side = VDD_SIDE_RIGHT;
+    int gap = 0;       /* distance between the VDD and the real desktop edge */
+    int offset = 0;    /* perpendicular offset from the primary monitor */
+};
+
+struct DeskBounds {
+    int left = 0, top = 0, right = 0, bottom = 0;
+    bool found = false;
+};
+
+static BOOL CALLBACK deskBoundsProc(HMONITOR hmon, HDC, LPRECT rc, LPARAM lp)
+{
+    auto *b = (DeskBounds *)lp;
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(hmon, (MONITORINFO *)&mi)) return TRUE;
+    /* The VDD itself must not define the "real desktop" edge. */
+    if (isVddMonitorDevice(mi.szDevice)) return TRUE;
+    if (!b->found) {
+        b->left = rc->left; b->top = rc->top;
+        b->right = rc->right; b->bottom = rc->bottom;
+        b->found = true;
+        return TRUE;
+    }
+    if (rc->left   < b->left)   b->left   = rc->left;
+    if (rc->top    < b->top)    b->top    = rc->top;
+    if (rc->right  > b->right)  b->right  = rc->right;
+    if (rc->bottom > b->bottom) b->bottom = rc->bottom;
+    return TRUE;
+}
+
+static bool realDeskBounds(DeskBounds &out)
+{
+    out = DeskBounds{};
+    EnumDisplayMonitors(NULL, NULL, deskBoundsProc, (LPARAM)&out);
+    return out.found;
+}
+
+struct PrimaryRect { RECT rc = {}; bool found = false; };
+static BOOL CALLBACK primaryRectProc(HMONITOR hmon, HDC, LPRECT rc, LPARAM lp)
+{
+    auto *p = (PrimaryRect *)lp;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoA(hmon, &mi) && (mi.dwFlags & MONITORINFOF_PRIMARY)) {
+        p->rc = *rc;
+        p->found = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static bool primaryMonitorRect(RECT &out)
+{
+    PrimaryRect p;
+    EnumDisplayMonitors(NULL, NULL, primaryRectProc, (LPARAM)&p);
+    if (!p.found) return false;
+    out = p.rc;
+    return true;
+}
+
+static std::string vddPlacementPath()
+{
+    std::string base;
+    const char *la = getenv("LOCALAPPDATA");
+    if (la && *la) {
+        base = la;
+    } else {
+        char buf[MAX_PATH] = {};
+        if (FAILED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr,
+                                    SHGFP_TYPE_CURRENT, buf)) || !buf[0])
+            return std::string();
+        base = buf;
+    }
+    const std::string dir = base + "\\Mivara";
+    CreateDirectoryA(dir.c_str(), nullptr);   /* parent already exists */
+    return dir + "\\extend.pos";
+}
+
+static std::string vddTrim(const std::string &s)
+{
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return std::string();
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static bool vddParseInt(const std::string &s, int &out)
+{
+    if (s.empty()) return false;
+    const char *start = s.c_str();
+    char *end = nullptr;
+    const long v = strtol(start, &end, 10);
+    if (end == start || *end != '\0' || v < -100000 || v > 100000)
+        return false;
+    out = (int)v;
+    return true;
+}
+
+static VddPlacement vddLoadPlacement()
+{
+    VddPlacement p;
+    std::string data;
+    if (!vddReadFile(vddPlacementPath(), data)) return p;
+
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t end = data.find('\n', pos);
+        if (end == std::string::npos) end = data.size();
+        const std::string line = vddTrim(data.substr(pos, end - pos));
+        pos = end + 1;
+        if (line.empty() || line[0] == '#') continue;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = vddLower(vddTrim(line.substr(0, eq)));
+        const std::string val = vddLower(vddTrim(line.substr(eq + 1)));
+        if (key == "side") {
+            if (val == "left")        p.side = VDD_SIDE_LEFT;
+            else if (val == "top")    p.side = VDD_SIDE_TOP;
+            else if (val == "bottom") p.side = VDD_SIDE_BOTTOM;
+            else                      p.side = VDD_SIDE_RIGHT;
+        } else if (key == "gap") {
+            int v = 0;
+            if (vddParseInt(val, v) && v >= 0) p.gap = v;
+        } else if (key == "offset") {
+            int v = 0;
+            if (vddParseInt(val, v)) p.offset = v;
+        }
+    }
+    return p;
+}
+
+static bool vddSavePlacement(const VddPlacement &p)
+{
+    const std::string path = vddPlacementPath();
+    if (path.empty()) return false;
+    static const char *names[] = {"right", "left", "top", "bottom"};
+    char buf[128] = {};
+    snprintf(buf, sizeof(buf), "side=%s\ngap=%d\noffset=%d\n",
+             names[p.side], p.gap, p.offset);
+    const std::string tmp = path + ".tmp";
+    if (!vddWriteFile(tmp, buf)) return false;
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static int vddClampInt(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* Describe where the VDD currently sits. Returns false for an overlapping or
+ * otherwise ambiguous arrangement; the last saved placement then stands. */
+static bool vddCapturePlacement(const std::string &dev, VddPlacement &out)
+{
+    int vx = 0, vy = 0, vw = 0, vh = 0;
+    if (!vddFindMonitorRect(dev, vx, vy, vw, vh)) return false;
+    DeskBounds b;
+    if (!realDeskBounds(b)) return false;
+    RECT pr = {};
+    if (!primaryMonitorRect(pr)) {
+        pr.left = b.left;
+        pr.top  = b.top;
+    }
+
+    const double vcx = vx + vw / 2.0;
+    const double vcy = vy + vh / 2.0;
+    const double dcx = (b.left + b.right) / 2.0;
+    const double dcy = (b.top + b.bottom) / 2.0;
+    int gap = 0;
+    if (std::fabs(vcx - dcx) >= std::fabs(vcy - dcy)) {
+        if (vcx < dcx) {
+            out.side = VDD_SIDE_LEFT;
+            gap = b.left - (vx + vw);
+            out.offset = vy - pr.top;
+        } else {
+            out.side = VDD_SIDE_RIGHT;
+            gap = vx - b.right;
+            out.offset = vy - pr.top;
+        }
+    } else if (vcy < dcy) {
+        out.side = VDD_SIDE_TOP;
+        gap = b.top - (vy + vh);
+        out.offset = vx - pr.left;
+    } else {
+        out.side = VDD_SIDE_BOTTOM;
+        gap = vy - b.bottom;
+        out.offset = vx - pr.left;
+    }
+    if (gap < 0) return false;       /* overlapping / diagonal: keep the old one */
+    out.gap = vddClampInt(gap, 0, 100000);
+    out.offset = vddClampInt(out.offset, -100000, 100000);
+    return true;
+}
+
+/* Rebuild the top-left corner for a VDD of w x h from the current desktop. */
+static bool vddPlacementXY(const VddPlacement &p, int w, int h, int &x, int &y)
+{
+    DeskBounds b;
+    if (!realDeskBounds(b)) return false;
+    RECT pr = {};
+    if (!primaryMonitorRect(pr)) {
+        pr.left = b.left;
+        pr.top  = b.top;
+    }
+    const int gap = vddClampInt(p.gap, 0, 100000);
+    const int off = vddClampInt(p.offset, -100000, 100000);
+    switch (p.side) {
+    case VDD_SIDE_LEFT:
+        x = b.left - gap - w;
+        y = pr.top + off;
+        break;
+    case VDD_SIDE_TOP:
+        x = pr.left + off;
+        y = b.top - gap - h;
+        break;
+    case VDD_SIDE_BOTTOM:
+        x = pr.left + off;
+        y = b.bottom + gap;
+        break;
+    default:
+        x = b.right + gap;
+        y = pr.top + off;
+        break;
+    }
+    return true;
+}
+
+/* Full startup: enable device, attach VDD, place it at the remembered spot
+ * (default: right of the real desktop), report the rect. w/h = requested
+ * virtual display resolution. */
 bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
 {
     if (w < 1 || w > 7680) w = 1920;
     if (h < 1 || h > 4320) h = 1080;
+    g_vdd_configured = false;
     g_vdd_base = VddDisplayState{};
     g_vdd_restore_base = false;
     if (!vddCaptureNonMtt(g_vdd_base)) {
@@ -976,6 +1212,9 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         return false;
     }
     g_vdd_restore_base = true;
+
+    /* The user's last placement (or right of the desktop on first use). */
+    const VddPlacement placement = vddLoadPlacement();
 
     /* The driver reads its mode list once at start-up. Never restart it while
      * a VDD path is active. */
@@ -1041,8 +1280,6 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         vddShutdown();
         return false;
     }
-    const int x = desktopRightEdge();
-
     /* A freshly (re)loaded driver may take a moment to refresh its modes. */
     if (!vddModeAvailable(dev, w, h)) {
         for (int t = 0; t < 3 && !vddModeAvailable(dev, w, h); t++)
@@ -1059,22 +1296,33 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         }
     }
 
+    int x = 0, y = 0;
+    if (!vddPlacementXY(placement, w, h, x, y)) {
+        /* No non-VDD monitor to anchor to (unlikely); keep the old origin. */
+        x = 0;
+        y = 0;
+    }
+
     bool ok = false;
     for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-        ok = vddConfigure(dev, x, 0, w, h, 60);
+        ok = vddConfigure(dev, x, y, w, h, 60);
         if (!ok) Sleep(600);
     }
     if (!ok) {
         for (int attempt = 0; attempt < 2 && !ok; attempt++) {
-            ok = vddConfigure(dev, x, 0, w, h, 30);
+            ok = vddConfigure(dev, x, y, w, h, 30);
             if (!ok) Sleep(600);
         }
     }
     if (!ok && (w != 1920 || h != 1080)) {
         std::cerr << "Requested mode " << w << "x" << h
                   << " rejected – falling back to 1920x1080\n";
+        if (!vddPlacementXY(placement, 1920, 1080, x, y)) {
+            x = 0;
+            y = 0;
+        }
         for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-            ok = vddConfigure(dev, x, 0, 1920, 1080, 60);
+            ok = vddConfigure(dev, x, y, 1920, 1080, 60);
             if (!ok) Sleep(600);
         }
     }
@@ -1089,12 +1337,18 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         vddShutdown();
         return false;
     }
-    bool positioned = info.x == x && info.y == 0;
+    /* The actual mode may differ from the request; rebuild the expected
+     * corner from it so a left/top placement uses the right width/height. */
+    int ex = x, ey = y;
+    vddPlacementXY(placement, info.w, info.h, ex, ey);
+    bool positioned = info.x == ex && info.y == ey;
     for (int attempt = 0; attempt < 4 && !positioned; ++attempt) {
-        vddConfigure(dev, x, 0, info.w, info.h, attempt == 3 ? 30 : 60);
+        vddConfigure(dev, ex, ey, info.w, info.h, attempt == 3 ? 30 : 60);
         Sleep(300);
-        if (vddFindMonitorRect(dev, info.x, info.y, info.w, info.h))
-            positioned = info.x == x && info.y == 0;
+        if (vddFindMonitorRect(dev, info.x, info.y, info.w, info.h)) {
+            vddPlacementXY(placement, info.w, info.h, ex, ey);
+            positioned = info.x == ex && info.y == ey;
+        }
     }
     if (!positioned) {
         std::cerr << "Virtual display position could not be applied\n";
@@ -1113,13 +1367,38 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
         return false;
     }
 
+    g_vdd_configured = true;
     out = info;
     g_vdd_base = VddDisplayState{};
     g_vdd_restore_base = false;
+    /* Report the refresh rate that actually stuck. A 30 Hz fallback (the
+     * 60 Hz request was refused by the driver) is invisible in the old log
+     * line but caps the whole capture at 30 fps. */
+    DEVMODEA cur = {};
+    cur.dmSize = sizeof(cur);
+    int hz = 0;
+    if (EnumDisplaySettingsExA(dev.c_str(), ENUM_CURRENT_SETTINGS, &cur, 0))
+        hz = (int)cur.dmDisplayFrequency;
     std::cout << "Virtual display ready: " << dev << "  "
               << info.w << "x" << info.h
+              << (hz > 0 ? " @ " + std::to_string(hz) + " Hz" : "")
               << " @(" << info.x << "," << info.y << ")\n";
+    if (hz > 0 && hz < 60)
+        std::cerr << "Warning: the virtual display is running at " << hz
+                  << " Hz; the 60 Hz mode was not accepted by the driver.\n";
     return true;
+}
+
+/* Persist where the user left the virtual display, so the next extend
+ * session can put it back there. Failure is not fatal: the old placement
+ * (or the right-of-desktop default) simply stays in effect. */
+static void vddRememberCurrentPlacement()
+{
+    std::string dev;
+    VddPlacement p;
+    if (!vddFindActiveDevice(dev) || !vddCapturePlacement(dev, p)) return;
+    if (!vddSavePlacement(p))
+        std::cerr << "Warning: failed to save the virtual display position\n";
 }
 
 /* Tear down: detach the virtual display AND disable the Root\MttVDD device
@@ -1128,6 +1407,9 @@ bool vddStartup(int w, int h, VddInfo &out, bool reloadFirst)
 void vddShutdown()
 {
     if (!g_vdd_own.exchange(false)) return;
+    /* Only a fully configured display can teach us a meaningful position. */
+    if (g_vdd_configured.exchange(false))
+        vddRememberCurrentPlacement();
     VddDisplayState restore;
     bool haveRestore = false;
     if (g_vdd_restore_base) {
@@ -1156,7 +1438,11 @@ void vddShutdown()
  * stays a no-op afterwards. Return value = CCD detach succeeded. */
 bool vddForceDetach()
 {
+    /* The GUI cannot see the sender's g_vdd_configured flag, so try the
+     * capture here too; it is refused for overlapping/ambiguous layouts. */
+    vddRememberCurrentPlacement();
     g_vdd_own = false;
+    g_vdd_configured = false;
     g_vdd_base = VddDisplayState{};
     g_vdd_restore_base = false;
     VddDisplayState restore;

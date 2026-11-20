@@ -13,7 +13,7 @@ Authoritative guidance for wire protocols, runtime control channels, discovery a
   - Proof (sender→receiver, password only) `HsAuthProof` **40 bytes**: magic 'TVHA', version=2, proof[32].
   - Response (receiver→sender) `HsResponseV2` **36 bytes**: magic, version=3, recv_width, recv_height, status, codec, codec_flags, reserved[2].
   - Token (receiver→sender, `HS_OK` only) `HsResponseExtV3` **44 bytes**: magic `0x54564852` 'TVHR', version=2, token[32], flags.
-  - `mode`: 0 = mirror, 1 = extend. `codec`: 0=raw 1=rle 2=h264 3=h265 4=av1. `status`: 0=ok 1=version 2=codec 3=dims 4=decoder 5=legacy 6=busy 7=auth 8=auth_timeout 9=denied 10=auth_config.
+  - `mode`: 0 = mirror, 1 = extend. `codec`: 0=raw 1=rle 2=h264 3=h265 4=av1. `status`: 0=ok 1=version 2=codec 3=dims 4=decoder 5=legacy 6=busy 7=auth 8=auth_timeout 9=denied 10=auth_config. `codec_flags`: bit0 `CODEC_FLAG_WANT_HW` (sender prefers a hardware encoder), bit1 `CODEC_FLAG_CHROMA_444` (stream is 4:4:4; the receiver must keep its decoder in software — D3D11VA cannot decode it). Bit1 is set in the handshake and in every `CTRL_RECONFIG` body; an old receiver ignores it.
   - Receiver peeks 4 bytes first: non-TVHS magic ⇒ legacy peer, explicit error (no black screen). A pre-v3 request is answered `HS_ERR_VERSION` **before** the authorization exchange, so an old sender cannot bypass the policy.
   - Authorization is enforced at the receiver only. The proof is purpose-separated (`auth.h`):
     `purpose_key = HMAC-SHA256(PBKDF2(fold(pw), salt, iter), "Mivara/v1/auth-key" ‖ purpose)` and

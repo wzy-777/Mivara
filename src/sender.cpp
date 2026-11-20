@@ -118,7 +118,11 @@
 #define MAX_FRAME_SKIP        3
 #define MAX_FRAME_BYTES       (7680u * 4320u * 3u)
 
-static const int SOCK_BUF = 4 * 1024 * 1024;
+/* 1 MB, not 4: a larger send window only lets the kernel queue seconds of
+ * stale frames ahead of the newest one when the link hiccups. At 1080p-1440p
+ * bitrates 1 MB still covers a several-hundred-ms RTT times bandwidth product
+ * many times over, and the pacing loop supplies the backpressure instead. */
+static const int SOCK_BUF = 1 * 1024 * 1024;
 
 /* ── ANSI colours (Windows CMD does not support VT100 by default) ────────── */
 #ifdef _WIN32
@@ -545,6 +549,7 @@ struct CapturedFrame {
     const uint8_t *pixels = nullptr;
     int stride = 0;
     bool bgr24 = false;             /* packed 3-byte BGR               */
+    bool bgra = false;              /* packed 4-byte BGRA (DDA direct)  */
 };
 
 static const uint8_t *captureFrameRGB(CapturedFrame &f)
@@ -588,7 +593,25 @@ static void captureBgrFromBgra(CapturedFrame &f, const uint8_t *bgra, int stride
     for (size_t y = 0; y < height; y++) {
         const uint8_t *src = bgra + y * (size_t)stride;
         uint8_t *dst = f.rgb.data() + y * width * 3;
-        for (size_t x = 0; x < width; x++) {
+        size_t x = 0;
+        /* Four pixels per step: 32-bit loads and 12-byte stores give the
+         * compiler something it can vectorise, instead of a byte-wise triple
+         * per pixel. */
+        for (; x + 4 <= width; x += 4) {
+            uint32_t p0, p1, p2, p3;
+            std::memcpy(&p0, src + x * 4,      4);
+            std::memcpy(&p1, src + x * 4 + 4,  4);
+            std::memcpy(&p2, src + x * 4 + 8,  4);
+            std::memcpy(&p3, src + x * 4 + 12, 4);
+            uint8_t *o = dst + x * 3;
+            o[0]  = (uint8_t)p0;       o[1]  = (uint8_t)(p0 >> 8);
+            o[2]  = (uint8_t)(p0 >> 16); o[3] = (uint8_t)p1;
+            o[4]  = (uint8_t)(p1 >> 8); o[5]  = (uint8_t)(p1 >> 16);
+            o[6]  = (uint8_t)p2;       o[7]  = (uint8_t)(p2 >> 8);
+            o[8]  = (uint8_t)(p2 >> 16); o[9] = (uint8_t)p3;
+            o[10] = (uint8_t)(p3 >> 8); o[11] = (uint8_t)(p3 >> 16);
+        }
+        for (; x < width; x++) {
             dst[x * 3]     = src[x * 4];
             dst[x * 3 + 1] = src[x * 4 + 1];
             dst[x * 3 + 2] = src[x * 4 + 2];
@@ -654,6 +677,7 @@ static bool captureScreen(CapturedFrame &f)
     f.pixels = nullptr;
     f.stride = 0;
     f.bgr24 = false;
+    f.bgra  = false;
     static WinCaptureContext ctx;
     if (!ctx.ensure(SCREEN_WIDTH, SCREEN_HEIGHT)) return false;
 
@@ -750,6 +774,7 @@ static bool captureScreen(CapturedFrame &f)
     f.pixels = nullptr;
     f.stride = 0;
     f.bgr24 = false;
+    f.bgra  = false;
     f.rgb.assign((size_t)SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL, 0);
     const auto done = [&] {
         f.pixels = f.rgb.data();
@@ -1241,7 +1266,8 @@ static HsRequestV2 makeHsRequest(int w, int h)
     r.fps          = htonl((uint32_t)TARGET_FPS);
     r.mode         = htonl(DISPLAY_MODE);
     r.codec        = htonl((uint32_t)g_codec);
-    r.codec_flags  = htonl(g_want_hw ? CODEC_FLAG_WANT_HW : 0u);
+    r.codec_flags  = htonl((g_want_hw ? CODEC_FLAG_WANT_HW : 0u) |
+                           (g_chroma_444 ? CODEC_FLAG_CHROMA_444 : 0u));
     r.bitrate_kbps = htonl((uint32_t)(g_bitrate_kbps > 0 ? g_bitrate_kbps : 0));
     r.quality      = htonl((uint32_t)g_quality);
     r.gop_frames   = 0;                 /* 0 = default 2*fps */
@@ -2495,6 +2521,7 @@ int main(int argc, char* argv[])
 
         captured.pixels = nullptr;
         captured.bgr24 = false;
+        captured.bgra  = false;
         bool have_frame = false;
 #ifdef _WIN32
         if (use_dda) {
@@ -2528,7 +2555,18 @@ int main(int argc, char* argv[])
                 have_frame = true;
             }
             if (have_frame && ddaPixels()) {
-                captureBgrFromBgra(captured, ddaPixels(), ddaStride());
+                if (isCodedCodec() && encoder.outputsNV12()) {
+                    /* Hardware encoders take NV12, and swscale's BGRA->NV12
+                     * kernel is byte-identical to its BGR24 kernel, so the
+                     * duplicated surface can skip the ~1.8 ms/frame pack.
+                     * A YUV420P software encoder must still get BGR24: its
+                     * BGRA kernel differs by up to 29 levels. */
+                    captured.pixels = ddaPixels();
+                    captured.stride = ddaStride();
+                    captured.bgra   = true;
+                } else {
+                    captureBgrFromBgra(captured, ddaPixels(), ddaStride());
+                }
             } else if (have_frame) {
                 /* Defensive: a frame without pixels is never encodable. */
                 have_frame = false;
@@ -2590,9 +2628,11 @@ int main(int argc, char* argv[])
         bool sent_any = false;
         if (isCodedCodec()) {
             /* Coded: one access unit per frame, framed like any DATA packet */
-            std::string enc_err = captured.bgr24
-                ? encoder.encodeBGR24(captured.pixels, captured.stride, au)
-                : encoder.encode(captured.pixels, au);
+            std::string enc_err = captured.bgra
+                ? encoder.encodeBGRA(captured.pixels, captured.stride, au)
+                : captured.bgr24
+                    ? encoder.encodeBGR24(captured.pixels, captured.stride, au)
+                    : encoder.encode(captured.pixels, au);
             if (!enc_err.empty()) {
                 std::cerr << COL_RED << "Encode failed: " << enc_err
                           << "\n" << COL_RESET;

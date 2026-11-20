@@ -4,7 +4,7 @@
  * Layout: fixed left nav sidebar (主页 / 设置) with the active
  * tab's content to its right. Session flows (search / stream / receive) and
  * the connection-history list live inside the 主页 tab and remain reachable
- * via "返回会话" while browsing 设置.
+ * via the 主页 nav item while browsing 设置.
  *
  * Screens:
  *   HOME       – connect entry / receive bar / history; a running sender
@@ -64,6 +64,8 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  include <shellapi.h>      /* ShellExecuteW — hand files to explorer.exe */
+#  include <SDL2/SDL_syswm.h>  /* HWND for the tray-restore foreground force */
 #else
 #  include <unistd.h>
 #  include <fcntl.h>
@@ -78,7 +80,8 @@
  * One fixed canvas: there is no reflow, so every position below is a
  * compile-time integer. Width grew from 820 to fit the settings screen's
  * two-column card layout; height stayed at 700 so the window still fits a
- * 768-px-tall laptop screen together with its title bar and the taskbar.
+ * 768-px-tall laptop screen with the taskbar (the Windows build is borderless,
+ * so no native title bar sits outside this canvas).
  */
 #define WIN_W 880
 #define WIN_H 700
@@ -139,7 +142,20 @@
 #define SEG_CELL_GAP 2
 #define SEG_CELL_H (SEG_H - SEG_PAD * 2)
 #define SEG_W (SEG_PAD * 2 + SEG_CELL_W * 3 + SEG_CELL_GAP * 2)     /* 128       */
+#ifdef _WIN32
+/* The Windows window is borderless (the native caption is a bright OS bar on
+ * light themes), so minimize/close live in the app header, flush with its
+ * right edge. The appearance switcher and update button shift left to make
+ * room. */
+#define HDR_BTN_W 40
+#define HDR_BTN_H SEG_H
+#define HDR_BTN_Y SEG_Y
+#define HDR_CLOSE_X (WIN_W - 10 - HDR_BTN_W)
+#define HDR_MIN_X (HDR_CLOSE_X - HDR_BTN_W)
+#define SEG_X (HDR_MIN_X - 14 - SEG_W)
+#else
 #define SEG_X (BODY_R - SEG_W)          /* flush with the content's right edge  */
+#endif
 #define SEG_CELL_X(i) (SEG_X + SEG_PAD + (i) * (SEG_CELL_W + SEG_CELL_GAP))
 
 /* Header update button: present only while a release is waiting, immediately to
@@ -364,45 +380,6 @@ static SDL_Rect rcHistBtn(int i, int which)   /* 0 投屏 / 1 扩展 / 2 拼接 
     return SDL_Rect{x, homeHistCardY() + 42 + i * 48 + 6, w[which], 32};
 }
 
-/* 拼接 direction chooser (modal over whatever screen opened it). The pads are
- * laid out spatially — up / left · 本机 · right / down — so the question reads
- * as "where is the other PC", which is exactly the side the mouse must leave
- * from. */
-#define SIDE_DLG_W 420
-#define SIDE_DLG_H 320
-#define SIDE_DLG_X (CONTENT_X + (CONTENT_W - SIDE_DLG_W) / 2)
-#define SIDE_DLG_Y 170
-#define SIDE_DLG_CX (SIDE_DLG_X + SIDE_DLG_W / 2)
-#define SIDE_PAD_W 104
-#define SIDE_PAD_H 44
-#define SIDE_ROW1_Y (SIDE_DLG_Y + 104)
-#define SIDE_ROW2_Y (SIDE_ROW1_Y + 52)
-#define SIDE_ROW3_Y (SIDE_ROW2_Y + 52)
-
-static SDL_Rect rcSidePad(int side)
-{
-    const int top = SIDE_DLG_CX - SIDE_PAD_W / 2;
-    switch (side) {
-    case KVM_SIDE_LEFT:
-        return SDL_Rect{SIDE_DLG_CX - 58 - SIDE_PAD_W, SIDE_ROW2_Y,
-                        SIDE_PAD_W, SIDE_PAD_H};
-    case KVM_SIDE_RIGHT:
-        return SDL_Rect{SIDE_DLG_CX + 58, SIDE_ROW2_Y, SIDE_PAD_W, SIDE_PAD_H};
-    case KVM_SIDE_TOP:
-        return SDL_Rect{top, SIDE_ROW1_Y, SIDE_PAD_W, SIDE_PAD_H};
-    default:
-        return SDL_Rect{top, SIDE_ROW3_Y, SIDE_PAD_W, SIDE_PAD_H};
-    }
-}
-static SDL_Rect rcSideCenter()
-{
-    return SDL_Rect{SIDE_DLG_CX - 40, SIDE_ROW2_Y, 80, SIDE_PAD_H};
-}
-static SDL_Rect rcSideCancel()
-{
-    return SDL_Rect{SIDE_DLG_CX - 60, SIDE_DLG_Y + 264, 120, 34};
-}
-
 /* In-session four-way 拼接 switch, inside the home session card under the
  * target line. */
 #define ST_DIR_CAPTION_W 36
@@ -425,7 +402,7 @@ static SDL_Rect rcSideCancel()
 #define SET_R_H 296                     /* right-hand settings card              */
 #define SET_UPD_Y 548                   /* 更新 (full width)                     */
 #define SET_UPD_H 88
-#define SET_ACT_Y 648                   /* 恢复默认 / 取消 / 保存 / 返回会话      */
+#define SET_ACT_Y 648                   /* 恢复默认 / 取消 / 保存               */
 #define SET_ACT_H 44
 
 /* Three settings groups share the same two-column card geometry. */
@@ -436,8 +413,8 @@ static SDL_Rect rcSideCancel()
 
 /* 接收与安全 tab */
 #define SEC_SWITCH_Y 108
-#define SEC_SWITCH_H 228
-#define SEC_AUTH_Y 348
+#define SEC_SWITCH_H 150
+#define SEC_AUTH_Y (SEC_SWITCH_Y + SEC_SWITCH_H + 12)
 #define SEC_AUTH_H 264
 #define SEC_ROW_X (BODY_X + 20)
 #define SEC_ROW_W (BODY_W - 40)
@@ -488,6 +465,12 @@ static SDL_Rect rcSideCancel()
 #define SET_MINUS_X (SET_ROW_R - 36 - 8 - SET_VAL_W - 8 - SET_STEP_W)  /* 278 */
 #define SET_VAL_X   (SET_MINUS_X + SET_STEP_W + 8)                     /* 322 */
 #define SET_PLUS_X  (SET_ROW_R - SET_STEP_W)                           /* 440 */
+
+/* 画质与编码 card header: circular "?" help button in the top-right corner.
+ * Same vertical centre as the section title so the two read as one line. */
+#define SET_HELP_W 22
+#define SET_HELP_X (SET_COL_L + SET_COL_W - SET_PAD - SET_HELP_W)      /* 454 */
+#define SET_HELP_Y (SET_CARD_Y + 18)                                   /* 126 */
 
 #define TITLE_Y 72
 
@@ -617,6 +600,7 @@ enum BtnId {
     /* settings */
     BTN_SET_CODEC_BASE = 7000,          /* +0..5 */
     BTN_SET_HW = 7010,
+    BTN_SET_QUALITY_HELP,               /* 画质与编码 card · ? help page */
     BTN_SET_QUALITY_DEC,
     BTN_SET_QUALITY_INC,
     BTN_SET_FPS_DEC,
@@ -656,9 +640,8 @@ enum BtnId {
     /* left nav sidebar */
     BTN_NAV_HOME = 8000,
     BTN_NAV_SETTINGS,
-    BTN_RETURN_SESSION = 8010,
     /* Header appearance switcher. It shares the 8000 block with the nav ids
-     * (8000..8010) — keep any new nav item below BTN_THEME_LIGHT. See
+     * (8000..8001) — keep any new nav item below BTN_THEME_LIGHT. See
      * kThemeIds for how the three ids are dispatched. */
     BTN_THEME_LIGHT = 8020,
     BTN_THEME_DARK,
@@ -667,12 +650,13 @@ enum BtnId {
                                          * release is waiting); matches against
                                          * nothing else, so it may sit outside
                                          * the kThemeIds table */
-    /* 拼接 direction: the modal chooser shown right after clicking 拼接, and
-     * the live four-way switch on the home stitch card. Same order as KvmSide
-     * (left/right/top/bottom), so id - base indexes the side tables. */
-    BTN_STITCH_SIDE_BASE = 9000,        /* +0..3, plus cancel */
-    BTN_STITCH_SIDE_CANCEL = 9004,
-    BTN_STITCH_SWITCH_BASE = 9010,      /* +0..3 */
+    BTN_HDR_MINIMIZE,                   /* custom caption buttons (Windows:
+                                         * the native title bar is removed) */
+    BTN_HDR_CLOSE,
+    /* 拼接 direction: the live four-way switch on the home stitch card. Same
+     * order as KvmSide (left/right/top/bottom), so id - base indexes the side
+     * tables. */
+    BTN_STITCH_SWITCH_BASE = 9000,      /* +0..3 */
 
     /* authorization modals (receiver approval / sender password) */
     BTN_AUTH_ALLOW  = 9100,
@@ -872,16 +856,6 @@ struct LiveStats {
     std::string stage;      /* receiver: service startup stage           */
     std::string err;        /* receiver: service error token             */
     int         port = 0;   /* receiver: service port                    */
-};
-
-/* The 拼接 chooser holds the device it was opened for; only valid while
- * `open`. The modal is an overlay, not a Screen, so backing out returns to
- * the list it was opened from. */
-struct StitchAsk {
-    bool open = false;
-    std::string ip;
-    std::string name;
-    int port = KVM_PORT;
 };
 
 /* ── receive state (from the receiver's STAT lines) ───────────────────────
@@ -1087,7 +1061,6 @@ static AppConfig g_cfg_edit;            /* SCR_SETTINGS working copy */
 static AppConfig g_live_params;         /* params the running sender holds */
 static std::string g_last_ip, g_last_name;
 static int  g_last_port = 8081;
-static StitchAsk g_stitch_ask;          /* 拼接 direction modal (if open) */
 static std::atomic<int> g_recv_state{RSV_OFF};
 static std::atomic<unsigned long> g_recv_epoch{0}; /* incremented per launch/stop */
 static std::mutex       g_recv_mtx;
@@ -3058,8 +3031,13 @@ static void applyReceiverStat(const LiveStats &s)
     }
     if (s.event == "stop") {
         if (g_receiver.active) g_recv_state = RSV_WAITING;
-        std::lock_guard<std::mutex> lk(g_recv_mtx);
-        g_recv_peer.clear();
+        {
+            std::lock_guard<std::mutex> lk(g_recv_mtx);
+            g_recv_peer.clear();
+        }
+        /* The receive page is only for a live session: leaving it up would
+         * turn it into the very 「等待连接」 page this design removes. */
+        if (g_screen == SCR_RECEIVING) setScreen(SCR_HOME);
         return;
     }
     if (s.event == "svc") {
@@ -3595,9 +3573,6 @@ static void closeSetPwAsk()
 
 static void openSetPwAsk()
 {
-    /* The local 拼接 direction chooser and the password editor are two steps of
-     * different flows; keeping both open would stack two modals for no reason. */
-    g_stitch_ask.open = false;
     g_set_pw.open = true;
     g_set_pw.show = false;
     g_set_pw.a.clear();
@@ -4257,7 +4232,7 @@ static NavTab navTabForScreen(Screen s)
     return (s == SCR_SETTINGS) ? NAV_SETTINGS : NAV_HOME;
 }
 
-/* Remember the last non-settings page for 取消 / ESC / 返回会话. */
+/* Remember the last non-settings page for 取消 / ESC / 保存设置. */
 static void setScreen(Screen s)
 {
     g_screen = s;
@@ -4269,7 +4244,15 @@ static Screen resolveHomeScreen()
 {
     /* Every sender session lives on 主页; there is no session screen. */
     if (g_sender.active) return SCR_HOME;
-    if (g_receiver.active) return SCR_RECEIVING;
+    /* The receive page is a live-session page. While the receiver is only
+     * starting / waiting for a sender / waiting for authorization the home
+     * receive bar already carries the state, so 保存设置 must land on 主页
+     * instead of resurrecting a 「等待连接」 page. */
+    if (g_receiver.active && g_recv_state.load() == RSV_STREAMING)
+        return SCR_RECEIVING;
+    if (g_receiver.active) return SCR_HOME;
+    /* Never return to a receive page whose receiver is gone. */
+    if (g_session_screen == SCR_RECEIVING) return SCR_HOME;
     return g_session_screen;
 }
 
@@ -4331,18 +4314,37 @@ static void processSearchUpdates()
     }
 }
 
-/* Own the target strings: history callers pass references into g_hist, and
- * recordStartedSession() reloads that vector when the session actually starts. */
-static void launchStream(std::string ip, int port, int mode, std::string name,
-                         const char *stitch_side = nullptr)
+/* True when the live sender already targets this endpoint in this mode. The
+ * UI uses it so clicking the current row is a no-op instead of a reconnect. */
+static bool streamTargetIsCurrent(const std::string &ip, int port, int mode)
 {
-    /* One sender per process: a second start would fail in spawnChild() and
-     * leave the user staring at an error while the real session runs unseen. */
+    if (!g_sender.active || mode != g_child_mode) return false;
+    /* A failed child that has not been reaped yet must not swallow a retry. */
+    if (g_send_phase == SP_FAILED) return false;
+    if (ip != g_last_ip) return false;
+    /* Stitch always dials KVM_PORT; the history port is irrelevant. */
+    return mode == SEND_STITCH || port == g_last_port;
+}
+
+/* Own the target strings: history callers pass references into g_hist, and
+ * recordStartedSession() reloads that vector when the session actually starts.
+ * Returns true when a new child was spawned. */
+static bool launchStream(std::string ip, int port, int mode, std::string name)
+{
+    /* One sender per process. A different target/mode is a deliberate switch:
+     * stop the live child (bounded, graceful) and start the new session. */
     if (g_sender.active) {
-        g_status_note = "已有发送会话";
-        g_status_tone = StatusTone::Warning;
-        setScreen(resolveHomeScreen());
-        return;
+        if (streamTargetIsCurrent(ip, port, mode)) {
+            g_status_note = std::string("当前已在") + sendModeLabel(mode) +
+                            "此设备";
+            g_status_tone = StatusTone::Info;
+            setScreen(SCR_HOME);
+            return false;
+        }
+        logPush(std::string("[gui] switch ") + sendModeKey(g_child_mode) +
+                " -> " + sendModeKey(mode) + " " + ip + ":" +
+                std::to_string(port));
+        stopSender();
     }
     const bool extend = (mode == SEND_EXTEND);
     const bool stitch = (mode == SEND_STITCH);
@@ -4374,12 +4376,12 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
 #endif
     if (!binaryExists(path)) {
         fail("找不到发送程序，请先运行 make");
-        return;
+        return false;
     }
     if (stitch && !kvmSupported()) {
         logPush("[gui] stitch is unavailable on this platform");
         fail("拼接模式目前仅支持 Windows");
-        return;
+        return false;
     }
     std::string codec = (g_cfg.codec == "auto" || g_cfg.codec.empty())
                             ? "h264" : g_cfg.codec;
@@ -4390,10 +4392,9 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     /* A stitch session has no capture/encoder: passing codec/quality flags
      * would only suggest they do something. */
     if (stitch) {
-        /* The chooser's answer, or the saved preference for a caller that
-         * has no chooser (row-body replay). Always one of the four keys. */
-        const int s = kvmSideFromKey(stitch_side ? stitch_side
-                                                 : g_cfg.stitch_side.c_str());
+        /* The saved direction is the starting edge; the live card switches it
+         * afterwards with STITCH|side=… . Always one of the four keys. */
+        const int s = kvmSideFromKey(g_cfg.stitch_side.c_str());
         args.push_back("--stitch-side");
         args.push_back(kStitchSideKey[s < 0 ? (int)KVM_SIDE_RIGHT : s]);
         args.push_back("--file-drop");
@@ -4434,7 +4435,7 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
         fail(stitch ? "无法连接 " + ip + ":" + std::to_string(probe_port) +
                           "（对方需先启动接收）"
                     : "无法连接 " + ip + ":" + std::to_string(port));
-        return;
+        return false;
     }
 #ifdef _WIN32
     /* Extend mode: the sender may append the receiver's exact resolution to
@@ -4456,61 +4457,13 @@ static void launchStream(std::string ip, int port, int mode, std::string name,
     if (!spawnChild(g_sender, path, args, spawn_flags)) {
         logPush("[gui] spawn sender failed");
         fail("无法启动发送程序，请查看日志");
-        return;
+        return false;
     }
     g_status_note = "目标: " + sendTargetEndpoint();
     g_status_tone = StatusTone::Info;
     g_live_params = g_cfg;
     setScreen(SCR_HOME);
-}
-
-/* 拼接 always asks which side the peer is on before spawning the controller:
- * the answer is what tells the sender which local edge hands control over. */
-static void openStitchDialog(const std::string &ip, int port,
-                             const std::string &name)
-{
-    /* 授权 has the higher modal priority; stacking the direction chooser under
-     * it would leave a dialog whose clicks cannot reach it. */
-    if (g_auth_ask.open) {
-        g_status_note = "请先处理连接授权请求";
-        return;
-    }
-    if (!kvmSupported()) {           /* launchStream reports the error */
-        launchStream(ip, port, SEND_STITCH, name);
-        return;
-    }
-    g_stitch_ask.open = true;
-    g_stitch_ask.ip = ip;
-    g_stitch_ask.port = port;
-    g_stitch_ask.name = name;
-}
-
-static void chooseStitchSide(int side)
-{
-    if (!g_stitch_ask.open || side < 0 || side > 3) return;
-    const std::string ip = g_stitch_ask.ip;
-    const std::string name = g_stitch_ask.name;
-    const int port = g_stitch_ask.port;
-    g_stitch_ask.open = false;
-    /* Remember the answer: it is the default the next chooser opens on. */
-    g_cfg.stitch_side = kStitchSideKey[side];
-    g_cfg_edit.stitch_side = g_cfg.stitch_side;
-    configSave(g_cfg);
-    launchStream(ip, port, SEND_STITCH, name, kStitchSideKey[side]);
-}
-
-/* Single entry point for "start this mode": 拼接 always asks for its side
- * first, mirror/extend go straight to the sender. */
-static void startSendMode(const std::string &ip, int port, int mode,
-                          const std::string &name)
-{
-    if (g_sender.active) {           /* launchStream() also guards, defensively */
-        g_status_note = "已有发送会话";
-        setScreen(resolveHomeScreen());
-        return;
-    }
-    if (mode == SEND_STITCH) openStitchDialog(ip, port, name);
-    else launchStream(ip, port, mode, name);
+    return true;
 }
 
 /* ── independent two-way file page ────────────────────────────────────────── */
@@ -5979,12 +5932,22 @@ static void requestQuit(bool no_confirm = false)
     SDL_PushEvent(&q);
 }
 
+/** The custom caption close behaves exactly like the native window close:
+ *  hide to the tray when one exists, otherwise quit. The SDL_QUIT handler in
+ *  main() owns both policies (and the live-session confirmation). */
+static void requestWindowClose()
+{
+    SDL_Event q;
+    q.type = SDL_QUIT;
+    SDL_PushEvent(&q);
+}
+
 static void hideToTray()
 {
     if (!g_tray_ok || g_hidden) return;
     /* A pending prompt (approval / password) is time-limited; hiding the
      * window would make it unanswerable while the deadline keeps running. */
-    if (g_auth_ask.open || g_pw_ask.open || g_stitch_ask.open || g_set_pw.open)
+    if (g_auth_ask.open || g_pw_ask.open || g_set_pw.open)
         return;
     SDL_HideWindow(g_win);
     if (g_log_win && g_log_open) SDL_HideWindow(g_log_win);
@@ -5994,27 +5957,127 @@ static void hideToTray()
         /* One time only; the flag lives in config.ini and changes nothing
          * else about the user's settings. */
         trayNotify("Mivara 仍在运行",
-                   "关闭窗口不会中断会话。单击托盘图标可恢复，右键可退出。");
+                   "关闭窗口不会中断会话。单击托盘图标可恢复，右键菜单可直接连接常用主机或退出。");
         g_cfg.tray_hint_shown = 1;
         configSave(g_cfg);
     }
 }
 
+/* Bring the main window to the front even when the foreground lock refuses a
+ * background (and elevated) process. The tray click is user input, but plain
+ * SetForegroundWindow can still be refused, so fall back to a brief topmost
+ * toggle — the same trick the receiver uses for its first extend frame. */
+static void raiseMainWindowForeground()
+{
+#ifdef _WIN32
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(g_win, &info) ||
+        info.subsystem != SDL_SYSWM_WINDOWS)
+        return;
+    HWND hwnd = info.info.win.window;
+    if (!hwnd) return;
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+    if (GetForegroundWindow() != hwnd) {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE);
+        SetForegroundWindow(hwnd);
+    }
+#endif
+}
+
+#ifdef _WIN32
+/* The app draws its own caption strip on a borderless window: the whole
+ * header is a native drag area except the real controls. SDL hit-test points
+ * are device pixels, like uiPx(). */
+static bool headerPointIn(const SDL_Point &p, int x, int y, int w, int h)
+{
+    const int x0 = uiPx(x), y0 = uiPx(y);
+    const int x1 = uiPx(x + w), y1 = uiPx(y + h);
+    return p.x >= x0 && p.x < x1 && p.y >= y0 && p.y < y1;
+}
+
+static SDL_HitTestResult SDLCALL mainWindowHitTest(
+    SDL_Window *, const SDL_Point *area, void *)
+{
+    if (!area || area->y < 0 || area->y >= uiPx(HEADER_H))
+        return SDL_HITTEST_NORMAL;
+    if (headerPointIn(*area, HDR_MIN_X, HDR_BTN_Y, HDR_BTN_W, HDR_BTN_H) ||
+        headerPointIn(*area, HDR_CLOSE_X, HDR_BTN_Y, HDR_BTN_W, HDR_BTN_H) ||
+        headerPointIn(*area, SEG_X, SEG_Y, SEG_W, SEG_H))
+        return SDL_HITTEST_NORMAL;
+    /* The update chip only occupies its slot while a release is waiting; the
+     * rest of the time the same pixels must stay draggable. */
+    if (updateBadgeVisible(updateGetInfo()) &&
+        headerPointIn(*area, UPD_BTN_X, UPD_BTN_Y, UPD_BTN_W, UPD_BTN_H))
+        return SDL_HITTEST_NORMAL;
+    return SDL_HITTEST_DRAGGABLE;
+}
+
+/* Removing the caption turns the window into WS_POPUP, which drops the
+ * taskbar button; WS_EX_APPWINDOW puts it back so the custom minimize button
+ * (and the taskbar) can always restore the window. */
+static void ensureMainWindowTaskbarEntry()
+{
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(g_win, &info) ||
+        info.subsystem != SDL_SYSWM_WINDOWS)
+        return;
+    HWND hwnd = info.info.win.window;
+    if (!hwnd) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    ex |= WS_EX_APPWINDOW;
+    ex &= ~(LONG_PTR)WS_EX_TOOLWINDOW;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+}
+
+/* Rounded window corners are a Windows 11 DWM property; resolve it through
+ * dwmapi.dll so the build needs no extra import library and Windows 10 simply
+ * keeps its square corners. */
+static void applyRoundedWindowCorners()
+{
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(g_win, &info) ||
+        info.subsystem != SDL_SYSWM_WINDOWS)
+        return;
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) return;
+    typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID,
+                                                      DWORD);
+    auto setAttr = reinterpret_cast<DwmSetWindowAttributeFn>(
+        reinterpret_cast<void *>(GetProcAddress(dwm,
+                                                "DwmSetWindowAttribute")));
+    if (setAttr) {
+        const DWORD cornerPref = 33;   /* DWMWA_WINDOW_CORNER_PREFERENCE */
+        const DWORD round = 2;         /* DWMWCP_ROUND                  */
+        setAttr(info.info.win.window, cornerPref, &round, sizeof(round));
+    }
+    FreeLibrary(dwm);
+}
+#endif
+
 static void showFromTray()
 {
-    if (!g_hidden) {
-        SDL_RaiseWindow(g_win);
-        return;
-    }
+    const bool was_hidden = g_hidden;
     g_hidden = false;
-    SDL_ShowWindow(g_win);
+    if (was_hidden) {
+        SDL_ShowWindow(g_win);
+        if (g_log_win && g_log_open) SDL_ShowWindow(g_log_win);
+        if (g_file_win) SDL_ShowWindow(g_file_win);
+    }
+    /* Also covers the minimized-but-not-hidden case: a tray click must always
+     * pop the main window, not merely raise an icon in the taskbar. */
     SDL_RestoreWindow(g_win);
     SDL_RaiseWindow(g_win);
-    if (g_log_win && g_log_open) SDL_ShowWindow(g_log_win);
-    if (g_file_win) {
-        SDL_ShowWindow(g_file_win);
-        SDL_RestoreWindow(g_file_win);
-    }
+    if (was_hidden && g_file_win) SDL_RestoreWindow(g_file_win);
+    raiseMainWindowForeground();
 }
 
 /* State summary for the tray tooltip (≤127 chars after conversion). */
@@ -6039,6 +6102,43 @@ static std::string trayTooltip()
     return s;
 }
 
+/* Snapshot for the tray right-click menu: live sessions + connection history.
+ * The menu is built on the tray thread from this copy, so it never reads
+ * g_hist / g_sender / g_recv_* directly. Listing only live states means an
+ * idle app shows no status row at all (没有就不列出来). */
+static void trayMenuSync()
+{
+    TrayMenuState st;
+    if (g_sender.active && g_send_phase != SP_IDLE) {
+        st.session = sendPhaseLabel();
+        st.session_mode = g_child_mode;
+        if (g_stitch_reconnecting) st.session += "（重连中）";
+        if (!g_last_ip.empty()) st.session += " · " + sendTargetName();
+    }
+    {
+        const RecvView rv = recvView();
+        if (rv.state == RSV_STREAMING) {
+            st.receiver = "接收：正在接收";
+            if (!rv.peer.empty()) st.receiver += " · " + rv.peer;
+        }
+    }
+    st.hosts.reserve(g_hist.size());
+    for (const HistEntry &e : g_hist) {
+        TrayHostEntry h;
+        h.name = e.name;
+        h.ip = e.ip;
+        h.port = e.port;
+        h.last_mode = sendModeFromKey(e.mode);
+        /* The submenu's floating header: what a click would repeat, when it
+         * last happened and how often the host was used. */
+        h.detail = std::string("上次：") + sendModeLabel(h.last_mode) +
+                   " · " + relTime(e.last_used_unix) +
+                   " · 共 " + std::to_string(e.use_count) + " 次";
+        st.hosts.push_back(h);
+    }
+    traySetMenuState(st);
+}
+
 /* ── screen building ─────────────────────────────────────────────────────── */
 /* One modal stack shared by buildButtons(), renderScreen() and onButton(). */
 enum Modal {
@@ -6046,14 +6146,12 @@ enum Modal {
     MODAL_DISCARD,
     MODAL_SETPW,
     MODAL_PW,
-    MODAL_STITCH,
     MODAL_AUTH
 };
 
 static Modal topModal()
 {
     if (g_auth_ask.open)   return MODAL_AUTH;
-    if (g_stitch_ask.open) return MODAL_STITCH;
     if (g_pw_ask.open)     return MODAL_PW;
     if (g_set_pw.open)     return MODAL_SETPW;
     if (g_discard_open)    return MODAL_DISCARD;
@@ -6093,18 +6191,6 @@ static void appendModalButtons()
                   BTN_V_SECONDARY);
         addButton(SETPW_DLG_X + 322, y, 114, 38, "应 用", BTN_SETPW_OK,
                   BTN_V_PRIMARY);
-        break;
-    }
-    case MODAL_STITCH: {
-        const int cur = stitchSideFromConfig();
-        for (int i = 0; i < 4; i++) {
-            const SDL_Rect r = rcSidePad(i);
-            addChoice(r.x, r.y, r.w, r.h, kStitchSideLabel[i],
-                      BTN_STITCH_SIDE_BASE + i, i == cur);
-        }
-        const SDL_Rect c = rcSideCancel();
-        addButton(c.x, c.y, c.w, c.h, "取 消", BTN_STITCH_SIDE_CANCEL,
-                  BTN_V_SECONDARY);
         break;
     }
     case MODAL_DISCARD: {
@@ -6291,6 +6377,14 @@ static void buildButtons()
                       BTN_HDR_UPDATE, BTN_V_GHOST);
     }
 
+#ifdef _WIN32
+    /* ── header: custom caption buttons (native title bar is removed) ─────── */
+    addButton(HDR_MIN_X, HDR_BTN_Y, HDR_BTN_W, HDR_BTN_H, "",
+              BTN_HDR_MINIMIZE, BTN_V_GHOST);
+    addButton(HDR_CLOSE_X, HDR_BTN_Y, HDR_BTN_W, HDR_BTN_H, "",
+              BTN_HDR_CLOSE, BTN_V_GHOST);
+#endif
+
     /* ── nav rail (on every screen) ──────────────────────────────────────── */
     {
         const NavTab tab = navTabForScreen(g_screen);
@@ -6472,6 +6566,10 @@ static void buildButtons()
                           codecLabels[i], BTN_SET_CODEC_BASE + i,
                           g_cfg_edit.codec == codecIds[i]);
             }
+            /* Help chip in the card header: hit area only, painted by
+             * renderScreen(). */
+            addButton(SET_HELP_X, SET_HELP_Y, SET_HELP_W, SET_HELP_W, "",
+                      BTN_SET_QUALITY_HELP, BTN_V_GHOST);
             addButton(SET_MINUS_X, SET_ROW_Y(0), SET_STEP_W, 32, "−",
                       BTN_SET_QUALITY_DEC, BTN_V_SECONDARY, GLYPH_NONE, nullptr,
                       g_cfg_edit.quality > 0);
@@ -6563,9 +6661,6 @@ static void buildButtons()
                   BTN_V_SECONDARY);
         addButton(cx - 10, SET_ACT_Y, 150, SET_ACT_H, "保存设置", BTN_SET_OK,
                   BTN_V_PRIMARY);
-        if (g_sender.active || g_receiver.active)
-            addButton(cx + 156, SET_ACT_Y, 172, SET_ACT_H, "返回会话",
-                      BTN_RETURN_SESSION, BTN_V_SECONDARY);
         break;
     }
     }
@@ -6820,29 +6915,6 @@ static void drawHomeSessionCard(SDL_Renderer *ren, SDL_Rect card)
                  card.x + 20, row2_y, THEME.textDim, g_fontS);
 }
 
-/* Modal scrim + card for the 拼接 direction question. The four pads are
- * painted by the common button pass (they are BTN_V_CHOICE cells), so this
- * only paints what has no hit area of its own: the backdrop, the title and
- * the 本机 marker that makes the spatial arrangement readable. */
-static void drawStitchSideDialog(SDL_Renderer *ren)
-{
-    fillRoundRect(ren, SDL_Rect{0, 0, WIN_W, WIN_H}, 0, withAlpha(BLACK, 0x66));
-    const SDL_Rect card{SIDE_DLG_X, SIDE_DLG_Y, SIDE_DLG_W, SIDE_DLG_H};
-    drawCard(ren, card, CARD_R);
-    const std::string target = g_stitch_ask.name.empty()
-                                   ? g_stitch_ask.ip : g_stitch_ask.name;
-    drawText(ren, fitText(target + " 在本机的哪一侧？", g_fontB, SIDE_DLG_W - 48),
-             SIDE_DLG_X + 24, SIDE_DLG_Y + 22, THEME.text, g_fontB);
-    drawText(ren, fitText(g_stitch_ask.ip + " · 共享键鼠，不传输画面",
-                          g_fontS, SIDE_DLG_W - 48),
-             SIDE_DLG_X + 24, SIDE_DLG_Y + 58, THEME.textDim, g_fontS);
-    drawText(ren, "从该侧移出鼠标即可控制对方", SIDE_DLG_X + 24, SIDE_DLG_Y + 78,
-             THEME.textDim, g_fontS);
-    const SDL_Rect me = rcSideCenter();
-    fillRoundRect(ren, me, THEME.radius - 3, THEME.surfaceAlt);
-    drawTextIn(ren, "本机", me, THEME.textDim, g_fontS, ALIGN_CENTER);
-}
-
 /* ── authorization and settings modals ──────────────────────────────────────
  * Only topModal() is painted here, matching buildButtons() and onButton(). */
 static void drawAuthDialogs(SDL_Renderer *ren)
@@ -6962,6 +7034,16 @@ static void drawHeader()
     drawGlyph(g_ren, GLYPH_LOGO, HDR_GLYPH_CX, HEADER_H / 2, 24, THEME.primary);
     drawTextV(g_ren, "Mivara 幻屏", HDR_WORD_X, HEADER_H / 2, THEME.text,
               g_fontB, ALIGN_LEFT);
+    /* Version next to the wordmark — the native title's "Mivara vX.Y.Z" that
+     * used to live in the removed caption. */
+    {
+        int ww = 0, wh = 0;
+        if (TTF_SizeUTF8(g_fontB, "Mivara 幻屏", &ww, &wh) == 0) {
+            drawTextV(g_ren, "v" MIVARA_VERSION,
+                      HDR_WORD_X + uiCoord(ww) + 8, HEADER_H / 2 + 2,
+                      THEME.textDim, g_fontS, ALIGN_LEFT);
+        }
+    }
     /* update button — ghost hit area, painted here because its fill encodes the
      * update state: tinted while a release waits, green once it is on disk,
      * with a progress bar under the glyph while it downloads. */
@@ -6992,6 +7074,28 @@ static void drawHeader()
     /* appearance switcher: a track with three choice cells on top of it */
     drawRoundRect(g_ren, SDL_Rect{SEG_X, SEG_Y, SEG_W, SEG_H}, THEME.radius,
                   THEME.surfaceAlt, THEME.border);
+#ifdef _WIN32
+    /* custom caption buttons — ghost hit areas painted here so the close
+     * button can use the danger tone on hover like a native caption */
+    {
+        const SDL_Rect minr{HDR_MIN_X, HDR_BTN_Y, HDR_BTN_W, HDR_BTN_H};
+        const SDL_Rect clsr{HDR_CLOSE_X, HDR_BTN_Y, HDR_BTN_W, HDR_BTN_H};
+        const bool min_on = (g_hot == BTN_HDR_MINIMIZE ||
+                             g_press == BTN_HDR_MINIMIZE);
+        const bool close_on = (g_hot == BTN_HDR_CLOSE ||
+                               g_press == BTN_HDR_CLOSE);
+        /* Separate the app controls from the window controls. */
+        drawHairline(g_ren, HDR_MIN_X - 8, HDR_BTN_Y + 5, 1,
+                     HDR_BTN_H - 10, THEME.border);
+        if (min_on)
+            fillRoundRect(g_ren, minr, THEME.radius - 4, THEME.hover);
+        if (close_on)
+            fillRoundRect(g_ren, clsr, THEME.radius - 4, THEME.dangerTint);
+        drawTextIn(g_ren, "−", minr, THEME.text, g_fontB, ALIGN_CENTER);
+        drawTextIn(g_ren, "×", clsr, close_on ? THEME.danger : THEME.text,
+                   g_fontB, ALIGN_CENTER);
+    }
+#endif
 }
 
 static void drawNav()
@@ -7767,7 +7871,7 @@ static void renderScreen(int mousex, int mousey)
             {
                 const SDL_Rect card{BODY_X, SET_UPD_Y, BODY_W, SET_UPD_H};
                 drawCard(g_ren, card, CARD_R);
-                drawText(g_ren, "软件更新", card.x + 20, card.y + 14,
+                drawText(g_ren, "更新", card.x + 20, card.y + 14,
                          THEME.textDim, g_fontBS);
                 UpdateInfo ui = updateGetInfo();
                 SDL_Color col = THEME.textDim;
@@ -7792,6 +7896,21 @@ static void renderScreen(int mousex, int mousey)
             drawCard(g_ren, card, CARD_R);
             drawText(g_ren, "画质与编码", SET_LC_X, card.y + 20, THEME.textDim,
                      g_fontBS);
+            /* Round ? chip — the hit area itself is the ghost button added by
+             * buildButtons(); hover/press only change the disc underneath. */
+            {
+                const SDL_Rect help{SET_HELP_X, SET_HELP_Y, SET_HELP_W,
+                                    SET_HELP_W};
+                const int hcx = help.x + help.w / 2;
+                const int hcy = help.y + help.h / 2;
+                setColor(g_ren, g_press == BTN_SET_QUALITY_HELP ? THEME.press
+                                : g_hot == BTN_SET_QUALITY_HELP  ? THEME.hover
+                                                               : THEME.surfaceAlt);
+                fillCircle(g_ren, hcx, hcy, SET_HELP_W / 2 - 1);
+                drawRing(g_ren, hcx, hcy, SET_HELP_W / 2 - 1, THEME.border);
+                drawTextIn(g_ren, "?", help, THEME.textDim, g_fontS,
+                           ALIGN_CENTER);
+            }
             drawText(g_ren, "编码", SET_LC_X, SET_CODEC_LABEL_Y, THEME.text, g_font);
 
             std::string vQ = std::to_string(g_cfg_edit.quality);
@@ -7853,12 +7972,6 @@ static void renderScreen(int mousex, int mousey)
                 drawText(g_ren, std::string("当前状态：") + recvStateLabel(g_recv_state),
                          SEC_ROW_X + 4, SEC_SWITCH_Y + 98,
                          recvStateColor(g_recv_state), g_fontS);
-                drawText(g_ren, "此开关立即启停接收，只改变本次运行，不写入配置。",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 140, THEME.textDim, g_fontS);
-                drawText(g_ren, "下次启动是否接收，以及是否随 Windows 登录启动，",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 164, THEME.textDim, g_fontS);
-                drawText(g_ren, "已移至「常规」页分别管理。",
-                         SEC_ROW_X + 4, SEC_SWITCH_Y + 188, THEME.textDim, g_fontS);
             }
 
             {
@@ -7915,7 +8028,7 @@ static void renderScreen(int mousex, int mousey)
             }
         }
 
-        /* ── 保存设置 / 恢复默认 / 返回会话 ─────────────────────────────── */
+        /* ── 保存设置 / 恢复默认 / 取消 ─────────────────────────────────── */
         break;
     }
     }
@@ -7941,9 +8054,6 @@ static void renderScreen(int mousex, int mousey)
     case MODAL_SETPW:
     case MODAL_DISCARD:
         drawAuthDialogs(g_ren);
-        break;
-    case MODAL_STITCH:
-        drawStitchSideDialog(g_ren);
         break;
     default:
         break;
@@ -7976,6 +8086,101 @@ static void startInstall()
     }
 }
 
+/* ── 画质与编码 help page ─────────────────────────────────────────────────
+ * docs/help/quality.html ships with the app (the Windows installer and both
+ * Linux packages copy docs/ wholesale). Install layouts differ, so probe the
+ * known locations relative to the executable:
+ *   dev / Windows / portable bundle
+ *       <root>/bin/app(.exe)         → <root>/docs/help/quality.html
+ *   Linux install.sh
+ *       <prefix>/lib/mivara/bin/app  → <prefix>/share/doc/mivara/docs/help/quality.html
+ *   Linux .deb
+ *       /usr/lib/mivara/app          → /usr/share/doc/mivara/docs/help/quality.html
+ * MIVARA_HELP_PAGE overrides the probe (tests / unusual layouts). */
+static std::string qualityHelpPath()
+{
+    const char *override = std::getenv("MIVARA_HELP_PAGE");
+    if (override && *override) {
+        FILE *f = std::fopen(override, "rb");
+        if (f) { std::fclose(f); return override; }
+    }
+    static const char *kRel[] = {
+        "/../docs/help/quality.html",
+        "/../../docs/help/quality.html",
+        "/../../share/doc/mivara/docs/help/quality.html",
+        "/../../../share/doc/mivara/docs/help/quality.html",
+    };
+    const std::string dir = exeDir();
+    for (const char *rel : kRel) {
+        const std::string p = dir + rel;
+        FILE *f = std::fopen(p.c_str(), "rb");
+        if (!f) continue;
+        std::fclose(f);
+        return p;
+    }
+    return std::string();
+}
+
+/* Open a local file with the user's default handler. The GUI runs elevated
+ * (requireAdministrator), so Windows hands off through explorer.exe: launching
+ * the browser directly would give it the admin token. Mirrors
+ * updateOpenReleasePage(). */
+static bool openLocalPath(const std::string &path)
+{
+#ifdef _WIN32
+    wchar_t windir[MAX_PATH] = {};
+    if (!GetWindowsDirectoryW(windir, MAX_PATH) || !windir[0]) return false;
+    /* exeDir() (GetModuleFileNameA) and getenv() hand us narrow strings in
+     * the process ANSI code page, not UTF-8; converting them as UTF-8 would
+     * fail for a non-ASCII install path. */
+    const int n = MultiByteToWideChar(CP_ACP, 0, path.c_str(),
+                                      (int)path.size(), nullptr, 0);
+    if (n <= 0) return false;
+    std::wstring wpath(n, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, path.c_str(), (int)path.size(),
+                        &wpath[0], n);
+    /* Resolve our '..' segments and normalise separators before handing the
+     * path to explorer's command-line parser. */
+    wchar_t full[MAX_PATH] = {};
+    const DWORD len = GetFullPathNameW(wpath.c_str(), MAX_PATH, full, nullptr);
+    if (len == 0 || len >= MAX_PATH) return false;
+    const std::wstring explorer = std::wstring(windir) + L"\\explorer.exe";
+    const std::wstring args = L"\"" + std::wstring(full) + L"\"";
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", explorer.c_str(),
+                                args.c_str(), nullptr, SW_SHOWNORMAL);
+    return (INT_PTR)r > 32;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        execlp("xdg-open", "xdg-open", path.c_str(), (char *)nullptr);
+        execlp("open", "open", path.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) return false;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+#endif
+}
+
+/** Open the shipped 画质与编码 explainer in the default browser. */
+static void openQualityHelp()
+{
+    const std::string path = qualityHelpPath();
+    if (path.empty()) {
+        g_status_note = "找不到帮助页面 docs/help/quality.html，请重新安装完整程序";
+        g_status_tone = StatusTone::Error;
+        return;
+    }
+    if (!openLocalPath(path)) {
+        g_status_note = "无法打开帮助页面，请手动查看 docs/help/quality.html";
+        g_status_tone = StatusTone::Error;
+        return;
+    }
+    g_status_note = "已在浏览器中打开「画质与编码」说明";
+    g_status_tone = StatusTone::Info;
+}
+
 static void onButton(int id, bool file_window = false)
 {
     /* Exactly one modal owns the input — the same one buildButtons() rendered
@@ -7995,12 +8200,6 @@ static void onButton(int id, bool file_window = false)
         if (id == BTN_SETPW_OK)            submitSetPassword();
         else if (id == BTN_SETPW_CANCEL)   closeSetPwAsk();
         else if (id == BTN_SETPW_SHOW)     g_set_pw.show = !g_set_pw.show;
-        return;
-    case MODAL_STITCH:
-        if (id >= BTN_STITCH_SIDE_BASE && id < BTN_STITCH_SIDE_BASE + 4)
-            chooseStitchSide(id - BTN_STITCH_SIDE_BASE);
-        else if (id == BTN_STITCH_SIDE_CANCEL)
-            g_stitch_ask.open = false;
         return;
     case MODAL_DISCARD:
         if (id == BTN_DISCARD_KEEP) {
@@ -8032,7 +8231,7 @@ static void onButton(int id, bool file_window = false)
             const std::string ip = g_last_ip, nm = g_last_name;
             const int port = g_last_port;
             stopSender();
-            launchStream(ip, port, SEND_STITCH, nm, key.c_str());
+            launchStream(ip, port, SEND_STITCH, nm);
             /* launchStream leaves its own failure note (and screen) alone. */
             if (g_sender.active)
                 g_status_note = std::string("已按新方向重连：") +
@@ -8080,10 +8279,6 @@ static void onButton(int id, bool file_window = false)
         if (g_screen == SCR_SETTINGS) requestLeaveSettings(true);
         else                          setScreen(SCR_HOME);
         break;
-    case BTN_RETURN_SESSION:
-        if (g_screen == SCR_SETTINGS) requestLeaveSettings(false);
-        else                          g_screen = resolveHomeScreen();
-        break;
     case BTN_NAV_SETTINGS:
         if (g_file_open && !g_file_detached) closeFileTransfer();
         /* Only re-snapshot when arriving from another screen. openSettings()
@@ -8120,9 +8315,9 @@ static void onButton(int id, bool file_window = false)
         toggleLogWindow();
         break;
     case BTN_HOME_SESSION_RETRY:
-        /* Reuse the normal entry point: 拼接 asks for the side again, while
-         * mirror/extend go straight back to the sender. */
-        startSendMode(g_last_ip, g_last_port, g_child_mode, g_last_name);
+        /* Retry keeps the saved stitch direction; the live card can switch it
+         * once the session is up. */
+        launchStream(g_last_ip, g_last_port, g_child_mode, g_last_name);
         break;
     case BTN_HOME_SESSION_DISMISS:
         /* Return to the connect card; searching must stay reachable after a
@@ -8211,6 +8406,9 @@ static void onButton(int id, bool file_window = false)
         break;
 
     /* settings */
+    case BTN_SET_QUALITY_HELP:
+        openQualityHelp();
+        break;
     case BTN_SET_HW:
         g_cfg_edit.hw_accel = !g_cfg_edit.hw_accel;
         break;
@@ -8362,6 +8560,12 @@ static void onButton(int id, bool file_window = false)
          * download that is already running (取消下载 lives in the 更新 card). */
         break;
     }
+    case BTN_HDR_MINIMIZE:
+        SDL_MinimizeWindow(g_win);
+        break;
+    case BTN_HDR_CLOSE:
+        requestWindowClose();
+        break;
     case BTN_SET_OK: {
         /* 仅允许密码连接 is only a policy when a usable KDF record exists.
          * Refusing here keeps a half-configured receiver from either rejecting
@@ -8481,7 +8685,7 @@ static void onButton(int id, bool file_window = false)
             const std::string ip = g_last_ip, nm = g_last_name;
             const int port = g_last_port;
             stopSender();
-            launchStream(ip, port, SEND_STITCH, nm, g_cfg.stitch_side.c_str());
+            launchStream(ip, port, SEND_STITCH, nm);
             if (g_sender.active)
                 g_status_note = g_cfg.file_drop_send
                                     ? "已开启拖拽发送并重连拼接（对方需再次确认）"
@@ -8655,8 +8859,8 @@ static void onButton(int id, bool file_window = false)
                 devs = g_devices;
             }
             if (idx >= 0 && idx < (int)devs.size() && kind >= 1 && kind <= 3)
-                startSendMode(devs[idx].ip_address, devs[idx].tcp_port,
-                              kind - 1, devs[idx].name);
+                launchStream(devs[idx].ip_address, devs[idx].tcp_port,
+                             kind - 1, devs[idx].name);
             break;
         }
         /* history rows: +0(row) / +1 投屏 / +2 扩展 / +3 拼接 / +4 删除 / +5 文件 */
@@ -8677,10 +8881,10 @@ static void onButton(int id, bool file_window = false)
                 } else if (kind == 5) {
                     openFileTransfer(e.ip, e.name);
                 } else if (kind >= 1 && kind <= 3) {
-                    startSendMode(e.ip, e.port, kind - 1, e.name);
+                    launchStream(e.ip, e.port, kind - 1, e.name);
                 } else {
                     /* row body click: reconnect with the entry's last mode */
-                    startSendMode(e.ip, e.port, sendModeFromKey(e.mode), e.name);
+                    launchStream(e.ip, e.port, sendModeFromKey(e.mode), e.name);
                 }
             }
             break;
@@ -8785,8 +8989,14 @@ int main(int argc, char *argv[])
      * task that an earlier failed registration or an uninstall left behind. */
     reconcileAutoStart(g_cfg);
 
+#ifdef _WIN32
+    const Uint32 win_flags = SDL_WINDOW_BORDERLESS;
+#else
+    const Uint32 win_flags = 0;
+#endif
     g_win = SDL_CreateWindow("Mivara v" MIVARA_VERSION, SDL_WINDOWPOS_CENTERED,
-                             SDL_WINDOWPOS_CENTERED, uiPx(WIN_W), uiPx(WIN_H), 0);
+                             SDL_WINDOWPOS_CENTERED, uiPx(WIN_W), uiPx(WIN_H),
+                             win_flags);
     g_ren = SDL_CreateRenderer(g_win, -1,
                                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!g_win || !g_ren) {
@@ -8802,6 +9012,16 @@ int main(int argc, char *argv[])
         return 1;
     }
     applyMivaraWindowIcon(g_win);
+#ifdef _WIN32
+    /* Created borderless: toggling the caption off afterwards leaves a stale
+     * DWM non-client frame that can flash the old title bar on activation.
+     * The header draws our own caption controls and is the drag area;
+     * WS_EX_APPWINDOW keeps the taskbar entry that WS_POPUP drops, and DWM
+     * rounding gives the window its corners back. */
+    SDL_SetWindowHitTest(g_win, mainWindowHitTest, nullptr);
+    ensureMainWindowTaskbarEntry();
+    applyRoundedWindowCorners();
+#endif
     /* Required by fillRoundRect: the tint chips, hairlines and the stacked
      * drop shadow all rely on SDL honouring the alpha channel. */
     SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
@@ -9143,11 +9363,6 @@ int main(int argc, char *argv[])
                         answerAuthAsk(false);   /* default answer is 拒绝 */
                     continue;
                 }
-                if (modal == MODAL_STITCH) {
-                    if (ev.key.keysym.sym == SDLK_ESCAPE)
-                        g_stitch_ask.open = false;
-                    continue;
-                }
                 if (modal == MODAL_DISCARD) {
                     if (ev.key.keysym.sym == SDLK_ESCAPE)
                         g_discard_open = false;
@@ -9303,10 +9518,11 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* tray requests: 显示主界面 / 退出 (never touches the settings).
-         * Drain unconditionally: the single-instance wake channel outlives the
-         * icon, so a shell-rejected icon must not strand a second launch's
-         * show request (issue 19). Only the tooltip needs a live icon. */
+        /* tray requests: 显示主界面 / 退出 / a history host from the menu
+         * (never touches the settings). Drain unconditionally: the
+         * single-instance wake channel outlives the icon, so a shell-rejected
+         * icon must not strand a second launch's show request (issue 19).
+         * Only the tooltip and the menu snapshot need a live icon. */
         {
             const TrayRequests tr = trayTakeRequests();
             if (tr.show) showFromTray();
@@ -9314,12 +9530,78 @@ int main(int argc, char *argv[])
                 stopReceiver();           /* single stop path */
                 running = false;
             }
+            if (tr.stop == TRAY_STOP_SENDER) {
+                if (g_sender.active) {
+                    const std::string label = g_child_label;
+                    stopSender();
+                    g_status_note = "已停止" + label;
+                    g_status_tone = StatusTone::Info;
+                    /* Deliberately no setScreen(): a tray stop must not throw
+                     * away an open Settings page (or its unsaved edits). */
+                    if (g_hidden)
+                        trayNotify("已停止" + label, "可从托盘右键重新连接");
+                }
+            } else if (tr.stop == TRAY_STOP_RECEIVER) {
+                if (g_receiver.active) {
+                    stopReceiver();
+                    if (g_hidden)
+                        trayNotify("接收已停止", "其他设备将无法连接到此电脑");
+                }
+            }
+            if (tr.launch != TRAY_LAUNCH_NONE) {
+                const bool modal = (topModal() != MODAL_NONE);
+                const bool dirty = (g_screen == SCR_SETTINGS && settingsDirty());
+                if (modal || dirty) {
+                    /* The menu is reachable while hidden and from any screen;
+                     * changing the screen behind a waiting dialog or unsaved
+                     * settings would strand/discard them. Let the user answer
+                     * first instead of bypassing requestLeaveSettings(). */
+                    showFromTray();
+                    trayNotify("请先完成当前操作",
+                               modal ? "主界面有等待确认的窗口"
+                                     : "设置尚未保存，请先保存或取消");
+                } else if (tr.launch == TRAY_LAUNCH_FILES) {
+                    /* The file page is interactive: it must be visible even
+                     * if the icon was used while the window was hidden. */
+                    openFileTransfer(tr.ip, tr.name);
+                    if (g_hidden) showFromTray();
+                } else if (tr.launch >= TRAY_LAUNCH_MIRROR &&
+                           tr.launch <= TRAY_LAUNCH_STITCH) {
+                    /* launchStream switches a live session (stop + relaunch)
+                     * when the target or mode differs, and is a no-op when the
+                     * same endpoint/mode is already running. */
+                    const bool started =
+                        launchStream(tr.ip, tr.port,
+                                     tr.launch - TRAY_LAUNCH_MIRROR, tr.name);
+                    if (g_hidden) {
+                        if (started) {
+                            trayNotify("正在连接",
+                                       sendTargetName() + " · " +
+                                           sendModeLabel(g_child_mode));
+                        } else if (!g_sender.active) {
+                            /* launchStream's failure path only writes the
+                             * home card; the user is looking at the desktop,
+                             * so tell them what happened. */
+                            trayNotify("无法开始会话",
+                                       g_sender_fail_reason.empty()
+                                           ? "发送程序没有启动"
+                                           : g_sender_fail_reason);
+                        } else {
+                            trayNotify("Mivara",
+                                       g_status_note.empty()
+                                           ? "当前会话已在运行"
+                                           : g_status_note);
+                        }
+                    }
+                }
+            }
             if (g_tray_ok) {
                 const std::string tip = trayTooltip();
                 if (tip != g_tray_tip_last) {
                     g_tray_tip_last = tip;
                     traySetTooltip(tip);
                 }
+                trayMenuSync();
             }
         }
 
