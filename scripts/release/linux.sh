@@ -5,8 +5,10 @@
 # Builds the Linux packages in GitHub Actions on the tag that is being
 # released, downloads the artifact into dist/, verifies it, appends the
 # Linux hashes to the release notes and uploads the assets to the GitHub
-# Release. Sourced by release.sh; also runnable on its own to repair a
-# release whose Linux build failed.
+# Release. The workflow builds x86_64 and aarch64 in one matrix run and the
+# merged `linux-packages` artifact carries all nine files.
+# Sourced by release.sh; also runnable on its own to repair a release whose
+# Linux build failed.
 #
 # Usage:
 #   bash scripts/release/linux.sh 0.13.0              # build, upload, edit notes
@@ -22,20 +24,25 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 DIST="${DIST:-$ROOT/dist}"
-LINUX_ARCH="${LINUX_ARCH:-x86_64}"
-DEB_ARCH="${DEB_ARCH:-amd64}"
+# The workflow builds both pairs; keep the list in one place so every file
+# check, upload and release-note row covers the same set.
+LINUX_TARGETS=("x86_64:amd64" "aarch64:arm64")
 LINUX_WORKFLOW="release-linux.yml"
 LINUX_ARTIFACT="linux-packages"
 LINUX_READY=0
 
 linux_asset_names() {
-  local ver="$1"
-  printf '%s\n' \
-    "Mivara-linux-${LINUX_ARCH}-${ver}.tar.gz" \
-    "Mivara-linux-${LINUX_ARCH}.tar.gz" \
-    "mivara_${ver}_${DEB_ARCH}.deb" \
-    "Mivara-linux-${DEB_ARCH}.deb" \
-    "SHA256SUMS-linux.txt"
+  local ver="$1" pair la da
+  for pair in "${LINUX_TARGETS[@]}"; do
+    la="${pair%%:*}"
+    da="${pair##*:}"
+    printf '%s\n' \
+      "Mivara-linux-${la}-${ver}.tar.gz" \
+      "Mivara-linux-${la}.tar.gz" \
+      "mivara_${ver}_${da}.deb" \
+      "Mivara-linux-${da}.deb"
+  done
+  printf '%s\n' "SHA256SUMS-linux.txt"
 }
 
 linux_assets_present() {
@@ -47,19 +54,23 @@ linux_assets_present() {
 }
 
 linux_verify_local() {
-  local ver="$1"
-  linux_assets_present "$ver" || die "dist/ 缺少 Linux 产物（需要 4 个包 + SHA256SUMS-linux.txt）"
-  grep -q "  Mivara-linux-${LINUX_ARCH}-${ver}.tar.gz$" "$DIST/SHA256SUMS-linux.txt" \
-    || die "dist/SHA256SUMS-linux.txt 不是 $ver 的产物"
+  local ver="$1" pair la da
+  linux_assets_present "$ver" || die "dist/ 缺少 Linux 产物（需要 8 个包 + SHA256SUMS-linux.txt）"
   ( cd "$DIST" && sha256sum -c SHA256SUMS-linux.txt >/dev/null ) \
     || die "dist/SHA256SUMS-linux.txt 校验失败"
-  cmp -s "$DIST/Mivara-linux-${LINUX_ARCH}-${ver}.tar.gz" \
-         "$DIST/Mivara-linux-${LINUX_ARCH}.tar.gz" \
-    || die "固定名 tar 与版本名文件不一致"
-  cmp -s "$DIST/mivara_${ver}_${DEB_ARCH}.deb" \
-         "$DIST/Mivara-linux-${DEB_ARCH}.deb" \
-    || die "固定名 deb 与版本名文件不一致"
-  ok "Linux 产物本地校验通过（$ver, ${LINUX_ARCH}/${DEB_ARCH}）"
+  for pair in "${LINUX_TARGETS[@]}"; do
+    la="${pair%%:*}"
+    da="${pair##*:}"
+    grep -q "  Mivara-linux-${la}-${ver}.tar.gz$" "$DIST/SHA256SUMS-linux.txt" \
+      || die "dist/SHA256SUMS-linux.txt 缺少 $ver 的 $la 条目"
+    cmp -s "$DIST/Mivara-linux-${la}-${ver}.tar.gz" \
+           "$DIST/Mivara-linux-${la}.tar.gz" \
+      || die "固定名 tar（$la）与版本名文件不一致"
+    cmp -s "$DIST/mivara_${ver}_${da}.deb" \
+           "$DIST/Mivara-linux-${da}.deb" \
+      || die "固定名 deb（$da）与版本名文件不一致"
+  done
+  ok "Linux 产物本地校验通过（$ver, x86_64/amd64 + aarch64/arm64）"
 }
 
 linux_run_ids() {
@@ -218,8 +229,8 @@ linux_update_notes() {
       printf '| `%s` | `%s` |\n' "$n" "$h"
     done < "$DIST/SHA256SUMS-linux.txt"
     printf '\n'
-    printf 'Ubuntu/Debian 优先安装 `.deb`（`sudo apt install ./mivara_%s_%s.deb`）；其他发行版解压 `.tar.gz` 后运行 `./install.sh`。\n' \
-      "$ver" "$DEB_ARCH"
+    printf 'Ubuntu/Debian 优先安装 `.deb`（`sudo apt install ./mivara_%s_amd64.deb` 或 `./mivara_%s_arm64.deb`）；其他发行版解压对应架构的 `.tar.gz` 后运行 `./install.sh`。\n' \
+      "$ver" "$ver"
     printf '预编译包需要 glibc 2.35+（构建于 Ubuntu 22.04）；更旧的系统请从源码构建。安装说明见 [构建与打包](%s/blob/main/docs/zh/building.md)。\n' \
       "$REPO_URL"
     printf '<!-- /mivara-linux-assets -->\n'

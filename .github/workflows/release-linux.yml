@@ -9,10 +9,14 @@
 #     FFmpeg/SDL/codec closure and only relies on the host for glibc, X11 and
 #     the desktop stack.
 #
-# What it does: ubuntu-22.04 build → dist/Mivara-linux-x86_64-<ver>.tar.gz,
-#   its fixed-name copy, mivara_<ver>_amd64.deb, its fixed-name copy and
-#   SHA256SUMS-linux.txt, uploaded as the `linux-packages` artifact.
+# What it does: one 22.04 build per architecture (x86_64 on ubuntu-22.04,
+#   aarch64 on ubuntu-22.04-arm) → dist/Mivara-linux-<arch>-<ver>.tar.gz, its
+#   fixed-name copy, mivara_<ver>_<debarch>.deb, its fixed-name copy and a
+#   per-arch SHA256SUMS-linux.txt. The merge job concatenates the checksum
+#   files and uploads one `linux-packages` artifact with all nine files, which
+#   is what scripts/release/linux.sh downloads.
 #
+# The -arm runner is GitHub's hosted arm64 runner, available to public repos.
 # release.sh dispatches this workflow on the pushed release tag and uploads
 # the artifact to the GitHub Release. Dispatch it by hand only to repair a
 # release:
@@ -35,10 +39,22 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            linux_arch: x86_64
+            deb_arch: amd64
+          - runner: ubuntu-22.04-arm
+            linux_arch: aarch64
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
       DEBIAN_FRONTEND: noninteractive
+      LINUX_ARCH: ${{ matrix.linux_arch }}
+      DEB_ARCH: ${{ matrix.deb_arch }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -65,10 +81,44 @@ jobs:
       - name: Upload Linux packages
         uses: actions/upload-artifact@v7
         with:
-          name: linux-packages
+          name: linux-packages-${{ matrix.linux_arch }}
           path: |
             dist/Mivara-linux-*.tar.gz
             dist/mivara_*.deb
             dist/Mivara-linux-*.deb
             dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
+
+  merge-linux:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Download both architectures
+        uses: actions/download-artifact@v7
+        with:
+          pattern: linux-packages-*
+          path: artifacts
+
+      - name: Merge packages and checksums
+        run: |
+          set -eu
+          mkdir -p merged
+          # upload-artifact flattens the common dist/ prefix today, but find
+          # keeps this working if that changes.
+          find artifacts -type f \( -name 'Mivara-linux-*' -o -name 'mivara_*.deb' \) \
+            -exec cp -f {} merged/ \;
+          x86sums="$(find artifacts/linux-packages-x86_64 -type f -name SHA256SUMS-linux.txt | head -n 1)"
+          armsums="$(find artifacts/linux-packages-aarch64 -type f -name SHA256SUMS-linux.txt | head -n 1)"
+          # Stable order: x86_64 first, then aarch64. scripts/release/linux.sh
+          # validates every line and cmp's both fixed-name pairs.
+          cat "$x86sums" "$armsums" > merged/SHA256SUMS-linux.txt
+          ( cd merged && sha256sum -c SHA256SUMS-linux.txt )
+          ls -l merged
+
+      - name: Upload merged Linux packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages
+          path: merged/*
           if-no-files-found: error

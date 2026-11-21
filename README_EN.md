@@ -45,10 +45,11 @@ Turn any computer on your LAN into a second screen. The sender captures and stre
 
 ### Linux
 
-1. Download [Mivara-linux-x86_64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-x86_64.tar.gz) (portable) or [Mivara-linux-amd64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-amd64.deb) (Ubuntu 22.04).
-2. Install one of:
+1. Download [Mivara-linux-x86_64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-x86_64.tar.gz) (portable) or [Mivara-linux-amd64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-amd64.deb) (Ubuntu 22.04); ARM64 devices use [Mivara-linux-aarch64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-aarch64.tar.gz) (portable) or [Mivara-linux-arm64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-arm64.deb) (Ubuntu 22.04).
+2. Install one of (deb or portable):
    - Ubuntu: `sudo apt install ./Mivara-linux-amd64.deb`
-   - Other distros: extract the tarball, enter the directory and run `./install.sh` (defaults to `~/.local`; `sudo ./install.sh` uses `/usr/local`)
+   - Ubuntu (ARM64): `sudo apt install ./Mivara-linux-arm64.deb`
+   - Other distros: extract the matching architecture's tarball, enter the directory and run `./install.sh` (defaults to `~/.local`; `sudo ./install.sh` uses `/usr/local`)
 3. Launch "Mivara" from the application menu or run `mivara`. Linux supports mirroring, receiving, file transfer and both stitch roles (X11 session); extend needs a Windows sender.
 
 > The portable bundle ships the FFmpeg/SDL runtime and needs glibc 2.35+ with an X11 desktop; the `.deb` is built against Ubuntu 22.04's FFmpeg ABI. See [Building & Packaging](docs/en/building.md#prebuilt-linux-packages).

@@ -14,8 +14,9 @@
 # This is also the recovery path for an aborted release: it never builds,
 # commits or pushes, so it can be rerun after a network failure.
 #
-# When dist/SHA256SUMS-linux.txt lists the version being verified, the four
-# Linux assets and their server digests are checked as well.
+# When dist/SHA256SUMS-linux.txt lists the version being verified, every
+# Linux asset named there (x86_64 and/or aarch64) and its server digest are
+# checked as well.
 # ============================================================================
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -64,13 +65,11 @@ verify_release() {
   # local SHA256SUMS-linux.txt lists THIS version they are part of this
   # release and must be checked like the Windows ones. (dist/ can still hold
   # the previous release's checksum file, so never trust its mere presence.)
-  LINUX_ARCH="${LINUX_ARCH:-x86_64}"
-  DEB_ARCH="${DEB_ARCH:-amd64}"
   LINUX_NAMES=()
   LINUX_SUMS_DIGEST=""
   LINUX_SUMS_CURRENT=0
   if [ -f dist/SHA256SUMS-linux.txt ]; then
-    if grep -q "  Mivara-linux-${LINUX_ARCH}-${VER}.tar.gz$" dist/SHA256SUMS-linux.txt; then
+    if grep -Eq "  Mivara-linux-(x86_64|aarch64)-${VER}\.tar\.gz$" dist/SHA256SUMS-linux.txt; then
       LINUX_SUMS_CURRENT=1
     else
       warn "dist/SHA256SUMS-linux.txt 不是 $VER 的产物，跳过 Linux 校验"

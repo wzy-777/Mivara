@@ -81,15 +81,17 @@ Builds use `-O3 -march=native -flto`; output goes to `bin/`.
 
 ## Prebuilt Linux Packages
 
-Each release publishes two Linux artifacts built by CI on Ubuntu 22.04:
+Each release publishes Linux artifacts for two architectures (x86_64 and aarch64), built by CI on Ubuntu 22.04:
 
 | File | Target | Notes |
 |------|--------|-------|
-| `Mivara-linux-x86_64.tar.gz` | X11 desktops with glibc 2.35+ | Portable bundle; ships the FFmpeg/SDL/codec runtime, run `./install.sh` after extracting |
-| `Mivara-linux-amd64.deb` | Ubuntu 22.04 (FFmpeg 4.4 ABI) | Debian package; `sudo apt install ./Mivara-linux-amd64.deb` |
-| `SHA256SUMS-linux.txt` | — | SHA-256 for the files above |
+| `Mivara-linux-x86_64.tar.gz` | x86_64 X11 desktops with glibc 2.35+ | Portable bundle; ships the FFmpeg/SDL/codec runtime, run `./install.sh` after extracting |
+| `Mivara-linux-amd64.deb` | x86_64 Ubuntu 22.04 (FFmpeg 4.4 ABI) | Debian package; `sudo apt install ./Mivara-linux-amd64.deb` |
+| `Mivara-linux-aarch64.tar.gz` | ARM64 X11 desktops with glibc 2.35+ | Portable bundle for ARM64 |
+| `Mivara-linux-arm64.deb` | ARM64 Ubuntu 22.04 (FFmpeg 4.4 ABI) | Debian package; `sudo apt install ./Mivara-linux-arm64.deb` |
+| `SHA256SUMS-linux.txt` | — | SHA-256 for all of the above (both architectures) |
 
-The portable installer defaults to `~/.local` (`sudo ./install.sh` uses `/usr/local`) and creates the `mivara` launcher, desktop entry and icon; `./install.sh --uninstall` removes it. The `.deb` installs to `/usr/lib/mivara`; the command is `mivara` (also `mivara-sender` / `mivara-receiver`).
+The portable installer defaults to `~/.local` (`sudo ./install.sh` uses `/usr/local`) and creates the `mivara` launcher, desktop entry and icon; `./install.sh --uninstall` removes it. The `.deb` installs to `/usr/lib/mivara`; the command is `mivara` (also `mivara-sender` / `mivara-receiver`). The in-app "Download update" picks the fixed-name package matching the current install and running architecture, verifies `SHA256SUMS-linux.txt`, then installs with privilege escalation and relaunches.
 
 Build locally:
 
@@ -99,13 +101,13 @@ sudo apt-get install patchelf dpkg-dev   # packaging tools (Debian/Ubuntu)
 make package-linux                       # portable build + tar.gz + .deb → dist/
 ```
 
-The packaging script is `scripts/release/package-linux.sh`: it runs `make clean` and a portable build (`-O3 -march=x86-64 -flto`), copies the non-system runtime libraries into the tarball and writes an `$ORIGIN` RPATH; the `.deb` instead depends on the distribution's FFmpeg/SDL packages, with dependencies computed by `dpkg-shlibdeps`. Pass `--skip-build` to reuse an existing `bin/`. Output:
+The packaging script is `scripts/release/package-linux.sh`: `LINUX_ARCH` defaults to `uname -m`; it runs `make clean` and a portable build (`-O3 -march=x86-64 -flto` on x86_64, `-O3 -flto` elsewhere), copies the non-system runtime libraries into the tarball and writes an `$ORIGIN` RPATH; the `.deb` instead depends on the distribution's FFmpeg/SDL packages, with dependencies computed by `dpkg-shlibdeps`. Pass `--skip-build` to reuse an existing `bin/`. Output:
 
-- `dist/Mivara-linux-x86_64-<version>.tar.gz` (and the fixed-name copy `dist/Mivara-linux-x86_64.tar.gz`)
-- `dist/mivara_<version>_amd64.deb` (and the fixed-name copy `dist/Mivara-linux-amd64.deb`)
+- `dist/Mivara-linux-<arch>-<version>.tar.gz` (and the fixed-name copy `dist/Mivara-linux-<arch>.tar.gz`)
+- `dist/mivara_<version>_<debarch>.deb` (and the fixed-name copy `dist/Mivara-linux-<debarch>.deb`)
 - `dist/SHA256SUMS-linux.txt`
 
-For releases, `release.sh` dispatches `.github/workflows/release-linux.yml` on the pushed tag, downloads the artifacts and uploads them together with the Windows installer; `--no-linux` produces a Windows-only release. If CI fails, the Windows assets are still published and `bash scripts/release/linux.sh <version>` adds the Linux packages afterwards.
+For releases, `release.sh` dispatches `.github/workflows/release-linux.yml` on the pushed tag; the workflow runs `ubuntu-22.04` (x86_64) and `ubuntu-22.04-arm` (aarch64) in parallel, merges the checksums into one `linux-packages` artifact, and uploads it together with the Windows installer. `--no-linux` produces a Windows-only release. If CI fails, the Windows assets are still published and `bash scripts/release/linux.sh <version>` adds the Linux packages afterwards.
 
 ## Windows Console Notes
 

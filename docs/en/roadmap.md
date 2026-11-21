@@ -16,7 +16,7 @@ The list below tracks shipped and planned features in order; `[x]` means shipped
 - [ ] Receiver input back-channel (real keyboard/mouse control from the receiver side)
 - [x] Optional encoders: RLE / H.264 / H.265 / AV1 as a selectable option
 - [x] GUI advanced settings (encoder picker, connection history)
-- [x] In-app update check + one-click download/install (Windows, SHA-256 verified, admin-only staging directory)
+- [x] In-app update check + one-click download/install (Windows and Linux, SHA-256 verified; Linux installs with privilege escalation and relaunches)
 - [x] Extend-resolution choice (auto-matches the receiver; `extend_res` in `config.ini` overrides it; no GUI control yet)
 - [ ] Audio capture and streaming
 - [ ] TLS encryption

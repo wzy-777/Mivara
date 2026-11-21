@@ -2634,7 +2634,7 @@ static std::string updateStatusText(const UpdateInfo &ui, SDL_Color &col)
     case UpdateState::Downloaded:
         if (!ui.detail.empty()) {            /* the last hand-over failed */
             col = THEME.danger;
-            return "启动安装程序失败，请重试";
+            return updateErrorText(ui.detail);
         }
         col = THEME.success;
         return "更新包已下载，点击「立即安装」";
@@ -8065,12 +8065,16 @@ static void renderScreen(int mousex, int mousey)
 }
 
 /* ── button actions ──────────────────────────────────────────────────────── */
-/** Hand the verified installer over to Setup and quit on success.
+/** Hand the verified installer over and quit on success.
+ * Windows launches Setup; Linux starts a detached helper that waits for this
+ * process to exit, installs the verified package (apt-get via pkexec, or the
+ * bundle's install.sh) and relaunches Mivara. Quitting first is what lets the
+ * update replace the running binary.
  * Launch FIRST and quit only on success: if the hand-over fails the user keeps
  * the running session and simply clicks 立即安装 again. On success the normal
  * exit path is what stops the children (the Ctrl+C path detaches the virtual
- * display) while Setup shows its wizard, so app.exe is released before Setup
- * replaces it. */
+ * display) while the installer runs, so the app binary is released before the
+ * installer replaces it. */
 static void startInstall()
 {
     UpdateInfo ui = updateGetInfo();
@@ -8541,7 +8545,7 @@ static void onButton(int id, bool file_window = false)
     case BTN_HDR_UPDATE: {
         UpdateInfo ui = updateGetInfo();
         if (ui.state == UpdateState::Available) {
-            if (!updateDownloadSupported()) {    /* POSIX: browser hand-off only */
+            if (!updateDownloadSupported()) {    /* macOS/unsupported: browser only */
                 if (!updateOpenReleasePage()) logPush("[gui] 打开浏览器失败");
                 break;
             }

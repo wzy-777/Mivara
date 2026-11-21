@@ -5,11 +5,11 @@
 # Linux-only half of the release pipeline. Rebuilds bin/{app,sender,receiver}
 # with the portable flags and produces:
 #
-#   dist/Mivara-linux-x86_64-<ver>.tar.gz   portable bundle (bundled runtime)
-#   dist/Mivara-linux-x86_64.tar.gz         fixed-name copy of the same file
-#   dist/mivara_<ver>_amd64.deb             Debian/Ubuntu package
-#   dist/Mivara-linux-amd64.deb             fixed-name copy of the same file
-#   dist/SHA256SUMS-linux.txt               sha256sum lines for all four
+#   dist/Mivara-linux-<arch>-<ver>.tar.gz   portable bundle (bundled runtime)
+#   dist/Mivara-linux-<arch>.tar.gz         fixed-name copy of the same file
+#   dist/mivara_<ver>_<debarch>.deb         Debian/Ubuntu package
+#   dist/Mivara-linux-<debarch>.deb         fixed-name copy of the same file
+#   dist/SHA256SUMS-linux.txt               sha256sum lines for the four files
 #
 # The tar.gz is self-contained apart from glibc/X11/desktop libraries: the
 # FFmpeg/SDL/codec closure is copied into lib/ and the binaries get an
@@ -18,10 +18,14 @@
 # FFmpeg ABI it was built against (CI builds on Ubuntu 22.04).
 #
 # Usage:
-#   bash scripts/release/package-linux.sh              # build + package
+#   bash scripts/release/package-linux.sh              # build + package (host arch)
+#   LINUX_ARCH=aarch64 bash scripts/release/package-linux.sh
 #   bash scripts/release/package-linux.sh --skip-build # package bin/ as-is
 #   bash scripts/release/package-linux.sh --ver 0.13.0
 #   bash scripts/release/package-linux.sh --no-deb     # portable tar only
+#
+# The release CI runs this once per architecture: x86_64 on ubuntu-22.04 and
+# aarch64 on ubuntu-22.04-arm. A local run can only build the host arch.
 #
 # Requirements (Debian/Ubuntu host): g++ make pkg-config libx11-dev
 # libsdl2-dev libsdl2-ttf-dev libavcodec-dev libavutil-dev libswscale-dev
@@ -31,7 +35,7 @@
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-LINUX_ARCH="${LINUX_ARCH:-x86_64}"
+LINUX_ARCH="${LINUX_ARCH:-$(uname -m)}"
 DEB_ARCH="${DEB_ARCH:-}"
 DIST="${DIST:-$ROOT/dist}"
 WORK="$DIST/linux"

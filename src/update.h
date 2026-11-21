@@ -6,11 +6,19 @@
  * it is rate limited (60/h per IP unauthenticated) and would fail behind
  * shared/CGNAT addresses; the web redirect has no such limit.
  *
- * Windows update flow (POSIX offers check + browser handoff only):
+ * Windows update flow (Linux offers the same in-app download + install;
+ * macOS offers check + browser handoff only):
  *   Available -> download Mivara-Setup.exe over HTTPS into a locked-down
  *   %ProgramData%\Mivara\Updates directory, verify size + SHA-256 against the
  *   release's SHA256SUMS.txt (fail closed: no sums file => no in-app install),
  *   re-verify the hash on disk right before launching the Inno Setup installer.
+ *
+ * Linux update flow:
+ *   Available -> pick the fixed-name asset matching the running binary
+ *   (x86_64/aarch64 tar.gz, or amd64/arm64 .deb when installed from the .deb),
+ *   verify SHA-256 against the release's SHA256SUMS-linux.txt, then hand the
+ *   verified package to a detached helper that waits for this process to exit,
+ *   installs it through apt-get/pkexec or install.sh, and relaunches Mivara.
  *
  * Threading: one worker thread owned by this module. The worker never touches
  * SDL, the log ring or the config; the UI polls updateTake() once per frame.
@@ -43,7 +51,7 @@ struct UpdateInfo {
 /* Chinese text for a failure token ("" -> generic). */
 std::string updateErrorText(const std::string &detail);
 
-/* True when this build can download+install in-app (Windows only). */
+/* True when this build can download+install in-app (Windows and Linux). */
 bool updateDownloadSupported();
 
 /* ── main thread API ─────────────────────────────────────────────────────── */
@@ -58,7 +66,8 @@ void updateStartupSweep();         /* delete stale installers from earlier runs 
 
 /* ── actions ─────────────────────────────────────────────────────────────── */
 bool updateOpenReleasePage();   /* open the constant release URL in the browser */
-bool updateLaunchInstaller();   /* launch the verified installer (Windows) */
+bool updateLaunchInstaller();   /* launch the verified installer (Windows:
+                                 * Inno Setup; Linux: detached privileged helper) */
 
 /* ── pure helpers (also exercised by the -DUPDATE_TEST_MAIN CLI) ─────────── */
 bool updateParseReleaseLocation(const std::string &location, std::string &tag_out);

@@ -17,7 +17,9 @@
 | 扩展模式黑屏 / 无画面 | 两端握手不一致（模式值 0=镜像 1=扩展） | 接收端与发送端使用同版本二进制 |
 | 断开后虚拟屏仍在「设置 → 屏幕」 | 旧版本只做 CCD 分离，或未以管理员运行 | 已修复：退出时禁用 Root\MttVDD 设备（需管理员权限运行 sender/app）。若日志出现 disable 失败，可在设备管理器手动禁用「Virtual Display Driver」。驱动说明见[虚拟显示器驱动](virtual-display.md) |
 | 「检查更新」失败（DNS 解析失败 / 请求超时 / 安全连接失败） | 检查只访问 `github.com`，直连不稳定时（企业网络或大陆网络常见）会失败，属预期降级 | 点设置页「打开下载页」用浏览器（走系统代理/VPN）手动下载安装；安装新版本前建议先在应用内「退出」，确保虚拟显示器正确卸载 |
-| 点「下载更新」提示「未找到校验文件」 | 该 Release 未附带 `SHA256SUMS.txt`（应用内安装要求有哈希锚点，缺失时不做应用内安装） | 用「打开下载页」手动下载安装即可 |
+| 点「下载更新」提示「未找到校验文件」 | 该 Release 未附带 `SHA256SUMS.txt` / `SHA256SUMS-linux.txt`（应用内安装要求有哈希锚点，缺失时不做应用内安装） | 用「打开下载页」手动下载安装即可 |
+| 点「下载更新」提示「当前架构暂无安装包」 | 该 Release 没有当前架构（如 aarch64）的固定名包 | 用「打开下载页」选择对应架构；或等待该架构的发布产物 |
+| Linux 点「立即安装」后应用退出但没有重启 | 提权安装被取消（pkexec 密码框）、apt 锁被占用或发行版依赖不满足 | 查看 `~/.cache/mivara/updates/install.log`，按日志手动执行 `sudo apt install ~/.cache/mivara/updates/Mivara-linux-*.deb`，便携包则解压后运行 `./install.sh` |
 | 下载/运行时 SmartScreen 提示（「通常不会下载」「未知发布者」） | 安装包未做代码签名 + 新文件无下载信誉（正常信誉提示，非报毒） | 校验 SHA-256 后按提示继续，详见 [Windows SmartScreen 提示说明](#windows-smartscreen-提示说明) |
 | 拼接时偶尔自动断开 / 主页拼接卡片显示「连接中断，正在自动重连…」 | 本机网卡切换（USB 网卡休眠、Wi-Fi 自动接管）或对端重启使 TCP 8084 连接失效；不是心跳误判 | 控制器会自动重连（1/2/4/8/16/30 秒退避），期间可点「停止」；查看日志 `[kvm] connection lost: <reason>` 与 `STAT|event=stitch|state=reconnecting|reason=…` 定位原因。若是 USB 有线网卡，可在设备管理器/网卡高级设置关闭「Selective suspend」或延长空闲超时，并关闭不需要的 Wi-Fi 自动连接；接收端为手动/密码策略时重连需要再次授权；对端 IP 已变化时自动重连会一直失败，需先点「停止拼接」结束重连，再重新搜索设备 |
 | 拼接时拖拽文件没有复制 | 两端未开启文件投放；发送开关在拼接建立后才打开且旧会话未重连；8085 被防火墙拦截；`bin/stitchcap.exe` 缺失或被安全软件拦截；落点不是资源管理器/桌面 | 在「设置 → 常规」分别开启接收端「允许对端发送文件」和发送端「拖拽到边缘发送文件」并保存；会话中修改发送开关会自动按新配置重连拼接（对端需重新确认），接收端开关保存即生效；放行 TCP 8085（反向拖回还需放行控制端的 TCP 8087）；确认 `bin/stitchcap.exe` 与 exe 同目录；拖到资源管理器窗口或桌面，无法识别时会回退到 `Downloads\Mivara`（或 `%LOCALAPPDATA%\Mivara\Received`）。仍失败时看日志 `STAT|event=drop` 的 `ready/capture/release/sending/receiving/done/error` 各阶段定位断点；需要捕获层细节时，在发送端进程环境设置 `MIVARA_DROP_TRACE=1` 和 `MIVARA_STITCHCAP_TRACE=1` 后重连拼接，读取 `%TEMP%\mivara-dropctl-trace.log` 与 `%TEMP%\mivara-stitchcap-trace.log` |

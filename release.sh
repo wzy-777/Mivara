@@ -137,7 +137,7 @@ if [ "$DO_LINUX" = 1 ]; then
     || die "缺少 .github/workflows/release-linux.yml（Linux 打包 CI）"
   [ -f "scripts/release/package-linux.sh" ] \
     || die "缺少 scripts/release/package-linux.sh"
-  ok "Linux 打包已启用（CI · ubuntu-22.04）"
+  ok "Linux 打包已启用（CI · ubuntu-22.04 / ubuntu-22.04-arm）"
 else
   warn "已禁用 Linux 打包（--no-linux）"
 fi
@@ -359,7 +359,7 @@ step "完成"
 printf '  Release : %s/releases/tag/%s\n' "$REPO_URL" "$TAG"
 printf '  SHA-256 : %s\n' "$HASH"
 if [ "$DO_LINUX" = 1 ]; then
-  printf '  Linux   : tar.gz + .deb 已上传（%s/%s）\n' "$LINUX_ARCH" "$DEB_ARCH"
+  printf '  Linux   : tar.gz + .deb 已上传（x86_64/amd64 + aarch64/arm64）\n'
 else
   printf '  Linux   : 已跳过（--no-linux）\n'
 fi

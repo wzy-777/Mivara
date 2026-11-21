@@ -45,10 +45,11 @@
 
 ### Linux
 
-1. 下载 [Mivara-linux-x86_64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-x86_64.tar.gz)（通用包）或 [Mivara-linux-amd64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-amd64.deb)（Ubuntu 22.04）。
-2. 安装（二选一）：
+1. 下载 [Mivara-linux-x86_64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-x86_64.tar.gz)（通用包）或 [Mivara-linux-amd64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-amd64.deb)（Ubuntu 22.04）；ARM64 设备下载 [Mivara-linux-aarch64.tar.gz](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-aarch64.tar.gz)（通用包）或 [Mivara-linux-arm64.deb](https://github.com/wzy-777/Mivara/releases/latest/download/Mivara-linux-arm64.deb)（Ubuntu 22.04）。
+2. 安装（deb 或通用包）：
    - Ubuntu：`sudo apt install ./Mivara-linux-amd64.deb`
-   - 其他发行版：解压后进入目录运行 `./install.sh`（默认安装到 `~/.local`；`sudo ./install.sh` 安装到 `/usr/local`）
+   - Ubuntu（ARM64）：`sudo apt install ./Mivara-linux-arm64.deb`
+   - 其他发行版：解压对应架构的压缩包后进入目录运行 `./install.sh`（默认安装到 `~/.local`；`sudo ./install.sh` 安装到 `/usr/local`）
 3. 从应用菜单启动「Mivara」，或在终端运行 `mivara`。Linux 端支持投屏、接收、文件传输，以及作为拼接的控制端或被控端（X11 会话）；扩展模式需要 Windows 发送端。
 
 > 通用包已内置 FFmpeg/SDL 等运行时库，只需系统提供 glibc 2.35+ 与 X11 桌面；`.deb` 按 Ubuntu 22.04 的 FFmpeg ABI 构建。详见[构建与打包](docs/zh/building.md#linux-预编译包)。
