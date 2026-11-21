@@ -16,7 +16,7 @@ ReleaseDate: 2026-11-21
 Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/wzy-777/Mivara/releases/download/v0.12.3/Mivara-Setup-0.12.3.exe
-  InstallerSha256: 60B5A8AE46F2843F78FECC083F354C141290319A7EE36E42FC7158BDAE542929
+  InstallerSha256: 78E9E0CC0FF7DEE076623FFEC3975C0B4A0C160DFFA24C61D7C1F4DDEAE29B2F
   # Unattended installs must not run the VDD task: devcon install triggers the
   # Windows Security "Would you like to install this device software?" dialog
   # (publisher SignPath Foundation), which blocks until the validator times out.
