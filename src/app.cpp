@@ -598,7 +598,7 @@ enum BtnId {
     BTN_MANUAL_CONNECT = 600,
     BTN_MANUAL_BACK,
     /* settings */
-    BTN_SET_CODEC_BASE = 7000,          /* +0..5 */
+    BTN_SET_CODEC_BASE = 7000,          /* +0..4 */
     BTN_SET_HW = 7010,
     BTN_SET_QUALITY_HELP,               /* 画质与编码 card · ? help page */
     BTN_SET_QUALITY_DEC,
@@ -6558,9 +6558,9 @@ static void buildButtons()
                       kTab[i], BTN_SET_TAB_BASE + i, g_set_tab == i);
 
         if (g_set_tab == 1) {
-            const char *codecLabels[] = {"自动", "H.264", "H.265", "AV1", "原始", "RLE"};
-            const char *codecIds[]    = {"auto", "h264", "h265", "av1", "raw", "rle"};
-            for (int i = 0; i < 6; i++) {
+            const char *codecLabels[] = {"自动", "H.264", "H.265", "AV1", "RLE"};
+            const char *codecIds[]    = {"auto", "h264", "h265", "av1", "rle"};
+            for (int i = 0; i < 5; i++) {
                 const int col = i % 3, row = i / 3;
                 addChoice(SET_LC_X + col * 101, SET_GRID_Y0 + row * 36, 93, 32,
                           codecLabels[i], BTN_SET_CODEC_BASE + i,
@@ -6688,8 +6688,7 @@ static std::string codecDetail(const std::string &impl)
         const size_t len = std::strlen(n);
         if (impl.size() < len || impl.compare(0, len, n) != 0) continue;
         /* Bare codec token — raw/rle arrive exactly like this, so there is no
-         * separator to strip and nothing left to say: "原始 (raw)" is the very
-         * duplication this function exists to remove. */
+         * separator to strip and nothing left to say. */
         if (impl.size() == len) return "";
         if (impl[len] == ' ' || impl[len] == '_' || impl[len] == '-')
             return impl.substr(len + 1);
@@ -8246,8 +8245,8 @@ static void onButton(int id, bool file_window = false)
         return;
     }
 
-    if (id >= BTN_SET_CODEC_BASE && id < BTN_SET_CODEC_BASE + 6) {
-        const char *ids[] = {"auto", "h264", "h265", "av1", "raw", "rle"};
+    if (id >= BTN_SET_CODEC_BASE && id < BTN_SET_CODEC_BASE + 5) {
+        const char *ids[] = {"auto", "h264", "h265", "av1", "rle"};
         g_cfg_edit.codec = ids[id - BTN_SET_CODEC_BASE];
         return;
     }

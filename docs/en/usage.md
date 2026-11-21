@@ -32,7 +32,7 @@ The GUI is Chinese-only; the screenshots below show the Home screen (light/dark)
 |----------|-----------|
 | **Extend mode** | Virtual display auto-enabled and attached at session start; on every exit path (normal end / Ctrl+C / disconnect / console close / hard-kill fallback) it is detached and the device is disabled, so it vanishes from system settings completely |
 | **Virtual display integration** | Activation/deactivation/positioning done in-process via the CCD API — no manual display-settings fiddling |
-| **Video codecs** | H.264 / H.265 / AV1 (FFmpeg), hardware-first (NVENC/QSV/AMF/VAAPI) with automatic software fallback (libx264/libx265/SVT-AV1); raw/RLE lossless options kept |
+| **Video codecs** | H.264 / H.265 / AV1 (FFmpeg), hardware-first (NVENC/QSV/AMF/VAAPI) with automatic software fallback (libx264/libx265/SVT-AV1); RLE lossless option kept |
 | **Live reconfigure** | Change codec/quality/bitrate/fps/scale/chroma mid-session — applied in seconds without dropping the stream (codec switches blip for a frame or two) |
 | **Visible cursor** | The pointer is drawn into the video frames; in extend mode this equals "pointer crossing" |
 | **Direct connect** | `sender <IP>` skips discovery — works when SSDP multicast is blocked by network policy |
@@ -114,7 +114,7 @@ The top-right of the header holds the **appearance switcher** — three icons: s
 - **Home · Connection history**: only sessions that actually started are recorded — video has started streaming, or a stitch session has been established. Discovery, connection probes, denied authorization and launch failures add no entry. For the last 20 entries, click a row to reconnect with its last mode or choose another mode directly; the folder icon beside the computer name opens two-way file transfer; delete one, clear all, or scroll with the mouse wheel
 - **Home · In session**: cast, extend and stitch sessions all run entirely from Home — there is no separate session screen. The home card shows the target, connection state, Log and Stop; cast/extend show codec, FPS, bitrate and resolution live, while stitch shows the four-way "Direction" switch and control state. A failed attempt keeps the same card with the reason plus Log / Retry / Close (Close returns to the connect card so search and manual IP are reachable again). You can switch to Settings without interrupting the session, then use the Home nav item to return to Home. ESC on any other screen only returns Home; **it does not stop the session**
 - **Settings · General**: "Startup" contains start receiving on app launch, launch at logon, the stitch file-drop and two-way file-transfer switches, and "Detach file-transfer window by default"; "Updates & diagnostics" contains the status console, log window and automatic update checks; "Update" sits below
-- **Settings · Quality & Codec**: the left column has codec (auto/H.264/H.265/AV1/raw/RLE), quality, FPS, bitrate, scale and chroma; the right column has hardware acceleration. **Changed transfer parameters apply live when you save — the stream is not dropped**. The **?** button in the card header opens the bundled [Quality & Codec guide](../help/quality.html) in the browser; the page is currently in Chinese and explains every option with recommended presets
+- **Settings · Quality & Codec**: the left column has codec (auto/H.264/H.265/AV1/RLE), quality, FPS, bitrate, scale and chroma; the right column has hardware acceleration. **Changed transfer parameters apply live when you save — the stream is not dropped**. The **?** button in the card header opens the bundled [Quality & Codec guide](../help/quality.html) in the browser; the page is currently in Chinese and explains every option with recommended presets
 - **Settings · Receiving & Security**: see the next section
 - **Settings · Update & Save**: the bottom of General shows the current version and check result; a new release offers "Download update" (with progress) → "Install now" (Windows: after verification the app quits and starts the installer; Linux: after verification the app quits, installs with privilege escalation and relaunches; macOS: opens the release page). You can "Ignore this version". Apart from immediate controls such as appearance and the receive switch, changes are committed with "Save settings". Cancel or ESC goes back, asking first when edits are unsaved; "Restore defaults" changes the working copy and writes only when saved. A failed save keeps the edits and explains the error
 - **No devices found**: three options — "Keep searching", "Enter IP manually", "Exit"; a manually entered IP leads to the same three direct mode choices. If a connection fails or no receiver is ever found, see [Troubleshooting](troubleshooting.md)
@@ -183,7 +183,7 @@ The GUI Settings screen (persisted to `%LOCALAPPDATA%\Mivara\config.ini`):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Appearance | follow system | Light / Dark / Follow system; the header switcher applies instantly and writes `theme` to `config.ini`, so it needs no Save |
-| Codec | H.264 | auto/H.264/H.265/AV1/raw/RLE |
+| Codec | H.264 | auto/H.264/H.265/AV1/RLE |
 | Hardware accel | on | Prefer GPU encoding |
 | Quality / Bitrate | 23 / 0 | Bitrate > 0 uses bitrate mode, otherwise CRF |
 | FPS / Scale | 60 / 100% | Sender cap and pre-downscale |

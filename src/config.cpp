@@ -119,8 +119,13 @@ bool validExtendRes(const std::string &v)
 void applyKey(AppConfig &cfg, const std::string &key, const std::string &val)
 {
     if (key == "codec") {
-        if (val == "auto" || val == "h264" || val == "h265" || val == "av1" ||
-            val == "raw" || val == "rle")
+        /* "raw" was removed from the GUI; an old config.ini must still yield
+         * a highlighted choice, so fold it into the remaining lossless codec
+         * instead of rejecting the value and falling back to H.264. */
+        if (val == "raw")
+            cfg.codec = "rle";
+        else if (val == "auto" || val == "h264" || val == "h265" ||
+                 val == "av1" || val == "rle")
             cfg.codec = val;
     } else if (key == "hw_accel") {
         cfg.hw_accel = (val == "1") ? 1 : 0;

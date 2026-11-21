@@ -352,26 +352,17 @@
 
   <article class="opt">
     <div class="opt-head">
-      <h3>原始</h3>
-      <span class="badge warn">带宽极大</span>
-    </div>
-    <p><span class="k">是什么</span>不压缩的 RGB 画面直接传输，不经过编码器：完全无损、没有编码延迟，但带宽需求极高。1080p60 约 370 MB/s，而千兆网实际只有约 110 MB/s，远远不够。</p>
-    <p><span class="k">怎么选</span>只建议在 2.5G / 10G 有线局域网、低分辨率或本机测试时使用。此模式下「画质」「码率」「色度」「缩放」都不生效，帧率上限仍然有效。</p>
-  </article>
-
-  <article class="opt">
-    <div class="opt-head">
       <h3>RLE</h3>
       <span class="badge">无损压缩</span>
     </div>
     <p><span class="k">是什么</span>逐帧无损压缩，桌面文字和 UI 通常能省 30–70% 带宽；照片和视频的压缩率低，带宽仍远高于 H.264。压缩可以交给接收端 CPU 完成，发送端负担很小；如果接收端的压缩服务不可用，会退回未压缩发送。</p>
-    <p><span class="k">怎么选</span>想要零压缩损失、同时发送端 CPU 很弱时，可以在有线局域网里使用。与「原始」一样，「画质」「码率」「色度」「缩放」不生效（帧率上限有效）。</p>
+    <p><span class="k">怎么选</span>想要零压缩损失、同时发送端 CPU 很弱时，可以在有线局域网里使用。「画质」「码率」「色度」「缩放」不生效（帧率上限有效）。</p>
   </article>
 </section>
 
 <section id="quality">
   <h2>画质与流畅度</h2>
-  <p class="section-lead">下面三项只对编码流（H.264 / H.265 / AV1）有意义；「原始」和「RLE」不走编码器。</p>
+  <p class="section-lead">下面三项只对编码流（H.264 / H.265 / AV1）有意义；「RLE」不走编码器。</p>
 
   <article class="opt">
     <div class="opt-head">
@@ -410,7 +401,7 @@
       <span class="badge info">100% / 75% / 50%</span>
     </div>
     <p><span class="k">是什么</span>发送端先把画面缩小到对应比例再编码，接收端再放大到窗口大小。缩放能显著降低带宽和两端的编解码压力，但文字和小图标会变糊。</p>
-    <p><span class="k">怎么选</span>平时 100%。4K 桌面投到 1080p 接收端、或 Wi-Fi 带宽不足时可用 75%。50% 只适合看视频或远距离观看，不适合阅读文字。「原始 / RLE」不使用缩放。</p>
+    <p><span class="k">怎么选</span>平时 100%。4K 桌面投到 1080p 接收端、或 Wi-Fi 带宽不足时可用 75%。50% 只适合看视频或远距离观看，不适合阅读文字。「RLE」不使用缩放。</p>
   </article>
 
   <article class="opt">
@@ -467,7 +458,7 @@
         </tr>
         <tr>
           <td><strong>无损（仅高速有线）</strong></td>
-          <td>原始 / RLE</td><td>无关</td><td>不生效</td><td>按需</td><td>不生效</td><td>不生效</td><td>不生效</td>
+          <td>RLE</td><td>无关</td><td>不生效</td><td>按需</td><td>不生效</td><td>不生效</td><td>不生效</td>
         </tr>
       </tbody>
     </table>
@@ -494,7 +485,7 @@
 
   <details>
     <summary>怎样降低带宽占用？</summary>
-    <p>最有效的是降帧率（60 → 30）和缩放（100% → 75%）；其次是换 H.265 或 AV1、把画质调到 26–30，或直接设置码率上限。避免使用「原始」和「RLE」，它们的带宽需求远高于编码流。</p>
+    <p>最有效的是降帧率（60 → 30）和缩放（100% → 75%）；其次是换 H.265 或 AV1、把画质调到 26–30，或直接设置码率上限。避免使用「RLE」，它的带宽需求远高于编码流。</p>
   </details>
 
   <details>
@@ -503,8 +494,8 @@
   </details>
 
   <details>
-    <summary>为什么「原始 / RLE」调画质、码率、色度没有用？</summary>
-    <p>这两种方式不经过 H.264/H.265/AV1 编码器，所以画质、码率、色度和缩放都不参与。它们只受帧率上限和网络带宽影响。</p>
+    <summary>为什么「RLE」调画质、码率、色度没有用？</summary>
+    <p>RLE 不经过 H.264/H.265/AV1 编码器，所以画质、码率、色度和缩放都不参与；它只受帧率上限和网络带宽影响。</p>
   </details>
 
   <details>

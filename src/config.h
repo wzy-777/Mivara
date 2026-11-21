@@ -11,7 +11,7 @@
 
 struct AppConfig
 {
-    std::string codec = "h264";      /* auto|h264|h265|av1|raw|rle (auto=>h264) */
+    std::string codec = "h264";      /* auto|h264|h265|av1|rle (auto=>h264; legacy raw=>rle) */
     int hw_accel = 1;                /* 1 = prefer hardware encoding */
     int bitrate_kbps = 0;            /* 0 = quality/CRF mode */
     int quality = 23;                /* 0..51 */
