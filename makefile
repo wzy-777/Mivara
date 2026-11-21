@@ -333,6 +333,19 @@ copy-dlls: $(SENDER_BIN) $(RECEIVER_BIN) $(APP_BIN) $(STITCHCAP_BIN)
 	        if [ -f "$(BINDIR)/$$d" ]; then queue="$$queue $(BINDIR)/$$d"; fi; \
 	    done; \
 	done
+	@# MSYS2 ships SDL2 as sdl2-compat: SDL2.dll LoadLibrary()s SDL3.dll at
+	@# runtime, so that dependency never appears in the objdump import walk.
+	@# Ship it explicitly; fail closed rather than package a GUI that shows
+	@# "Failed loading SDL3 library." on every start.
+	@if [ -f "$(BINDIR)/SDL2.dll" ] && grep -aq "sdl2-compat" "$(BINDIR)/SDL2.dll"; then \
+	    if [ -f /mingw64/bin/SDL3.dll ]; then \
+	        cp -f /mingw64/bin/SDL3.dll "$(BINDIR)/"; \
+	        echo "  + SDL3.dll (sdl2-compat runtime)"; \
+	    else \
+	        echo "ERROR: SDL2.dll is sdl2-compat but /mingw64/bin/SDL3.dll is missing" >&2; \
+	        exit 1; \
+	    fi; \
+	fi
 	@echo "DLL closure updated"
 
 # Aliases
@@ -421,6 +434,13 @@ check:
         echo "    OK  SDL2_ttf $$(pkg-config --modversion SDL2_ttf)"; \
     else \
         echo "    NOT FOUND  SDL2_ttf  <-- required for the GUI (app)"; \
+    fi
+	@if [ -f "$(BINDIR)/SDL2.dll" ] && grep -aq "sdl2-compat" "$(BINDIR)/SDL2.dll"; then \
+        if [ -f "$(BINDIR)/SDL3.dll" ]; then \
+            echo "    OK  SDL3.dll (loaded at runtime by sdl2-compat)"; \
+        else \
+            echo "    MISSING  SDL3.dll  <-- SDL2.dll is sdl2-compat; app.exe will not start"; \
+        fi; \
     fi
 	@echo "========================================="
 

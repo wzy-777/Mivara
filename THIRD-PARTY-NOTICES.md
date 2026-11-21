@@ -17,6 +17,7 @@ Mivara（幻屏）的源码以 MIT 许可证发布，详见 [LICENSE](LICENSE)�
 - **License / 许可证**: zlib license.
 - **Source / 源码**: <https://www.libsdl.org/>
 - SDL2 is used by the GUI and receiver for windowing, rendering and text; SDL2_ttf provides TrueType font rendering. / SDL2 用于 GUI 与接收端的窗口、渲染和文本显示；SDL2_ttf 提供 TrueType 字体渲染。
+- Windows builds take SDL2 from MSYS2, which packages **sdl2-compat**: `SDL2.dll` is a compatibility layer that loads `SDL3.dll` at runtime. Both are zlib-licensed and both are bundled in the installer. / Windows 构建使用 MSYS2 的 SDL2 包，即 **sdl2-compat**：`SDL2.dll` 是兼容层，运行时会加载 `SDL3.dll`。两者均为 zlib 许可证，安装包会一并分发。
 - Windows runtime DLLs are bundled in the installer. The Linux portable tarball bundles the SDL2/SDL2_ttf shared libraries in `lib/`. / Windows 运行时 DLL 随安装包一并分发；Linux 便携包在 `lib/` 中内置 SDL2/SDL2_ttf 共享库。
 
 ## FFmpeg (libavcodec / libavutil / libswscale)
@@ -37,7 +38,7 @@ Mivara（幻屏）的源码以 MIT 许可证发布，详见 [LICENSE](LICENSE)�
 
 - `make copy-dlls` copies the MinGW-w64 runtime closure into `bin/`, and the installer ships it. Depending on the build machine this includes the GCC runtime libraries (`libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` — the GCC runtime libraries carry the GCC Runtime Library Exception) and SDL2_ttf's transitive dependencies (typically FreeType, HarfBuzz, Graphite2, libpng, zlib, bzip2, Brotli, GLib, gettext/libintl and libiconv). Each remains under its own license.
 - `make copy-dlls` 会把 MinGW-w64 运行时闭包复制到 `bin/`，安装包会一并分发。具体清单取决于构建机，通常包括 GCC 运行时库（`libstdc++-6.dll`、`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`，其中 GCC 运行时库带有 GCC Runtime Library Exception）以及 SDL2_ttf 的传递依赖（常见为 FreeType、HarfBuzz、Graphite2、libpng、zlib、bzip2、Brotli、GLib、gettext/libintl、libiconv）。各组件仍适用其各自的许可证。
-- Regenerate the exact closure with `ldd bin/*.exe` when preparing a release and ship the matching notices. / 发布前请用 `ldd bin/*.exe` 重新确认实际清单，并随附相应的许可证声明。
+- Run `make copy-dlls` when preparing a release and ship the matching notices; it resolves the closure with `objdump` and additionally copies `SDL3.dll` when `SDL2.dll` is sdl2-compat. / 发布前请运行 `make copy-dlls` 并随附相应的许可证声明；该目标用 `objdump` 解析依赖闭包，并在 `SDL2.dll` 为 sdl2-compat 时额外复制 `SDL3.dll`。
 
 ## Linux bundled runtime libraries / Linux 内置运行时库
 
