@@ -1,0 +1,118 @@
+# ============================================================================
+# Mivara – publish a release from CI artifacts
+# ============================================================================
+# Why this exists: the Windows installer and the Linux packages are already
+# built as workflow artifacts, but release.sh normally downloads them to the
+# maintainer's machine and uploads them again. On a slow or filtered link that
+# second transfer is the bottleneck. This workflow downloads both artifacts on
+# the runner, verifies every checksum and fixed-name copy, creates a DRAFT
+# release with all twelve assets, and only then publishes it.
+#
+# Dispatch from main with:
+#   version, installer_run_id, linux_run_id,
+#   notes_b64 (base64 of the Markdown body; use @@WINDOWS_SHA@@ as the
+#   installer-hash placeholder)
+#
+# The checkout uses the release tag, so scripts/release/linux.sh and the
+# version files are exactly the released source. release.sh remains the
+# one-shot local path; this workflow only publishes.
+# ============================================================================
+
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version X.Y.Z (without the v)"
+        required: true
+      installer_run_id:
+        description: "release-installer.yml run id"
+        required: true
+      linux_run_id:
+        description: "release-linux.yml run id"
+        required: true
+      notes_b64:
+        description: "base64(Markdown body); @@WINDOWS_SHA@@ is replaced"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      VER: ${{ inputs.version }}
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Download both artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p dist/win dist/linux-ci
+          gh run download "${{ inputs.installer_run_id }}" --name installer-unsigned -D dist/win
+          gh run download "${{ inputs.linux_run_id }}" --name linux-packages -D dist/linux-ci
+          find dist/win dist/linux-ci -maxdepth 3 -type f | sort
+
+      - name: Verify and stage assets
+        env:
+          NOTES_B64: ${{ inputs.notes_b64 }}
+        run: |
+          set -eu
+          find dist/win -type f -name "Mivara-Setup-$VER.exe" -exec cp -f {} dist/ \;
+          find dist/win -type f -name 'Mivara-Setup.exe' -exec cp -f {} dist/ \;
+          find dist/win -type f -name 'SHA256SUMS.txt' -exec cp -f {} dist/ \;
+          find dist/linux-ci -type f \
+            \( -name 'Mivara-linux-*' -o -name 'mivara_*.deb' -o -name 'SHA256SUMS-linux.txt' \) \
+            -exec cp -f {} dist/ \;
+
+          ( cd dist && sha256sum -c SHA256SUMS.txt )
+          ( cd dist && sha256sum -c SHA256SUMS-linux.txt )
+          cmp -s "dist/Mivara-Setup-$VER.exe" dist/Mivara-Setup.exe
+          cmp -s "dist/Mivara-linux-x86_64-$VER.tar.gz" dist/Mivara-linux-x86_64.tar.gz
+          cmp -s "dist/mivara_${VER}_amd64.deb" dist/Mivara-linux-amd64.deb
+          cmp -s "dist/Mivara-linux-aarch64-$VER.tar.gz" dist/Mivara-linux-aarch64.tar.gz
+          cmp -s "dist/mivara_${VER}_arm64.deb" dist/Mivara-linux-arm64.deb
+
+          printf '%s' "$NOTES_B64" | base64 -d > notes.md
+          winsha="$(awk '{print $1; exit}' dist/SHA256SUMS.txt)"
+          sed -i "s/@@WINDOWS_SHA@@/$winsha/" notes.md
+
+          # Reuse the release-note generator so the Linux table and install
+          # hint match release.sh exactly.
+          source scripts/release/linux.sh
+          linux_update_notes notes.md "$VER"
+
+          echo "winsha=$winsha"
+          head -20 notes.md
+
+      - name: Create draft release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "v$VER" --draft \
+            --title "Mivara $VER" \
+            --notes-file notes.md \
+            dist/Mivara-Setup*.exe \
+            dist/SHA256SUMS.txt \
+            dist/Mivara-linux-* \
+            dist/mivara_*.deb \
+            dist/SHA256SUMS-linux.txt
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release edit "v$VER" --draft=false
+          gh release view "v$VER" --json tagName,isDraft,assets \
+            --jq '{tag:.tagName, draft:.isDraft, assets:[.assets[].name]}'
