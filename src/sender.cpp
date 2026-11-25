@@ -1193,9 +1193,19 @@ static void stdinReaderLoop()
              * owner asks over this pipe instead: leave the loop and let the
              * normal cleanup (stats flush, VDD teardown) run. The token is
              * longer than the 8-character password rule, so it can never be
-             * mistaken for a password typed at the interactive prompt. */
+             * mistaken for a password typed at the interactive prompt.
+             *
+             * RETURN instead of looping back into getline: the app keeps this
+             * pipe open until it has reaped us (stopReader runs after its
+             * wait), so a detached thread still blocked in std::getline holds
+             * the C++ stream lock through process exit — the CRT then cannot
+             * finish exiting until the app closes the pipe, and the app sits
+             * out its full 8 s stop deadline before a hard kill. Leaving the
+             * thread function releases that lock and the process exits at
+             * once. */
             std::cout << "Stop requested by GUI\n" << std::flush;
             g_running = false;
+            return;
         } else if (g_auth_awaiting.load() && !line.empty()) {
             /* Interactive (no GUI): the line typed at the prompt is the
              * password. */

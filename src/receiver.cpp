@@ -2481,10 +2481,17 @@ static void receiverStdinLoop()
         } else if (line == "RX|quit" || line == "STOP|mivara") {
             /* STOP|mivara is the shared owner-stop line: the app uses it for
              * both children so a stop never depends on console control
-             * events (Ctrl+C is not delivered to these child consoles). */
+             * events (Ctrl+C is not delivered to these child consoles).
+             *
+             * Return instead of looping back into getline: the app keeps this
+             * pipe open until it has reaped us, and a detached thread blocked
+             * in std::getline holds the stream lock through process exit, so
+             * the CRT could not finish exiting until the app closed the pipe
+             * (which it only does after its 8 s stop deadline). */
             cancelAllApprovals();
             g_running = false;
             g_sess_cv.notify_all();
+            return;
         } else if (line == "PING") {
             emitRxStat("pong", "");
         }

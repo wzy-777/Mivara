@@ -827,6 +827,17 @@ struct ChildProc {
 #endif
     bool active = false;
     std::thread reader;
+    /* Normal shutdown joins `reader` in stopReader(). A process that exits
+     * through another path (a console control event started the exit before
+     * the stop path ran) would otherwise destroy this global's joinable
+     * std::thread during CRT teardown, which calls std::terminate — the
+     * observed 0x40000015 abort. Detaching at exit is the safe fallback: the
+     * process is going away anyway and the thread must not keep it alive. */
+    ~ChildProc()
+    {
+        if (!reader.joinable()) return;
+        try { reader.detach(); } catch (...) { /* exiting anyway */ }
+    }
 };
 
 static bool childExited(ChildProc &child, const char *name);
@@ -3800,6 +3811,13 @@ static bool spawnChild(ChildProc &child, const std::string &path,
      * way; with both bits set the child gets a visible console while its
      * stdout/stderr go to the pipe. */
     DWORD flags = console ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
+    /* The child is stopped with a CTRL_BREAK aimed at its own process group
+     * (see stopChild). Without this flag the child pid is not a group id, and
+     * group 0 would also contain this GUI (it attaches to the child's console
+     * to send the event) — a break delivered to the GUI started its own exit
+     * and aborted it. Ctrl+C is disabled inside the new group; these children
+     * are never stopped with CTRL_C (the stdin STOP line is primary). */
+    flags |= CREATE_NEW_PROCESS_GROUP;
     if (pipes) {
         /* Anonymous pipes: stdout/stderr → reader thread, stdin ← AUTH/RX/SETP
          * lines. This is the channel the --gui receiver protocol depends on. */
@@ -3927,9 +3945,11 @@ static bool spawnChild(ChildProc &child, const std::string &path,
 
 #ifdef _WIN32
 /* A NULL handler (SetConsoleCtrlHandler(nullptr, TRUE)) only swallows Ctrl+C,
- * not Ctrl+Break. The GUI attaches to the child's console before broadcasting
- * a break, so it needs a handler that also covers CTRL_BREAK_EVENT — otherwise
- * the stop signal would kill this process. Everything else stays default. */
+ * not Ctrl+Break. The GUI attaches to the child's console before sending it a
+ * break, so it keeps this handler installed as a belt-and-braces guard: the
+ * break is aimed at the child's process group, but a console event already
+ * queued on the shared console must never kill this process either. Everything
+ * else stays default. */
 static BOOL WINAPI stopIgnoreCtrlHandler(DWORD type)
 {
     return (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ? TRUE : FALSE;
@@ -3942,10 +3962,12 @@ static BOOL WINAPI stopIgnoreCtrlHandler(DWORD type)
  * deliver Ctrl+C to a child console at all — GenerateConsoleCtrlEvent returns
  * success but no handler ever runs — so the old Ctrl+C-only sequence always
  * sat out the full 8 s timeout before TerminateProcess. Ctrl+Break *is*
- * delivered and remains the fallback for the visible-status-console launch
- * (no stdin pipe). Either way cleanup (stats flush, vddShutdown) still runs
- * before the 8 s cap, and a hard kill then force-detaches the virtual display
- * so it can never linger after a stop. */
+ * delivered, and remains the fallback for the visible-status-console launch
+ * (no stdin pipe) and for a child that ignored the pipe line; it is aimed at
+ * the child's own process group, never console group 0 (see below). Either
+ * way cleanup (stats flush, vddShutdown) still runs before the 8 s cap, and a
+ * hard kill then force-detaches the virtual display so it can never linger
+ * after a stop. */
 static void stopChild(ChildProc &child, bool extend = false)
 {
     if (!child.active) return;
@@ -3962,14 +3984,23 @@ static void stopChild(ChildProc &child, bool extend = false)
         exited = WaitForSingleObject(child.pi.hProcess, 8000) == WAIT_OBJECT_0;
 
     /* 2) console fallback: no pipe (visible status console), or a child that
-     * ignored the command. Never broadcast without the guard handler. */
+     * ignored the command. NEVER send to console group 0: this process has
+     * just attached to the child's console, so group 0 also contains the GUI,
+     * and a CTRL_BREAK delivered to the GUI starts its own exit. That exit
+     * bypasses stopReader(), so the CRT teardown of the global ChildProc then
+     * calls std::terminate on the still-joinable reader thread and aborts the
+     * whole app (0x40000015). Children are spawned with
+     * CREATE_NEW_PROCESS_GROUP, so the child pid is the group id to target
+     * (CTRL_BREAK is the only event a process group accepts). A child that is
+     * not a group leader (visible console, where Windows ignores the flag)
+     * simply fails here and the hard kill below handles it. */
     if (!exited) {
         const DWORD left = deadline > GetTickCount()
                                ? deadline - GetTickCount() : 0;
         FreeConsole();
         SetConsoleCtrlHandler(stopIgnoreCtrlHandler, TRUE);
         if (AttachConsole(child.pi.dwProcessId)) {
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.pi.dwProcessId);
             /* Detach BEFORE waiting: when the child exits the visible console
              * is torn down and an attached process is terminated by the
              * resulting close event (verified — it survives only if this
